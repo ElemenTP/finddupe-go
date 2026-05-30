@@ -52,3 +52,6 @@ golangci-lint run ./...
 ## Key Dependencies
 
 - **CLI args parser**: github.com/spf13/cobra
+
+## Original Project
+Original finddupe project written in C is here as a reference: `project_root/finddupe-orig`
