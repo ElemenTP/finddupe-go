@@ -55,7 +55,9 @@ func (w *Walker) Walk(ctx context.Context, patterns []string, opts WalkOptions) 
 
 // walkPatterns iterates over all patterns and walks each one.
 func (w *Walker) walkPatterns(ctx context.Context, patterns []string, opts WalkOptions, ch chan<- Result) {
-	seen := make(map[string]bool) // dedup by device+inode+path
+	// seen tracks resolved symlink targets to prevent infinite loops
+	// when FollowSymlinks is enabled. Key is the canonical path.
+	seen := make(map[string]bool)
 
 	for _, pattern := range patterns {
 		if ctx.Err() != nil {
@@ -95,13 +97,10 @@ func (w *Walker) walkPattern(
 	}
 
 	// Walk the directory tree.
+	// filepath.WalkDir does NOT follow symlinks by default — it uses os.Lstat
+	// internally. Symlink following is handled inside createWalkFn.
 	walkFn := w.createWalkFn(ctx, baseDir, matchPattern, opts, ch, seen)
-
-	if opts.FollowSymlinks {
-		err = filepath.WalkDir(baseDir, walkFn)
-	} else {
-		err = w.walkWithoutSymlinks(baseDir, walkFn)
-	}
+	err = filepath.WalkDir(baseDir, walkFn)
 	if err != nil {
 		select {
 		case <-ctx.Done():
@@ -140,7 +139,9 @@ func (w *Walker) createWalkFn(
 
 	return func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			if !opts.FollowSymlinks && os.IsPermission(err) {
+			// On permission errors, skip the directory to avoid a flood of
+			// "permission denied" errors for every file inside it.
+			if os.IsPermission(err) {
 				return filepath.SkipDir
 			}
 			ch <- Result{Err: err}
@@ -154,11 +155,28 @@ func (w *Walker) createWalkFn(
 		default:
 		}
 
-		// For non-recursive patterns, skip subdirectories but not the root.
+		// Handle directories.
 		if d.IsDir() {
+			// For non-recursive patterns, skip subdirectories but not the root.
 			if !recursive && path != baseDir {
 				return filepath.SkipDir
 			}
+
+			// If this directory is a symlink, handle it based on FollowSymlinks.
+			if d.Type()&os.ModeSymlink != 0 {
+				if opts.FollowSymlinks {
+					w.walkSymlinkTarget(ctx, path, matchPattern, opts, ch, seen)
+				}
+				return filepath.SkipDir
+			}
+
+			return nil
+		}
+
+		// If this entry is a symlink and we're not following symlinks, skip it.
+		// d.Info() calls os.Stat which follows symlinks, so we must filter by
+		// d.Type() which reports the entry's own type (with ModeSymlink set).
+		if !opts.FollowSymlinks && d.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
 
@@ -186,18 +204,33 @@ func (w *Walker) createWalkFn(
 	}
 }
 
-// walkWithoutSymlinks walks a directory tree without following symlinks.
-func (w *Walker) walkWithoutSymlinks(root string, fn fs.WalkDirFunc) error {
-	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return fn(path, d, err)
+// walkSymlinkTarget resolves a symlink directory and recursively walks its target.
+// Uses the seen map (keyed by resolved canonical path) to prevent infinite loops.
+func (w *Walker) walkSymlinkTarget(
+	ctx context.Context, symlinkPath string, matchPattern string,
+	opts WalkOptions, ch chan<- Result, seen map[string]bool,
+) {
+	// Resolve the symlink to its canonical target.
+	target, err := filepath.EvalSymlinks(symlinkPath)
+	if err != nil {
+		ch <- Result{Err: err}
+		return
+	}
+
+	// Prevent infinite loops: if we've already visited this target, skip it.
+	if seen[target] {
+		return
+	}
+	seen[target] = true
+
+	// Walk the resolved target directory.
+	walkFn := w.createWalkFn(ctx, target, matchPattern, opts, ch, seen)
+	if err := filepath.WalkDir(target, walkFn); err != nil {
+		select {
+		case <-ctx.Done():
+		case ch <- Result{Err: err}:
 		}
-		// If it's a symlink directory, don't descend into it.
-		if d.IsDir() && d.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		return fn(path, d, err)
-	})
+	}
 }
 
 // processFileEntry creates a FileInfo and sends it on the channel.
