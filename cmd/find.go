@@ -1,36 +1,98 @@
 package cmd
 
 import (
-	"fmt"
+	"finddupe/internal/config"
+	"finddupe/internal/pipeline"
 
 	"github.com/spf13/cobra"
 )
 
-// findCmd represents the find command
+// findCmd represents the find command.
 var findCmd = &cobra.Command{
-	Use:   "find",
-	Short: "A brief description of your command",
-	Long: `A longer description that spans multiple lines and likely contains examples
-and usage of using your command. For example:
+	Use:   "find [flags] <path/pattern> [path/pattern...]",
+	Short: "Find and report duplicate files",
+	Long: `finddupe find scans the specified paths/patterns for duplicate files and reports them.
+No files are modified.
 
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("find called")
-	},
+Examples:
+  finddupe find /home/user/photos
+  finddupe find /data/**/*.jpg
+  finddupe find --hardlink /backup
+  finddupe find --sigs /path/to/files
+  finddupe find --threads 8 /large/dataset`,
+	Args: cobra.MinimumNArgs(1),
+	RunE: runFind,
+}
+
+var findFlags struct {
+	hardlink       bool
+	cow            bool
+	sigs           bool
+	verbose        bool
+	zero           bool
+	noProgress     bool
+	followSymlinks bool
+	threads        int
 }
 
 func init() {
 	rootCmd.AddCommand(findCmd)
 
-	// Here you will define your flags and configuration settings.
+	findCmd.Flags().BoolVarP(&findFlags.hardlink, "hardlink", "H", false,
+		"Skip already-hardlinked files when reporting duplicates")
+	findCmd.Flags().BoolVarP(&findFlags.cow, "cow", "c", false,
+		"CoW search mode: find groups of CoW-cloned files")
+	findCmd.Flags().BoolVarP(&findFlags.sigs, "sigs", "s", false,
+		"Print file signatures only (no duplicate detection)")
+	findCmd.Flags().BoolVarP(&findFlags.verbose, "verbose", "v", false,
+		"Verbose output: show hardlink counts, file index details")
+	findCmd.Flags().BoolVarP(&findFlags.zero, "zero", "z", false,
+		"Include zero-length files (skipped by default)")
+	findCmd.Flags().BoolVarP(&findFlags.noProgress, "no-progress", "p", false,
+		"Hide the progress indicator")
+	findCmd.Flags().BoolVarP(&findFlags.followSymlinks, "follow-symlinks", "j", false,
+		"Follow symbolic links and reparse points")
+	findCmd.Flags().IntVarP(&findFlags.threads, "threads", "t", 0,
+		"Number of scanner workers (default: number of CPUs)")
+}
 
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// findCmd.PersistentFlags().String("foo", "", "A help for foo")
+// runFind builds the config and runs the pipeline in find mode.
+func runFind(cmd *cobra.Command, args []string) error {
+	// Separate paths and ref patterns.
+	paths, refPaths := splitPaths(args)
 
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// findCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	cfg := &config.Config{
+		Mode:           config.ModeFind,
+		Action:         config.ActionReport,
+		Paths:          paths,
+		RefPaths:       refPaths,
+		Threads:        findFlags.threads,
+		Verbose:        findFlags.verbose,
+		PrintSigs:      findFlags.sigs,
+		ShowProgress:   !findFlags.noProgress,
+		FollowSymlinks: findFlags.followSymlinks,
+		IncludeZeroLen: findFlags.zero,
+		SkipHardlinked: findFlags.hardlink,
+	}
+
+	return pipeline.Run(cmd.Context(), cfg)
+}
+
+// splitPaths separates regular paths from --ref paths.
+// TODO: support --ref flag properly via cobra's built-in mechanism.
+func splitPaths(args []string) (paths, refPaths []string) {
+	inRef := false
+	for _, a := range args {
+		if a == "--ref" {
+			inRef = true
+			continue
+		}
+		if inRef {
+			refPaths = append(refPaths, a)
+			inRef = false
+		} else {
+			paths = append(paths, a)
+		}
+	}
+	return
 }
