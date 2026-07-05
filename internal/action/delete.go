@@ -14,7 +14,13 @@ func (e *Executor) deleteFile(group dupe.DupeGroup) (Result, error) {
 			return ResultSkippedRO, nil
 		}
 		// Make writable before deleting.
-		if chmodErr := os.Chmod(group.Candidate.Path, 0666); chmodErr != nil { //nolint:gosec
+		// Only add user-write permission (mode | 0200) rather than 0666 to
+		// avoid a TOCTOU window where the file is temporarily world-writable.
+		info, statErr := os.Stat(group.Candidate.Path)
+		if statErr != nil {
+			return ResultError, statErr
+		}
+		if chmodErr := os.Chmod(group.Candidate.Path, info.Mode()|0200); chmodErr != nil {
 			return ResultError, chmodErr
 		}
 	}

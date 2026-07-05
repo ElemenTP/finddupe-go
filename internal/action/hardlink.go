@@ -31,9 +31,11 @@ func (e *Executor) createHardlink(group dupe.DupeGroup) (Result, error) {
 	origMode := origInfo.Mode()
 	origModTime := origInfo.ModTime()
 
-	// Make writable if needed.
+	// Make writable if needed. Only add user-write permission
+	// (mode | 0200) rather than 0666 to avoid a TOCTOU window where
+	// the file is temporarily world-writable on multi-user systems.
 	if readOnly {
-		if chmodErr := os.Chmod(candidatePath, 0666); chmodErr != nil { //nolint:gosec
+		if chmodErr := os.Chmod(candidatePath, origMode|0200); chmodErr != nil {
 			return ResultError, chmodErr
 		}
 	}
