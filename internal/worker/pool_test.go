@@ -15,9 +15,11 @@ func TestPool_AllTasksExecute(t *testing.T) {
 	var count atomic.Int32
 
 	for range 10 {
-		p.Submit(context.Background(), func(ctx context.Context) {
+		if !p.Submit(context.Background(), func(_ context.Context) {
 			count.Add(1)
-		})
+		}) {
+			t.Error("Submit returned false with live context")
+		}
 	}
 	p.Wait()
 
@@ -34,14 +36,16 @@ func TestPool_Bounded(t *testing.T) {
 	var maxActive atomic.Int32
 
 	for range 10 {
-		p.Submit(context.Background(), func(ctx context.Context) {
+		if !p.Submit(context.Background(), func(_ context.Context) {
 			n := active.Add(1)
 			if n > maxActive.Load() {
 				maxActive.Store(n)
 			}
 			time.Sleep(10 * time.Millisecond)
 			active.Add(-1)
-		})
+		}) {
+			t.Error("Submit returned false with live context")
+		}
 	}
 	p.Wait()
 
@@ -58,10 +62,12 @@ func TestPool_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately.
 
-	// Submit should not execute the task.
-	p.Submit(ctx, func(ctx context.Context) {
+	// Submit should return false when context is already cancelled.
+	if p.Submit(ctx, func(_ context.Context) {
 		count.Add(1)
-	})
+	}) {
+		t.Error("expected Submit to return false with cancelled context")
+	}
 	p.Wait()
 
 	if count.Load() != 0 {
@@ -74,10 +80,12 @@ func TestPool_WaitBlocks(t *testing.T) {
 	p := worker.New(4)
 	var done atomic.Int32
 
-	p.Submit(context.Background(), func(ctx context.Context) {
+	if !p.Submit(context.Background(), func(_ context.Context) {
 		time.Sleep(50 * time.Millisecond)
 		done.Store(1)
-	})
+	}) {
+		t.Error("Submit returned false with live context")
+	}
 
 	// Wait should block until task completes.
 	p.Wait()
@@ -92,9 +100,11 @@ func TestPool_ZeroSize(t *testing.T) {
 	p := worker.New(0) // Should default to runtime.NumCPU().
 	var count atomic.Int32
 
-	p.Submit(context.Background(), func(ctx context.Context) {
+	if !p.Submit(context.Background(), func(_ context.Context) {
 		count.Add(1)
-	})
+	}) {
+		t.Error("Submit returned false with live context")
+	}
 	p.Wait()
 
 	if count.Load() != 1 {

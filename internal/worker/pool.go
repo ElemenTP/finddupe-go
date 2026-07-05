@@ -26,19 +26,21 @@ func New(size int) *Pool {
 }
 
 // Submit enqueues a task for execution. This method blocks if all workers are busy.
-// If ctx is already cancelled, the task is not executed.
-// If ctx is cancelled while waiting, the task is not executed.
-func (p *Pool) Submit(ctx context.Context, fn func(context.Context)) {
+// If ctx is already cancelled, the task is not executed and Submit returns false.
+// If ctx is cancelled while waiting, the task is not executed and Submit returns false.
+// The caller must check the return value: if false, the task was not submitted
+// and any associated cleanup (e.g. WaitGroup.Done) is the caller's responsibility.
+func (p *Pool) Submit(ctx context.Context, fn func(context.Context)) bool {
 	select {
 	case <-ctx.Done():
-		return
+		return false
 	default:
 	}
 
 	select {
 	case p.sem <- struct{}{}:
 	case <-ctx.Done():
-		return
+		return false
 	}
 
 	p.wg.Add(1)
@@ -47,6 +49,7 @@ func (p *Pool) Submit(ctx context.Context, fn func(context.Context)) {
 		defer func() { <-p.sem }()
 		fn(ctx)
 	}()
+	return true
 }
 
 // Wait blocks until all submitted tasks have completed.

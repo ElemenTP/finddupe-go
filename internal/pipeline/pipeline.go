@@ -137,10 +137,20 @@ func runNormalMode(
 				continue
 			}
 
-			pending.Add(1)
 			fi := result.Info
 
-			pool.Submit(ctx, func(ctx context.Context) {
+			// Check ctx before incrementing pending to avoid deadlock:
+			// if Submit returns false, the callback is never executed and
+			// pending.Done would never be called.
+			select {
+			case <-ctx.Done():
+				continue
+			default:
+			}
+
+			pending.Add(1)
+
+			if !pool.Submit(ctx, func(ctx context.Context) {
 				defer pending.Done()
 
 				// Open file once: compute checksum AND retrieve inode/link info.
@@ -158,7 +168,9 @@ func runNormalMode(
 				case fileCh <- fi:
 				case <-ctx.Done():
 				}
-			})
+			}) {
+				pending.Done() // Submit declined due to cancellation.
+			}
 		}
 	}()
 
