@@ -15,10 +15,10 @@ type Pool struct {
 }
 
 // New creates a Pool with the given number of workers.
-// If size is <= 0, [runtime.NumCPU] is used.
+// If size is <= 0, [runtime.NumCPU]*2 is used (mixed I/O+CPU workload).
 func New(size int) *Pool {
 	if size <= 0 {
-		size = runtime.NumCPU()
+		size = runtime.NumCPU() * 2
 	}
 	return &Pool{
 		sem: make(chan struct{}, size),

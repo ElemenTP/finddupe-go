@@ -12,6 +12,19 @@ type FileInfo struct {
 	// Signature is the 64-bit composite checksum (CRC32 << 32 | Sum32).
 	Signature uint64
 
+	// SHA256 is the SHA-256 hash of the full file content.
+	// Zero value means "not yet computed".
+	SHA256 [32]byte
+
+	// HashState is the marshaled state of an in-progress SHA-256 digest,
+	// used to resume hashing from HashOffset without re-reading the file
+	// from the beginning. nil means hashing has not started.
+	HashState []byte
+
+	// HashOffset is the number of bytes already fed into the SHA-256 digest.
+	// Used with HashState to resume incremental hashing.
+	HashOffset int64
+
 	// Inode is the filesystem object identifier (inode on Unix, file index on Windows).
 	Inode uint64
 
@@ -22,15 +35,21 @@ type FileInfo struct {
 	IsRef bool
 }
 
-// DupeGroup represents a pair of files that share the same checksum.
-// The executor verifies whether they are truly duplicates via full byte comparison.
-type DupeGroup struct {
-	// Signature is the checksum that matched.
+// GroupKey is the composite key for grouping files by weak checksum and size.
+type GroupKey struct {
 	Signature uint64
+	Size      int64
+}
 
-	// Original is the first file stored with this checksum (the "kept" file).
+// DupeGroup represents a pair of files that share the same weak checksum and size.
+// The executor verifies whether they are truly duplicates via SHA-256 comparison.
+type DupeGroup struct {
+	// Key is the composite (signature, size) key that matched.
+	Key GroupKey
+
+	// Original is the first file stored with this key (the "kept" file).
 	Original FileInfo
 
-	// Candidate is the newly discovered file with the same checksum.
+	// Candidate is the newly discovered file with the same key.
 	Candidate FileInfo
 }

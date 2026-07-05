@@ -1,93 +1,175 @@
 package dupe
 
-// Detector finds duplicate files by grouping them by checksum (normal mode)
-// or filesystem object identifier (hardlink search mode).
+import "sync"
+
+// Detector finds duplicate files using a two-level grouping strategy:
+//  1. Primary key: (weak CRC signature, file size) — composite key eliminates
+//     false collisions from file-size wrapping at 4 GB.
+//  2. Secondary key: SHA-256 of full file content — zero means "not yet computed".
+//
+// Strategy by group size:
+//   - 1 file: store without computing SHA-256 (avoids unnecessary I/O).
+//   - 2 files: chunked SHA-256 comparison with early-stop; partial hash state
+//     saved on mismatch.
+//   - 3+ files: mass concurrent SHA-256 computation for all unhashed files;
+//     instant matching against files with known SHA-256.
 type Detector struct {
-	// groups maps a 64-bit signature to files with that signature.
-	// The slice holds files in insertion order and serves as a collision chain.
-	groups map[uint64][]FileInfo
-
-	// inodeGroups maps inode to files (hardlink search mode only).
-	inodeGroups map[uint64][]FileInfo
-
-	// stats is the shared statistics accumulator.
-	stats *Stats
+	mu     sync.Mutex
+	groups map[GroupKey]map[[32]byte][]FileInfo
+	stats  *Stats
 }
+
+// zeroSHA is the sentinel key for files whose SHA-256 has not been computed.
+var zeroSHA [32]byte
 
 // NewDetector creates a new Detector with the given stats.
 func NewDetector(stats *Stats) *Detector {
 	return &Detector{
-		groups:      make(map[uint64][]FileInfo),
-		inodeGroups: make(map[uint64][]FileInfo),
-		stats:       stats,
+		groups: make(map[GroupKey]map[[32]byte][]FileInfo),
+		stats:  stats,
 	}
 }
 
-// Insert adds a FileInfo to the detector and returns potential duplicate groups.
-// In normal mode (checksum-based), returns one DupeGroup for each existing file
-// with the same signature. The caller must verify these with a full byte comparison.
-// In hardlink search mode, files with NumLinks <= 1 are silently skipped.
+// Insert adds a FileInfo and returns potential duplicate groups.
 func (d *Detector) Insert(fi FileInfo) []DupeGroup {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	d.stats.TotalFiles.Add(1)
 	d.stats.TotalBytes.Add(fi.Size)
 
-	key := fi.Signature
-	existing, exists := d.groups[key]
+	key := GroupKey{Signature: fi.Signature, Size: fi.Size}
+	shaGroups, exists := d.groups[key]
 
 	if !exists {
-		// First file with this signature — store and return nil.
-		d.groups[key] = []FileInfo{fi}
+		// Strategy 2: first file — no SHA-256 computation.
+		d.groups[key] = map[[32]byte][]FileInfo{fi.SHA256: {fi}}
 		return nil
 	}
 
-	// Signature collision — create ONE DupeGroup against the first file in the group.
-	// This matches the C version behavior: only verify against the first stored file.
-	// If verification fails (CRC collision), the file is added to the collision chain
-	// and compared against the next peer on the next match.
-	group := DupeGroup{
-		Signature: key,
-		Original:  existing[0],
-		Candidate: fi,
-	}
-
-	// Always append to the group (collision chain).
-	d.groups[key] = append(existing, fi)
-
-	return []DupeGroup{group}
-}
-
-// InsertHardlink adds a FileInfo for hardlink search mode.
-// Files with NumLinks <= 1 are skipped (they cannot be part of a hardlink group).
-// Returns true if the file was stored for hardlink detection.
-func (d *Detector) InsertHardlink(fi FileInfo) bool {
-	if fi.NumLinks <= 1 {
-		return false
-	}
-
-	d.stats.TotalFiles.Add(1)
-	d.stats.TotalBytes.Add(fi.Size)
-
-	d.inodeGroups[fi.Inode] = append(d.inodeGroups[fi.Inode], fi)
-	return true
-}
-
-// HardlinkGroups returns all inode groups with more than one file.
-// Each group represents a set of hardlinked files.
-func (d *Detector) HardlinkGroups() [][]FileInfo {
-	var result [][]FileInfo
-	for _, files := range d.inodeGroups {
-		if len(files) > 1 {
-			// Copy the slice to prevent external modification.
-			group := make([]FileInfo, len(files))
-			copy(group, files)
-			result = append(result, group)
+	// Instant match: candidate has a known SHA-256 that matches an existing bucket.
+	if fi.SHA256 != zeroSHA {
+		if files, ok := shaGroups[fi.SHA256]; ok && len(files) > 0 {
+			shaGroups[fi.SHA256] = append(files, fi)
+			return []DupeGroup{{Key: key, Original: files[0], Candidate: fi}}
 		}
+		// SHA-256 differs from all known buckets → CRC collision, store separately.
+		shaGroups[fi.SHA256] = append(shaGroups[fi.SHA256], fi)
+		return nil
 	}
-	return result
+
+	// Candidate has no SHA-256. Count existing files.
+	totalExisting := d.countLocked(shaGroups)
+	zeroFiles := shaGroups[zeroSHA]
+
+	// Store the new file in the zero-SHA bucket.
+	shaGroups[zeroSHA] = append(zeroFiles, fi)
+
+	if totalExisting == 1 {
+		// Strategy 3: exactly 2 files → chunked SHA-256 comparison with early-stop.
+		return []DupeGroup{{Key: key, Original: zeroFiles[0], Candidate: fi}}
+	}
+
+	// Strategy 4: 3+ files.
+	// Emit pre-verified matches against known-SHA sub-groups, plus one
+	// chunked-comparison group against the first zero-SHA file.
+	var groups []DupeGroup
+	for sha, files := range shaGroups {
+		if sha == zeroSHA || len(files) == 0 {
+			continue
+		}
+		groups = append(groups, DupeGroup{Key: key, Original: files[0], Candidate: fi})
+	}
+	// Also emit one group for chunked comparison against the first zero-SHA file
+	// (the original file that started this group).
+	if len(zeroFiles) > 0 {
+		groups = append(groups, DupeGroup{Key: key, Original: zeroFiles[0], Candidate: fi})
+	}
+
+	return groups
 }
 
-// Len returns the number of unique signatures stored.
+// UnhashedFiles returns files in the zero-SHA bucket for the given key.
+// The caller should submit these for full SHA-256 computation when the group
+// has 3+ files (mass concurrent computation).
+func (d *Detector) UnhashedFiles(key GroupKey) []FileInfo {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	shaGroups := d.groups[key]
+	if shaGroups == nil {
+		return nil
+	}
+	files := shaGroups[zeroSHA]
+	if len(files) == 0 {
+		return nil
+	}
+	// Return a copy to avoid races with concurrent updates.
+	out := make([]FileInfo, len(files))
+	copy(out, files)
+	return out
+}
+
+// GroupSize returns the total number of files for a given key.
+func (d *Detector) GroupSize(key GroupKey) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.countLocked(d.groups[key])
+}
+
+// UpdateFileState updates a file's hash progress. Keeps the state with the
+// largest HashOffset. Moves the file from the zero-SHA bucket to the correct
+// SHA bucket when SHA-256 is complete.
+func (d *Detector) UpdateFileState(key GroupKey, path string, hashState []byte, hashOffset int64, sha256 [32]byte) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	shaGroups := d.groups[key]
+	if shaGroups == nil {
+		return
+	}
+
+	// Find and update the file in the zero-SHA bucket.
+	zeroFiles := shaGroups[zeroSHA]
+	for i, f := range zeroFiles {
+		if f.Path != path {
+			continue
+		}
+		// Keep the more advanced state (larger HashOffset wins).
+		if hashOffset > f.HashOffset {
+			zeroFiles[i].HashState = hashState
+			zeroFiles[i].HashOffset = hashOffset
+		}
+
+		// If SHA-256 is now complete, move to the correct bucket.
+		if sha256 != zeroSHA {
+			f = zeroFiles[i]
+			f.SHA256 = sha256
+			// Move from zero bucket to SHA bucket.
+			shaGroups[sha256] = append(shaGroups[sha256], f)
+			shaGroups[zeroSHA] = append(zeroFiles[:i], zeroFiles[i+1:]...)
+		}
+		return
+	}
+}
+
+// countLocked returns the total number of files across all SHA buckets.
+// Must be called with d.mu held.
+func (d *Detector) countLocked(shaGroups map[[32]byte][]FileInfo) int {
+	if shaGroups == nil {
+		return 0
+	}
+	n := 0
+	for _, files := range shaGroups {
+		n += len(files)
+	}
+	return n
+}
+
+// Len returns the number of unique GroupKeys stored.
 func (d *Detector) Len() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	return len(d.groups)
 }
 

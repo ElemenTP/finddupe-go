@@ -2,17 +2,17 @@
 package action
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding"
 	"fmt"
+	"hash"
+	"io"
 	"os"
 
 	"finddupe/internal/config"
 	"finddupe/internal/dupe"
 )
-
-// chunkSize is the buffer size for full file verification.
-const chunkSize = 0x10000 // 64KB, matching C version's CHUNK_SIZE
 
 // MaxHardlinks is the maximum number of hardlinks per file on Windows NTFS.
 const MaxHardlinks = 1023
@@ -21,27 +21,15 @@ const MaxHardlinks = 1023
 type Result int
 
 const (
-	// ResultVerifiedDuplicate means files are confirmed duplicates and the action succeeded.
-	// In find mode (ActionReport), this is the final result after verification.
 	ResultVerifiedDuplicate Result = iota
-	// ResultAlreadyHardlinked means the files share the same inode (already hardlinked)
-	// and were skipped due to --hardlink flag in find mode.
 	ResultAlreadyHardlinked
-	// ResultDeleted means the duplicate file was deleted.
 	ResultDeleted
-	// ResultHardlinked means the duplicate was replaced with a hardlink.
 	ResultHardlinked
-	// ResultCoWCloned means the duplicate was replaced with a CoW clone.
 	ResultCoWCloned
-	// ResultSkippedRO means the file was skipped because it is read-only.
 	ResultSkippedRO
-	// ResultSkippedRef means the file was skipped because it is a reference.
 	ResultSkippedRef
-	// ResultHardlinkLimit means linking was skipped due to the NTFS link limit.
 	ResultHardlinkLimit
-	// ResultNotDuplicate means the files differ on full comparison (CRC collision).
 	ResultNotDuplicate
-	// ResultError means the action failed with an error.
 	ResultError
 )
 
@@ -49,8 +37,7 @@ const (
 type Options struct {
 	Action          config.Action
 	IncludeReadonly bool
-	// SkipHardlinked skips duplicate pairs that are already hardlinked (same inode).
-	SkipHardlinked bool
+	SkipHardlinked  bool
 }
 
 // Executor verifies and eliminates duplicate files.
@@ -63,43 +50,150 @@ func New(opts Options) *Executor {
 	return &Executor{opts: opts}
 }
 
-// VerifyAndExecute performs a full byte-by-byte comparison between the candidate
-// and the original file. If confirmed, it executes the configured action.
-func (e *Executor) VerifyAndExecute(ctx context.Context, group dupe.DupeGroup) (Result, error) {
+// chunkSizeFor returns an appropriate I/O chunk size for a file of the given size.
+// Small files are read in one chunk; medium files use 64 KB chunks for fast
+// early-stop; large files use 1 MB chunks to reduce syscall overhead.
+func chunkSizeFor(fileSize int64) int64 {
+	switch {
+	case fileSize <= 64*1024:
+		return fileSize // one read
+	case fileSize <= 16*1024*1024:
+		return 64 * 1024
+	default:
+		return 1024 * 1024
+	}
+}
+
+// VerifyChunked performs chunked SHA-256 comparison between the candidate and
+// original file. If either file has saved hash state (from a previous early-stop),
+// hashing resumes from the saved offset to avoid re-reading.
+//
+// Returns updated FileInfo for both files with current hash state and offset.
+// If the files are identical and the full file was hashed, SHA-256 is complete.
+func (e *Executor) VerifyChunked(
+	ctx context.Context, group dupe.DupeGroup,
+) (Result, dupe.FileInfo, dupe.FileInfo, error) {
 	select {
 	case <-ctx.Done():
-		return ResultError, ctx.Err()
+		return ResultError, group.Original, group.Candidate, ctx.Err()
 	default:
 	}
 
-	// If SkipHardlinked is set and both files share the same inode (already
-	// hardlinked to each other), skip them — they're the same physical file.
+	// Skip already-hardlinked pairs (same inode).
 	if e.opts.SkipHardlinked && group.Original.Inode != 0 &&
 		group.Original.Inode == group.Candidate.Inode &&
 		group.Original.NumLinks > 1 {
-		return ResultAlreadyHardlinked, nil
+		return ResultAlreadyHardlinked, group.Original, group.Candidate, nil
 	}
 
-	// Verify full file content.
-	isDuplicate, err := VerifyFullFile(group.Candidate.Path, group.Original.Path, group.Candidate.Size)
+	chunkSize := chunkSizeFor(group.Candidate.Size)
+
+	orig, cand, err := hashCompare(ctx, group.Original, group.Candidate, chunkSize)
 	if err != nil {
-		return ResultError, fmt.Errorf("verify %s: %w", group.Candidate.Path, err)
-	}
-	if !isDuplicate {
-		return ResultNotDuplicate, nil
+		return ResultError, orig, cand, fmt.Errorf("verify %s: %w", group.Candidate.Path, err)
 	}
 
-	// If candidate is a reference file, skip it.
+	// If either file's SHA-256 is still incomplete, the files are not duplicates.
+	if orig.SHA256 == ([32]byte{}) || cand.SHA256 == ([32]byte{}) {
+		return ResultNotDuplicate, orig, cand, nil
+	}
+
+	// Both files have complete SHA-256 and match — confirmed duplicates.
 	if group.Candidate.IsRef {
-		return ResultSkippedRef, nil
+		return ResultSkippedRef, orig, cand, nil
 	}
 
-	// Execute the configured action (files are confirmed duplicates at this point).
-	return e.execute(ctx, group)
+	result, err := e.execute(ctx, group)
+	return result, orig, cand, err
+}
+
+// hashCompare reads two files chunk by chunk, updating SHA-256 hashers and
+// comparing accumulated hashes after each chunk for early-stop. Saved hash state
+// is resumed if available.
+func hashCompare(
+	ctx context.Context, orig, cand dupe.FileInfo, chunkSize int64,
+) (dupe.FileInfo, dupe.FileInfo, error) {
+	// Open files.
+	fOrig, err := os.Open(orig.Path)
+	if err != nil {
+		return orig, cand, err
+	}
+	defer fOrig.Close()
+
+	fCand, err := os.Open(cand.Path)
+	if err != nil {
+		return orig, cand, err
+	}
+	defer fCand.Close()
+
+	// Restore or create hashers.
+	hOrig, err := restoreHasher(orig.HashState)
+	if err != nil {
+		return orig, cand, err
+	}
+	hCand, err := restoreHasher(cand.HashState)
+	if err != nil {
+		return orig, cand, err
+	}
+
+	// Seek to saved offsets.
+	if _, err := fOrig.Seek(orig.HashOffset, io.SeekStart); err != nil {
+		return orig, cand, err
+	}
+	if _, err := fCand.Seek(cand.HashOffset, io.SeekStart); err != nil {
+		return orig, cand, err
+	}
+
+	remaining := orig.Size - orig.HashOffset
+	bufOrig := make([]byte, chunkSize)
+	bufCand := make([]byte, chunkSize)
+
+	for remaining > 0 {
+		select {
+		case <-ctx.Done():
+			return orig, cand, ctx.Err()
+		default:
+		}
+
+		toRead := chunkSize
+		if toRead > remaining {
+			toRead = remaining
+		}
+
+		nOrig, _ := io.ReadFull(fOrig, bufOrig[:toRead])
+		nCand, _ := io.ReadFull(fCand, bufCand[:toRead])
+
+		if nOrig != nCand {
+			// Truncated file — not a duplicate.
+			saveHashState(&orig, hOrig, nOrig)
+			saveHashState(&cand, hCand, nCand)
+			return orig, cand, nil
+		}
+
+		hOrig.Write(bufOrig[:nOrig])
+		hCand.Write(bufCand[:nCand])
+
+		// Early-stop: compare accumulated SHA-256 after each chunk.
+		if !hashesEqual(hOrig, hCand) {
+			saveHashState(&orig, hOrig, nOrig)
+			saveHashState(&cand, hCand, nCand)
+			return orig, cand, nil
+		}
+
+		remaining -= int64(nOrig)
+	}
+
+	// End of file reached with matching hashes — SHA-256 is complete.
+	finishHash(hOrig, &orig.SHA256)
+	finishHash(hCand, &cand.SHA256)
+	orig.HashOffset = orig.Size
+	cand.HashOffset = cand.Size
+	orig.HashState = nil // no longer needed, SHA-256 is complete
+	cand.HashState = nil
+	return orig, cand, nil
 }
 
 // execute performs the configured action on the duplicate file.
-// The files have already been confirmed as duplicates.
 func (e *Executor) execute(ctx context.Context, group dupe.DupeGroup) (Result, error) {
 	select {
 	case <-ctx.Done():
@@ -108,7 +202,7 @@ func (e *Executor) execute(ctx context.Context, group dupe.DupeGroup) (Result, e
 	}
 	switch e.opts.Action {
 	case config.ActionReport:
-		return ResultVerifiedDuplicate, nil // Confirmed duplicate, no action taken.
+		return ResultVerifiedDuplicate, nil
 	case config.ActionDelete:
 		return e.deleteFile(group)
 	case config.ActionHardlink:
@@ -120,73 +214,37 @@ func (e *Executor) execute(ctx context.Context, group dupe.DupeGroup) (Result, e
 	}
 }
 
-// VerifyFullFile performs a byte-by-byte comparison of two files.
-// Returns true if the files are identical.
-func VerifyFullFile(pathA, pathB string, expectedSize int64) (bool, error) {
-	// Quick check: sizes must match.
-	infoA, err := os.Stat(pathA)
-	if err != nil {
-		return false, err
+// restoreHasher creates a new SHA-256 hasher. If state is non-nil, it restores
+// the hasher to the saved state (resuming incremental hashing).
+func restoreHasher(state []byte) (hash.Hash, error) {
+	h := sha256.New()
+	if len(state) > 0 {
+		if m, ok := h.(encoding.BinaryUnmarshaler); ok {
+			if err := m.UnmarshalBinary(state); err != nil {
+				return nil, err
+			}
+		}
 	}
-	infoB, err := os.Stat(pathB)
-	if err != nil {
-		return false, err
-	}
-	if infoA.Size() != infoB.Size() {
-		return false, nil
-	}
-
-	// Check if they are the same file (same inode).
-	if os.SameFile(infoA, infoB) {
-		return true, nil
-	}
-
-	// Reset expectedSize to actual size if mismatch.
-	if expectedSize != infoA.Size() {
-		expectedSize = infoA.Size()
-	}
-
-	return compareFiles(pathA, pathB, expectedSize)
+	return h, nil
 }
 
-// compareFiles reads both files in chunks and compares each chunk.
-func compareFiles(pathA, pathB string, size int64) (bool, error) {
-	fA, err := os.Open(pathA)
-	if err != nil {
-		return false, err
-	}
-	defer fA.Close()
-
-	fB, err := os.Open(pathB)
-	if err != nil {
-		return false, err
-	}
-	defer fB.Close()
-
-	bufA := make([]byte, chunkSize)
-	bufB := make([]byte, chunkSize)
-
-	remaining := size
-	for remaining > 0 {
-		toRead := chunkSize
-		if int64(toRead) > remaining {
-			toRead = int(remaining)
+// saveHashState marshals the hasher state and updates the FileInfo's hash progress.
+func saveHashState(fi *dupe.FileInfo, h hash.Hash, bytesRead int) {
+	if m, ok := h.(encoding.BinaryMarshaler); ok {
+		state, err := m.MarshalBinary()
+		if err == nil {
+			fi.HashState = state
 		}
-
-		nA, errA := fA.Read(bufA[:toRead])
-		nB, errB := fB.Read(bufB[:toRead])
-
-		if nA != nB || !bytes.Equal(bufA[:nA], bufB[:nB]) {
-			return false, nil
-		}
-
-		// If either read had an unexpected EOF, treat as mismatch.
-		if (errA != nil && nA < toRead) || (errB != nil && nB < toRead) {
-			return false, nil
-		}
-
-		remaining -= int64(toRead)
 	}
+	fi.HashOffset += int64(bytesRead)
+}
 
-	return true, nil
+// hashesEqual compares the current accumulated hashes of two SHA-256 digests.
+func hashesEqual(a, b hash.Hash) bool {
+	return string(a.Sum(nil)) == string(b.Sum(nil))
+}
+
+// finishHash finalizes a hash.Hash into a [32]byte.
+func finishHash(h hash.Hash, out *[32]byte) {
+	h.Sum((*out)[:0])
 }

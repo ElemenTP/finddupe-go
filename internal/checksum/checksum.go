@@ -3,6 +3,7 @@
 package checksum
 
 import (
+	"crypto/sha256"
 	"io"
 	"os"
 )
@@ -15,26 +16,66 @@ const BytesToChecksum = 32768
 // The signature is (crc << 32) | sum, where crc and sum are computed from
 // the first BytesToChecksum bytes, and fileSize is added to sum.
 func Compute(path string, size int64) (uint64, error) {
-	sig, _, _, err := ComputeFileInfo(path, size)
+	sig, _, _, _, err := ComputeFileInfo(path, size)
 	return sig, err
 }
 
 // ComputeFileInfo opens the file once and returns the checksum signature,
-// filesystem inode, and hardlink count. On Windows, this uses
+// filesystem inode, hardlink count, and SHA-256 hash. On Windows, this uses
 // GetFileInformationByHandle on the already-open handle — avoiding a
 // second CreateFile call in the single-threaded walker.
-func ComputeFileInfo(path string, size int64) (sig uint64, inode uint64, numLinks uint64, err error) {
+//
+// When size <= BytesToChecksum (32KB), the entire file is read for CRC so
+// SHA-256 is also computed at zero additional cost. For larger files,
+// SHA-256 is returned as zero (not yet computed).
+func ComputeFileInfo(path string, size int64) (sig uint64, inode uint64, numLinks uint64, sha256sum [32]byte, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, [32]byte{}, err
 	}
 	defer f.Close()
 
 	// Get inode from the open file handle (platform-specific).
 	inode, numLinks = fileInode(f)
 
-	sig, err = ComputeFromReader(f, size)
-	return sig, inode, numLinks, err
+	if size <= BytesToChecksum {
+		// File fits entirely in the CRC buffer — compute SHA-256 alongside CRC
+		// at zero additional I/O cost.
+		sig, sha256sum, err = computeBoth(f, size)
+	} else {
+		sig, err = ComputeFromReader(f, size)
+	}
+	return sig, inode, numLinks, sha256sum, err
+}
+
+// computeBoth reads the entire file (up to BytesToChecksum) and computes
+// both the weak CRC signature and the SHA-256 hash. The file must be
+// <= BytesToChecksum bytes.
+func computeBoth(r io.Reader, size int64) (uint64, [32]byte, error) {
+	bytesToRead := min(size, BytesToChecksum)
+	buf := make([]byte, bytesToRead)
+	n, err := io.ReadFull(r, buf)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return 0, [32]byte{}, err
+	}
+	buf = buf[:n]
+
+	// Weak CRC (matching C CalcCrc algorithm).
+	var crc uint32
+	var sum uint32
+	for _, b := range buf {
+		crc ^= uint32(b)
+		sum += uint32(b)
+		crc = (crc >> 8) ^ ((crc & 0xff) << 24) ^ ((crc & 0xff) << 9)
+		sum = (sum << 1) + (sum >> 31)
+	}
+	sum += uint32(size)
+	sig := (uint64(crc) << 32) | uint64(sum)
+
+	// SHA-256 of the complete file content.
+	sha256sum := sha256.Sum256(buf)
+
+	return sig, sha256sum, nil
 }
 
 // ComputeFromReader reads up to BytesToChecksum bytes from r and returns the composite checksum.

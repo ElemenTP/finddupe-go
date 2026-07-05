@@ -3,7 +3,10 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -21,17 +24,14 @@ import (
 
 // Run executes the full duplicate detection pipeline.
 func Run(ctx context.Context, cfg *config.Config) error {
-	// Set up signal handling.
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
 	defer cancel()
 
-	// Determine thread count.
 	threads := cfg.Threads
 	if threads <= 0 {
-		threads = runtime.NumCPU()
+		threads = runtime.NumCPU() * 2
 	}
 
-	// Set up logging.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelWarn,
 	}))
@@ -41,7 +41,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		}))
 	}
 
-	// Create components.
 	stats := dupe.NewStats()
 	detector := dupe.NewDetector(stats)
 	walker := fswalker.New()
@@ -54,19 +53,17 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	executor := action.New(execOpts)
 
-	// Create channels.
 	walkResultCh := make(chan fswalker.Result, threads*4)
 	fileCh := make(chan dupe.FileInfo, threads*4)
 	groupCh := make(chan dupe.DupeGroup, threads)
 	errCh := make(chan error, 1)
 
-	// Start progress reporter if enabled.
 	if cfg.ShowProgress {
 		prog := progress.New(stats)
 		go prog.Run(ctx)
 	}
 
-	// Start the filesystem walker.
+	// Filesystem walker.
 	go func() {
 		defer close(walkResultCh)
 		opts := fswalker.WalkOptions{
@@ -74,8 +71,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			IncludeZeroLen: cfg.IncludeZeroLen,
 			ZeroLen:        stats,
 		}
-
-		// Walk regular paths (not reference files).
 		for result := range walker.Walk(ctx, cfg.Paths, opts) {
 			select {
 			case walkResultCh <- result:
@@ -83,9 +78,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 				return
 			}
 		}
-
-		// Walk reference paths — these files are compared against but never
-		// acted upon (deleted, hardlinked, etc.).
 		for result := range walker.Walk(ctx, cfg.RefPaths, opts) {
 			result.Info.IsRef = true
 			select {
@@ -96,10 +88,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		}
 	}()
 
-	runNormalMode(ctx, cfg, walkResultCh, fileCh, groupCh, errCh,
+	runNormalMode(ctx, walkResultCh, fileCh, groupCh, errCh,
 		pool, stats, detector, executor, logger)
 
-	// Wait for completion or error.
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -109,17 +100,13 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
-	// Print summary.
-	printSummary(cfg, stats, detector)
+	printSummary(stats)
 
 	return nil
 }
 
-// runNormalMode runs the checksum-based duplicate detection pipeline.
-// Checksums are computed in the worker pool for parallelism.
 func runNormalMode(
 	ctx context.Context,
-	cfg *config.Config,
 	walkResultCh <-chan fswalker.Result,
 	fileCh chan dupe.FileInfo,
 	groupCh chan dupe.DupeGroup,
@@ -130,9 +117,7 @@ func runNormalMode(
 	executor *action.Executor,
 	logger *slog.Logger,
 ) {
-	// Scanner workers: compute checksums for walked files in the pool.
-	// Inode info is also retrieved from the already-open file handle
-	// (important on Windows where this requires a system call).
+	// Scanner: compute CRC (+ SHA-256 for ≤32KB files) in the worker pool.
 	go func() {
 		var pending sync.WaitGroup
 		defer func() {
@@ -142,15 +127,12 @@ func runNormalMode(
 		for result := range walkResultCh {
 			if result.Err != nil {
 				stats.CantReadFiles.Add(1)
-				logger.Warn("cannot read file", "path", result.Info.Path, "error", result.Err)
+				logger.WarnContext(ctx, "cannot read file", "path", result.Info.Path, "error", result.Err)
 				continue
 			}
 
 			fi := result.Info
 
-			// Check ctx before incrementing pending to avoid deadlock:
-			// if Submit returns false, the callback is never executed and
-			// pending.Done would never be called.
 			select {
 			case <-ctx.Done():
 				continue
@@ -162,28 +144,28 @@ func runNormalMode(
 			if !pool.Submit(ctx, func(ctx context.Context) {
 				defer pending.Done()
 
-				// Open file once: compute checksum AND retrieve inode/link info.
-				sig, inode, numLinks, err := checksum.ComputeFileInfo(fi.Path, fi.Size)
+				sig, inode, numLinks, sha256sum, err := checksum.ComputeFileInfo(fi.Path, fi.Size)
 				if err != nil {
 					stats.CantReadFiles.Add(1)
-					logger.Warn("checksum failed", "path", fi.Path, "error", err)
+					logger.WarnContext(ctx, "checksum failed", "path", fi.Path, "error", err)
 					return
 				}
 				fi.Signature = sig
 				fi.Inode = inode
 				fi.NumLinks = numLinks
+				fi.SHA256 = sha256sum
 
 				select {
 				case fileCh <- fi:
 				case <-ctx.Done():
 				}
 			}) {
-				pending.Done() // Submit declined due to cancellation.
+				pending.Done()
 			}
 		}
 	}()
 
-	// Detector: insert files into the duplicate detector.
+	// Detector: insert files, emit DupeGroups, trigger mass SHA-256 for 3+ groups.
 	go func() {
 		defer close(groupCh)
 		for fi := range fileCh {
@@ -195,80 +177,163 @@ func runNormalMode(
 					return
 				}
 			}
+
+			// Strategy 4: if group has 3+ files, submit mass SHA-256 computation
+			// for all files in the zero-SHA bucket. These run concurrently in the
+			// pool. Completed hashes are recorded via detector.UpdateFileState.
+			key := dupe.GroupKey{Signature: fi.Signature, Size: fi.Size}
+			if detector.GroupSize(key) >= 3 {
+				for _, uf := range detector.UnhashedFiles(key) {
+					f := uf
+					pool.Submit(ctx, func(ctx context.Context) {
+						computeFullSHA(ctx, &f, detector)
+					})
+				}
+			}
 		}
 	}()
 
-	// Executor: verify and execute actions on duplicate groups.
+	// Executor: verify DupeGroups and execute actions, all in the worker pool.
 	go func() {
+		var verifyWg sync.WaitGroup
 		defer func() {
+			verifyWg.Wait()
 			errCh <- nil
 			close(errCh)
 		}()
 		for group := range groupCh {
-			result, err := executor.VerifyAndExecute(ctx, group)
-			if err != nil {
-				logger.Error("action failed",
-					"original", group.Original.Path,
-					"candidate", group.Candidate.Path,
-					"error", err,
-				)
-				continue
-			}
+			g := group
+			verifyWg.Add(1)
 
-			// Update stats based on result.
-			switch result {
-			case action.ResultNotDuplicate:
-				continue
-			case action.ResultAlreadyHardlinked:
-				// Already hardlinked files skipped via --hardlink flag.
-				if cfg.Verbose {
-					fmt.Fprintf(os.Stderr, "Already hardlinked: '%s' and '%s'\n",
-						group.Original.Path, group.Candidate.Path)
-				}
-				continue
-			case action.ResultError:
-				logger.Error("action error", "candidate", group.Candidate.Path)
-				continue
-			case action.ResultHardlinkLimit:
-				logger.Warn("hardlink limit reached",
-					"original", group.Original.Path,
-					"candidate", group.Candidate.Path,
-				)
-				continue
-			case action.ResultVerifiedDuplicate:
-				fmt.Fprintf(os.Stderr, "Duplicate: '%s'\n", group.Original.Path)
-				fmt.Fprintf(os.Stderr, "With:      '%s'\n", group.Candidate.Path)
-				stats.DuplicateFiles.Add(1)
-				stats.DuplicateBytes.Add(group.Candidate.Size)
-			case action.ResultDeleted:
-				fmt.Fprintf(os.Stderr, "Deleted:    '%s'\n", group.Candidate.Path)
-				stats.DuplicateFiles.Add(1)
-				stats.DuplicateBytes.Add(group.Candidate.Size)
-				stats.DeletedFiles.Add(1)
-			case action.ResultHardlinked:
-				fmt.Fprintf(os.Stderr, "Hardlinked: '%s'\n", group.Candidate.Path)
-				stats.DuplicateFiles.Add(1)
-				stats.DuplicateBytes.Add(group.Candidate.Size)
-				stats.HardlinkedFiles.Add(1)
-			case action.ResultCoWCloned:
-				fmt.Fprintf(os.Stderr, "CoW cloned: '%s'\n", group.Candidate.Path)
-				stats.DuplicateFiles.Add(1)
-				stats.DuplicateBytes.Add(group.Candidate.Size)
-				stats.CoWClonedFiles.Add(1)
-			case action.ResultSkippedRO:
-				fmt.Fprintf(os.Stderr, "Skipping duplicate readonly file '%s'.\n", group.Candidate.Path)
-				stats.DuplicateFiles.Add(1)
-				stats.DuplicateBytes.Add(group.Candidate.Size)
-				stats.SkippedROFiles.Add(1)
-			case action.ResultSkippedRef:
-				stats.SkippedRefFiles.Add(1)
+			if !pool.Submit(ctx, func(ctx context.Context) {
+				defer verifyWg.Done()
+				handleDupeGroup(ctx, g, executor, detector, stats, logger)
+			}) {
+				verifyWg.Done()
 			}
 		}
 	}()
 }
 
+// handleDupeGroup verifies a DupeGroup and executes the configured action.
+// Called from the worker pool.
+func handleDupeGroup(
+	ctx context.Context,
+	group dupe.DupeGroup,
+	executor *action.Executor,
+	detector *dupe.Detector,
+	stats *dupe.Stats,
+	logger *slog.Logger,
+) {
+	result, updatedOrig, updatedCand, err := executor.VerifyChunked(ctx, group)
+	if err != nil {
+		logger.ErrorContext(ctx, "action failed",
+			"original", group.Original.Path,
+			"candidate", group.Candidate.Path,
+			"error", err,
+		)
+		return
+	}
+
+	// Persist hash progress so future comparisons can resume from the saved state.
+	detector.UpdateFileState(group.Key, updatedOrig.Path,
+		updatedOrig.HashState, updatedOrig.HashOffset, updatedOrig.SHA256)
+	detector.UpdateFileState(group.Key, updatedCand.Path,
+		updatedCand.HashState, updatedCand.HashOffset, updatedCand.SHA256)
+
+	switch result {
+	case action.ResultNotDuplicate:
+		return
+	case action.ResultAlreadyHardlinked:
+		return
+	case action.ResultError:
+		logger.ErrorContext(ctx, "action error", "candidate", group.Candidate.Path)
+		return
+	case action.ResultHardlinkLimit:
+		logger.WarnContext(ctx, "hardlink limit reached",
+			"original", group.Original.Path,
+			"candidate", group.Candidate.Path,
+		)
+		return
+	case action.ResultVerifiedDuplicate:
+		fmt.Fprintf(os.Stderr, "Duplicate: '%s'\n", group.Original.Path)
+		fmt.Fprintf(os.Stderr, "With:      '%s'\n", group.Candidate.Path)
+		stats.DuplicateFiles.Add(1)
+		stats.DuplicateBytes.Add(group.Candidate.Size)
+	case action.ResultDeleted:
+		fmt.Fprintf(os.Stderr, "Deleted:    '%s'\n", group.Candidate.Path)
+		stats.DuplicateFiles.Add(1)
+		stats.DuplicateBytes.Add(group.Candidate.Size)
+		stats.DeletedFiles.Add(1)
+	case action.ResultHardlinked:
+		fmt.Fprintf(os.Stderr, "Hardlinked: '%s'\n", group.Candidate.Path)
+		stats.DuplicateFiles.Add(1)
+		stats.DuplicateBytes.Add(group.Candidate.Size)
+		stats.HardlinkedFiles.Add(1)
+	case action.ResultCoWCloned:
+		fmt.Fprintf(os.Stderr, "CoW cloned: '%s'\n", group.Candidate.Path)
+		stats.DuplicateFiles.Add(1)
+		stats.DuplicateBytes.Add(group.Candidate.Size)
+		stats.CoWClonedFiles.Add(1)
+	case action.ResultSkippedRO:
+		fmt.Fprintf(os.Stderr, "Skipping duplicate readonly file '%s'.\n", group.Candidate.Path)
+		stats.DuplicateFiles.Add(1)
+		stats.DuplicateBytes.Add(group.Candidate.Size)
+		stats.SkippedROFiles.Add(1)
+	case action.ResultSkippedRef:
+		stats.SkippedRefFiles.Add(1)
+	}
+}
+
+// computeFullSHA reads the remainder of a file and computes its complete SHA-256.
+// If the file has partial hash state, hashing resumes from the saved offset.
+// The completed hash is recorded via detector.UpdateFileState.
+func computeFullSHA(ctx context.Context, fi *dupe.FileInfo, detector *dupe.Detector) {
+	f, err := os.Open(fi.Path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if len(fi.HashState) > 0 {
+		if m, ok := h.(encoding.BinaryUnmarshaler); ok {
+			if err := m.UnmarshalBinary(fi.HashState); err != nil {
+				return
+			}
+		}
+	}
+
+	if _, err := f.Seek(fi.HashOffset, io.SeekStart); err != nil {
+		return
+	}
+
+	remaining := fi.Size - fi.HashOffset
+	buf := make([]byte, 1024*1024) // 1 MB buffer
+	for remaining > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		toRead := int64(len(buf))
+		if toRead > remaining {
+			toRead = remaining
+		}
+		n, _ := io.ReadFull(f, buf[:toRead])
+		h.Write(buf[:n])
+		remaining -= int64(n)
+	}
+
+	var sha256sum [32]byte
+	h.Sum(sha256sum[:0])
+
+	key := dupe.GroupKey{Signature: fi.Signature, Size: fi.Size}
+	detector.UpdateFileState(key, fi.Path, nil, fi.Size, sha256sum)
+}
+
 // printSummary outputs the final statistics.
-func printSummary(cfg *config.Config, stats *dupe.Stats, detector *dupe.Detector) {
+func printSummary(stats *dupe.Stats) {
 	totalFiles := stats.TotalFiles.Load()
 	totalBytes := stats.TotalBytes.Load()
 
@@ -287,7 +352,6 @@ func printSummary(cfg *config.Config, stats *dupe.Stats, detector *dupe.Detector
 	if n := stats.CantReadFiles.Load(); n > 0 {
 		fmt.Fprintf(os.Stderr, "  %d files could not be opened\n", n)
 	}
-
 	if n := stats.DeletedFiles.Load(); n > 0 {
 		fmt.Fprintf(os.Stderr, "  %d files deleted\n", n)
 	}
@@ -305,7 +369,6 @@ func printSummary(cfg *config.Config, stats *dupe.Stats, detector *dupe.Detector
 	}
 }
 
-// formatSize formats a byte count for human display.
 func formatSize(bytes int64) string {
 	if bytes < 1024 {
 		return fmt.Sprintf("%d B", bytes)

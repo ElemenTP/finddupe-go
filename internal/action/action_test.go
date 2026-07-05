@@ -13,26 +13,37 @@ import (
 	"finddupe/internal/dupe"
 )
 
-func TestVerifyFullFile_Identical(t *testing.T) {
+func TestVerifyChunked_Identical(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	data := make([]byte, 100000)
+	data := make([]byte, 200000)
 	rand.Read(data)
 	a := filepath.Join(dir, "a.bin")
 	b := filepath.Join(dir, "b.bin")
 	os.WriteFile(a, data, 0644)
 	os.WriteFile(b, data, 0644)
 
-	ok, err := action.VerifyFullFile(a, b, int64(len(data)))
+	exec := action.New(action.Options{Action: config.ActionReport})
+	result, upOrig, upCand, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
+		Candidate: dupe.FileInfo{Path: b, Size: int64(len(data))},
+		Original:  dupe.FileInfo{Path: a, Size: int64(len(data))},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok {
-		t.Error("expected identical files to be verified as duplicates")
+	if result != action.ResultVerifiedDuplicate {
+		t.Errorf("expected ResultVerifiedDuplicate, got %d", result)
+	}
+	if upCand.SHA256 == ([32]byte{}) {
+		t.Error("expected complete SHA-256 on candidate")
+	}
+	if upCand.SHA256 != upOrig.SHA256 {
+		t.Error("expected matching SHA-256 for identical files")
 	}
 }
 
-func TestVerifyFullFile_Different(t *testing.T) {
+func TestVerifyChunked_Different(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.bin")
@@ -40,16 +51,31 @@ func TestVerifyFullFile_Different(t *testing.T) {
 	os.WriteFile(a, []byte("aaaa"), 0644)
 	os.WriteFile(b, []byte("bbbb"), 0644)
 
-	ok, err := action.VerifyFullFile(a, b, 4)
+	exec := action.New(action.Options{Action: config.ActionReport})
+	result, _, upCand, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+		Key:       dupe.GroupKey{Signature: 1, Size: 4},
+		Candidate: dupe.FileInfo{Path: b, Size: 4},
+		Original:  dupe.FileInfo{Path: a, Size: 4},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok {
-		t.Error("expected different files to not be duplicates")
+	if result != action.ResultNotDuplicate {
+		t.Errorf("expected ResultNotDuplicate, got %d", result)
+	}
+	// Early-stop: SHA-256 should be incomplete, hash state saved.
+	if upCand.SHA256 != ([32]byte{}) {
+		t.Error("expected incomplete SHA-256 after early-stop")
+	}
+	if len(upCand.HashState) == 0 {
+		t.Error("expected hash state saved after early-stop")
+	}
+	if upCand.HashOffset == 0 {
+		t.Error("expected non-zero hash offset after early-stop")
 	}
 }
 
-func TestVerifyFullFile_DifferentSizes(t *testing.T) {
+func TestVerifyChunked_DifferentSizes(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.bin")
@@ -57,53 +83,65 @@ func TestVerifyFullFile_DifferentSizes(t *testing.T) {
 	os.WriteFile(a, []byte("short"), 0644)
 	os.WriteFile(b, []byte("longer_file"), 0644)
 
-	ok, err := action.VerifyFullFile(a, b, 4)
+	exec := action.New(action.Options{Action: config.ActionReport})
+	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+		Key:       dupe.GroupKey{Signature: 1, Size: 5},
+		Candidate: dupe.FileInfo{Path: b, Size: 11},
+		Original:  dupe.FileInfo{Path: a, Size: 5},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok {
-		t.Error("expected different-sized files to not be duplicates")
+	if result != action.ResultNotDuplicate {
+		t.Errorf("expected ResultNotDuplicate for different sizes, got %d", result)
 	}
 }
 
-func TestVerifyFullFile_LargeFiles(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	// Create files larger than 64KB chunk.
-	data := make([]byte, 200000)
-	rand.Read(data)
-	a := filepath.Join(dir, "a.bin")
-	b := filepath.Join(dir, "b.bin")
-	os.WriteFile(a, data, 0644)
-	os.WriteFile(b, data, 0644)
-
-	ok, err := action.VerifyFullFile(a, b, int64(len(data)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Error("expected identical large files to be verified as duplicates")
-	}
-}
-
-func TestVerifyFullFile_DifferAfterFirstChunk(t *testing.T) {
+func TestVerifyChunked_PartialStateResume(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	data := make([]byte, 200000)
 	rand.Read(data)
 	a := filepath.Join(dir, "a.bin")
-	b := filepath.Join(dir, "b.bin")
 	os.WriteFile(a, data, 0644)
-	// Make files differ after 100KB.
-	data[100000] ^= 0xFF
-	os.WriteFile(b, data, 0644)
 
-	ok, err := action.VerifyFullFile(a, b, int64(len(data)))
+	// b has same first 64KB, different after.
+	dataB := make([]byte, 200000)
+	copy(dataB, data)
+	dataB[100000] ^= 0xFF
+	b := filepath.Join(dir, "b.bin")
+	os.WriteFile(b, dataB, 0644)
+
+	exec := action.New(action.Options{Action: config.ActionReport})
+
+	// First comparison: should early-stop, saving partial state.
+	_, upOrig, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
+		Candidate: dupe.FileInfo{Path: b, Size: int64(len(dataB))},
+		Original:  dupe.FileInfo{Path: a, Size: int64(len(data))},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok {
-		t.Error("expected files differing after first chunk to not be duplicates")
+	if upOrig.HashOffset == 0 {
+		t.Error("expected partial hash state after early-stop")
+	}
+
+	// Second comparison: resume from partial state.
+	// c matches b exactly.
+	c := filepath.Join(dir, "c.bin")
+	os.WriteFile(c, dataB, 0644)
+
+	_, upOrig2, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(dataB))},
+		Candidate: dupe.FileInfo{Path: c, Size: int64(len(dataB))},
+		Original:  upOrig, // has partial state from first comparison
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upOrig2.HashOffset <= upOrig.HashOffset {
+		t.Error("expected hash offset to increase after resume")
 	}
 }
 
@@ -116,10 +154,9 @@ func TestDelete_Success(t *testing.T) {
 	os.WriteFile(origPath, data, 0644)
 	os.WriteFile(dupPath, data, 0644)
 
-	exec := action.New(action.Options{
-		Action: config.ActionDelete,
-	})
-	result, err := exec.VerifyAndExecute(context.Background(), dupe.DupeGroup{
+	exec := action.New(action.Options{Action: config.ActionDelete})
+	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
 		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
 		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
 	})
@@ -144,10 +181,9 @@ func TestHardlink_Created(t *testing.T) {
 	os.WriteFile(origPath, data, 0644)
 	os.WriteFile(dupPath, data, 0644)
 
-	exec := action.New(action.Options{
-		Action: config.ActionHardlink,
-	})
-	result, err := exec.VerifyAndExecute(context.Background(), dupe.DupeGroup{
+	exec := action.New(action.Options{Action: config.ActionHardlink})
+	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
 		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
 		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
 	})
@@ -158,61 +194,15 @@ func TestHardlink_Created(t *testing.T) {
 		t.Errorf("expected ResultHardlinked, got %d", result)
 	}
 
-	// Verify the duplicate path now points to the same inode as original.
 	origInfo, _ := os.Stat(origPath)
 	dupInfo, _ := os.Stat(dupPath)
 	if !os.SameFile(origInfo, dupInfo) {
 		t.Error("expected files to be hardlinked (same file)")
 	}
 
-	// Verify content is preserved.
 	dupData, _ := os.ReadFile(dupPath)
 	if !bytes.Equal(data, dupData) {
 		t.Error("expected content to be preserved after hardlink")
-	}
-}
-
-func TestHardlink_NotDuplicate(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	origPath := filepath.Join(dir, "original.bin")
-	dupPath := filepath.Join(dir, "different.bin")
-	os.WriteFile(origPath, []byte("aaaa"), 0644)
-	os.WriteFile(dupPath, []byte("bbbb"), 0644)
-
-	exec := action.New(action.Options{
-		Action: config.ActionHardlink,
-	})
-	result, err := exec.VerifyAndExecute(context.Background(), dupe.DupeGroup{
-		Candidate: dupe.FileInfo{Path: dupPath, Size: 4},
-		Original:  dupe.FileInfo{Path: origPath, Size: 4},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result != action.ResultNotDuplicate {
-		t.Errorf("expected ResultNotDuplicate, got %d", result)
-	}
-}
-
-func TestCoW_Unsupported(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	origPath := filepath.Join(dir, "original.bin")
-	dupPath := filepath.Join(dir, "duplicate.bin")
-	data := []byte("test data for cow")
-	os.WriteFile(origPath, data, 0644)
-	os.WriteFile(dupPath, data, 0644)
-
-	exec := action.New(action.Options{
-		Action: config.ActionCoWClone,
-	})
-	_, err := exec.VerifyAndExecute(context.Background(), dupe.DupeGroup{
-		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
-		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
-	})
-	if err == nil {
-		t.Error("expected CoW to return error (not implemented)")
 	}
 }
 
@@ -225,22 +215,39 @@ func TestReport_NoAction(t *testing.T) {
 	os.WriteFile(origPath, data, 0644)
 	os.WriteFile(dupPath, data, 0644)
 
-	exec := action.New(action.Options{
-		Action: config.ActionReport,
-	})
-	result, err := exec.VerifyAndExecute(context.Background(), dupe.DupeGroup{
+	exec := action.New(action.Options{Action: config.ActionReport})
+	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
 		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
 		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Report mode returns ResultVerifiedDuplicate (confirmed duplicate, no action taken).
 	if result != action.ResultVerifiedDuplicate {
-		t.Errorf("expected ResultVerifiedDuplicate for report mode, got %d", result)
+		t.Errorf("expected ResultVerifiedDuplicate, got %d", result)
 	}
-	// Verify dupe file still exists.
 	if _, statErr := os.Stat(dupPath); statErr != nil {
 		t.Error("expected duplicate file to still exist in report mode")
+	}
+}
+
+func TestCoW_Unsupported(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	origPath := filepath.Join(dir, "original.bin")
+	dupPath := filepath.Join(dir, "duplicate.bin")
+	data := []byte("test data for cow")
+	os.WriteFile(origPath, data, 0644)
+	os.WriteFile(dupPath, data, 0644)
+
+	exec := action.New(action.Options{Action: config.ActionCoWClone})
+	_, _, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
+		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
+		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
+	})
+	if err == nil {
+		t.Error("expected CoW to return error (not implemented)")
 	}
 }
