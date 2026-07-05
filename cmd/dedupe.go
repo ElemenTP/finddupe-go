@@ -36,6 +36,7 @@ var dedupeFlags struct {
 	followSymlinks bool
 	rdonly         bool
 	threads        int
+	refPaths       []string
 }
 
 func init() {
@@ -61,6 +62,8 @@ func init() {
 		"Also operate on read-only files (Windows)")
 	dedupeCmd.Flags().IntVarP(&dedupeFlags.threads, "threads", "t", 0,
 		"Number of scanner workers (default: number of CPUs)")
+	dedupeCmd.Flags().StringArrayVar(&dedupeFlags.refPaths, "ref", nil,
+		"Mark following path as reference (compare against but never act upon); repeatable")
 }
 
 // runDedupe builds the config and runs the pipeline in dedupe mode.
@@ -71,14 +74,11 @@ func runDedupe(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Separate paths and ref patterns.
-	paths, refPaths := splitPaths(args)
-
 	cfg := &config.Config{
 		Mode:            config.ModeDedupe,
 		Action:          action,
-		Paths:           paths,
-		RefPaths:        refPaths,
+		Paths:           args,
+		RefPaths:        dedupeFlags.refPaths,
 		Threads:         dedupeFlags.threads,
 		Verbose:         dedupeFlags.verbose,
 		PrintSigs:       dedupeFlags.sigs,

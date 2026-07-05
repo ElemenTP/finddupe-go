@@ -33,6 +33,7 @@ var findFlags struct {
 	noProgress     bool
 	followSymlinks bool
 	threads        int
+	refPaths       []string
 }
 
 func init() {
@@ -54,18 +55,17 @@ func init() {
 		"Follow symbolic links and reparse points")
 	findCmd.Flags().IntVarP(&findFlags.threads, "threads", "t", 0,
 		"Number of scanner workers (default: number of CPUs)")
+	findCmd.Flags().StringArrayVar(&findFlags.refPaths, "ref", nil,
+		"Mark following path as reference (compare against but never act upon); repeatable")
 }
 
 // runFind builds the config and runs the pipeline in find mode.
 func runFind(cmd *cobra.Command, args []string) error {
-	// Separate paths and ref patterns.
-	paths, refPaths := splitPaths(args)
-
 	cfg := &config.Config{
 		Mode:           config.ModeFind,
 		Action:         config.ActionReport,
-		Paths:          paths,
-		RefPaths:       refPaths,
+		Paths:          args,
+		RefPaths:       findFlags.refPaths,
 		Threads:        findFlags.threads,
 		Verbose:        findFlags.verbose,
 		PrintSigs:      findFlags.sigs,
@@ -76,23 +76,4 @@ func runFind(cmd *cobra.Command, args []string) error {
 	}
 
 	return pipeline.Run(cmd.Context(), cfg)
-}
-
-// splitPaths separates regular paths from --ref paths.
-// TODO: support --ref flag properly via cobra's built-in mechanism.
-func splitPaths(args []string) (paths, refPaths []string) {
-	inRef := false
-	for _, a := range args {
-		if a == "--ref" {
-			inRef = true
-			continue
-		}
-		if inRef {
-			refPaths = append(refPaths, a)
-			inRef = false
-		} else {
-			paths = append(paths, a)
-		}
-	}
-	return
 }

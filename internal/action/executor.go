@@ -101,6 +101,11 @@ func (e *Executor) VerifyAndExecute(ctx context.Context, group dupe.DupeGroup) (
 // execute performs the configured action on the duplicate file.
 // The files have already been confirmed as duplicates.
 func (e *Executor) execute(ctx context.Context, group dupe.DupeGroup) (Result, error) {
+	select {
+	case <-ctx.Done():
+		return ResultError, ctx.Err()
+	default:
+	}
 	switch e.opts.Action {
 	case config.ActionReport:
 		return ResultVerifiedDuplicate, nil // Confirmed duplicate, no action taken.

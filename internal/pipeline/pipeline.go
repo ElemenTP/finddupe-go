@@ -75,10 +75,19 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			ZeroLen:        stats,
 		}
 
-		allPaths := append([]string{}, cfg.Paths...)
-		allPaths = append(allPaths, cfg.RefPaths...)
+		// Walk regular paths (not reference files).
+		for result := range walker.Walk(ctx, cfg.Paths, opts) {
+			select {
+			case walkResultCh <- result:
+			case <-ctx.Done():
+				return
+			}
+		}
 
-		for result := range walker.Walk(ctx, allPaths, opts) {
+		// Walk reference paths — these files are compared against but never
+		// acted upon (deleted, hardlinked, etc.).
+		for result := range walker.Walk(ctx, cfg.RefPaths, opts) {
+			result.Info.IsRef = true
 			select {
 			case walkResultCh <- result:
 			case <-ctx.Done():
