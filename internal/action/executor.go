@@ -64,6 +64,22 @@ func chunkSizeFor(fileSize int64) int64 {
 	}
 }
 
+func (e *Executor) DoExecution(ctx context.Context, exec dupe.Execution) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	switch exec.Type {
+	case dupe.HashCalc:
+	case dupe.HashComp:
+	case dupe.DupeElim:
+	default:
+	}
+	return nil
+}
+
 // VerifyChunked performs chunked SHA-256 comparison between the candidate and
 // original file. If either file has saved hash state (from a previous early-stop),
 // hashing resumes from the saved offset to avoid re-reading.
@@ -71,7 +87,7 @@ func chunkSizeFor(fileSize int64) int64 {
 // Returns updated FileInfo for both files with current hash state and offset.
 // If the files are identical and the full file was hashed, SHA-256 is complete.
 func (e *Executor) VerifyChunked(
-	ctx context.Context, group dupe.DupeGroup,
+	ctx context.Context, group dupe.Execution,
 ) (Result, dupe.FileInfo, dupe.FileInfo, error) {
 	select {
 	case <-ctx.Done():
@@ -194,7 +210,7 @@ func hashCompare(
 }
 
 // execute performs the configured action on the duplicate file.
-func (e *Executor) execute(ctx context.Context, group dupe.DupeGroup) (Result, error) {
+func (e *Executor) execute(ctx context.Context, group dupe.Execution) (Result, error) {
 	select {
 	case <-ctx.Done():
 		return ResultError, ctx.Err()

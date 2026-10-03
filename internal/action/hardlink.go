@@ -8,7 +8,7 @@ import (
 
 // createHardlink replaces the duplicate file with a hardlink to the original.
 // Strategy: delete the duplicate, then create a hardlink at its path pointing to the original.
-func (e *Executor) createHardlink(group dupe.DupeGroup) (Result, error) {
+func (e *Executor) createHardlink(group dupe.Execution) (Result, error) {
 	candidatePath := group.Candidate.Path
 	originalPath := group.Original.Path
 

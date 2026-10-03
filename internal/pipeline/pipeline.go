@@ -42,9 +42,32 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	stats := dupe.NewStats()
-	detector := dupe.NewDetector(stats)
-	walker := fswalker.New()
+	if cfg.ShowProgress {
+		prog := progress.New(stats)
+		go prog.Run(ctx)
+	}
+
 	pool := worker.New(threads)
+	var pending sync.WaitGroup
+	defer pending.Wait()
+
+	pushtask := func(fn func(context.Context)) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		pending.Add(1)
+		if !pool.Submit(ctx, func(ctx context.Context) {
+			defer pending.Done()
+			fn(ctx)
+		}) {
+			pending.Done()
+		}
+	}
+
+	walker := fswalker.New()
+	detector := dupe.NewDetector(stats)
 
 	execOpts := action.Options{
 		Action:          cfg.Action,
@@ -54,17 +77,12 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	executor := action.New(execOpts)
 
 	walkResultCh := make(chan fswalker.Result, threads*4)
-	fileCh := make(chan dupe.FileInfo, threads*4)
-	groupCh := make(chan dupe.DupeGroup, threads)
+	fileInfoCh := make(chan dupe.FileInfo, threads*4)
+	executionCh := make(chan dupe.Execution, threads)
 	errCh := make(chan error, 1)
 
-	if cfg.ShowProgress {
-		prog := progress.New(stats)
-		go prog.Run(ctx)
-	}
-
 	// Filesystem walker.
-	go func() {
+	pushtask(func(ctx context.Context) {
 		defer close(walkResultCh)
 		opts := fswalker.WalkOptions{
 			FollowSymlinks: cfg.FollowSymlinks,
@@ -86,11 +104,72 @@ func Run(ctx context.Context, cfg *config.Config) error {
 				return
 			}
 		}
-	}()
+	})
 
-	runNormalMode(ctx, walkResultCh, fileCh, groupCh, errCh,
-		pool, stats, detector, executor, logger)
+	// Scanner feeder
+	pushtask(func(ctx context.Context) {
+		defer close(fileInfoCh)
+		for result := range walkResultCh {
+			select {
+			case <-ctx.Done():
+				continue
+			default:
+			}
+			if result.Err != nil {
+				stats.CantReadFiles.Add(1)
+				logger.WarnContext(ctx, "cannot read file", "path", result.Info.Path, "error", result.Err)
+				continue
+			}
 
+			fi := result.Info
+			pushtask(func(ctx context.Context) {
+				sig, inode, numLinks, sha256sum, err := checksum.ComputeFileInfo(fi.Path, fi.Size)
+				if err != nil {
+					stats.CantReadFiles.Add(1)
+					logger.WarnContext(ctx, "checksum failed", "path", fi.Path, "error", err)
+					return
+				}
+				fi.Signature = sig
+				fi.Inode = inode
+				fi.NumLinks = numLinks
+				fi.SHA256 = sha256sum
+
+				select {
+				case fileInfoCh <- fi:
+				case <-ctx.Done():
+				}
+			})
+		}
+	})
+
+	// Detector
+	pushtask(func(ctx context.Context) {
+		defer close(executionCh)
+		for fi := range fileInfoCh {
+			select {
+			case <-ctx.Done():
+				continue
+			default:
+			}
+			executions := detector.Insert(fi)
+			for _, exec := range executions {
+				select {
+				case executionCh <- exec:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	})
+
+	// Executor
+	pushtask(func(ctx context.Context) {
+		defer func() {
+			errCh <- nil
+			close(errCh)
+		}()
+
+	})
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -105,121 +184,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	return nil
 }
 
-func runNormalMode(
-	ctx context.Context,
-	walkResultCh <-chan fswalker.Result,
-	fileCh chan dupe.FileInfo,
-	groupCh chan dupe.DupeGroup,
-	errCh chan<- error,
-	pool *worker.Pool,
-	stats *dupe.Stats,
-	detector *dupe.Detector,
-	executor *action.Executor,
-	logger *slog.Logger,
-) {
-	// Scanner: compute CRC (+ SHA-256 for ≤32KB files) in the worker pool.
-	go func() {
-		var pending sync.WaitGroup
-		defer func() {
-			pending.Wait()
-			close(fileCh)
-		}()
-		for result := range walkResultCh {
-			if result.Err != nil {
-				stats.CantReadFiles.Add(1)
-				logger.WarnContext(ctx, "cannot read file", "path", result.Info.Path, "error", result.Err)
-				continue
-			}
-
-			fi := result.Info
-
-			select {
-			case <-ctx.Done():
-				continue
-			default:
-			}
-
-			pending.Add(1)
-
-			if !pool.Submit(ctx, func(ctx context.Context) {
-				defer pending.Done()
-
-				sig, inode, numLinks, sha256sum, err := checksum.ComputeFileInfo(fi.Path, fi.Size)
-				if err != nil {
-					stats.CantReadFiles.Add(1)
-					logger.WarnContext(ctx, "checksum failed", "path", fi.Path, "error", err)
-					return
-				}
-				fi.Signature = sig
-				fi.Inode = inode
-				fi.NumLinks = numLinks
-				fi.SHA256 = sha256sum
-
-				select {
-				case fileCh <- fi:
-				case <-ctx.Done():
-				}
-			}) {
-				pending.Done()
-			}
-		}
-	}()
-
-	// Detector: insert files, emit DupeGroups, trigger mass SHA-256 for 3+ groups.
-	go func() {
-		defer close(groupCh)
-		for fi := range fileCh {
-			groups := detector.Insert(fi)
-			for _, g := range groups {
-				select {
-				case groupCh <- g:
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			// Strategy 4: if group has 3+ files, submit mass SHA-256 computation
-			// for all files in the zero-SHA bucket. These run concurrently in the
-			// pool. Completed hashes are recorded via detector.UpdateFileState.
-			key := dupe.GroupKey{Signature: fi.Signature, Size: fi.Size}
-			if detector.GroupSize(key) >= 3 {
-				for _, uf := range detector.UnhashedFiles(key) {
-					f := uf
-					pool.Submit(ctx, func(ctx context.Context) {
-						computeFullSHA(ctx, &f, detector)
-					})
-				}
-			}
-		}
-	}()
-
-	// Executor: verify DupeGroups and execute actions, all in the worker pool.
-	go func() {
-		var verifyWg sync.WaitGroup
-		defer func() {
-			verifyWg.Wait()
-			errCh <- nil
-			close(errCh)
-		}()
-		for group := range groupCh {
-			g := group
-			verifyWg.Add(1)
-
-			if !pool.Submit(ctx, func(ctx context.Context) {
-				defer verifyWg.Done()
-				handleDupeGroup(ctx, g, executor, detector, stats, logger)
-			}) {
-				verifyWg.Done()
-			}
-		}
-	}()
-}
-
 // handleDupeGroup verifies a DupeGroup and executes the configured action.
 // Called from the worker pool.
 func handleDupeGroup(
 	ctx context.Context,
-	group dupe.DupeGroup,
+	group dupe.Execution,
 	executor *action.Executor,
 	detector *dupe.Detector,
 	stats *dupe.Stats,

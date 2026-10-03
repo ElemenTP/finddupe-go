@@ -40,16 +40,23 @@ type GroupKey struct {
 	Signature uint64
 	Size      int64
 }
+type ExecutionType int
 
-// DupeGroup represents a pair of files that share the same weak checksum and size.
-// The executor verifies whether they are truly duplicates via SHA-256 comparison.
-type DupeGroup struct {
+const (
+	HashCalc ExecutionType = iota
+	HashComp
+	DupeElim
+)
+
+// Execution represents specific opeartion for executor to execute.
+// SHA-256 calculation, comparison, and dupe file elimination.
+type Execution struct {
 	// Key is the composite (signature, size) key that matched.
 	Key GroupKey
 
-	// Original is the first file stored with this key (the "kept" file).
-	Original FileInfo
+	// Type of this exection.
+	Type ExecutionType
 
-	// Candidate is the newly discovered file with the same key.
-	Candidate FileInfo
+	// List of files to execute on.
+	Files []FileInfo
 }

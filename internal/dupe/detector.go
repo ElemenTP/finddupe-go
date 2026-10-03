@@ -31,7 +31,7 @@ func NewDetector(stats *Stats) *Detector {
 }
 
 // Insert adds a FileInfo and returns potential duplicate groups.
-func (d *Detector) Insert(fi FileInfo) []DupeGroup {
+func (d *Detector) Insert(fi FileInfo) []Execution {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -51,7 +51,7 @@ func (d *Detector) Insert(fi FileInfo) []DupeGroup {
 	if fi.SHA256 != zeroSHA {
 		if files, ok := shaGroups[fi.SHA256]; ok && len(files) > 0 {
 			shaGroups[fi.SHA256] = append(files, fi)
-			return []DupeGroup{{Key: key, Original: files[0], Candidate: fi}}
+			return []Execution{{Key: key, Original: files[0], Candidate: fi}}
 		}
 		// SHA-256 differs from all known buckets → CRC collision, store separately.
 		shaGroups[fi.SHA256] = append(shaGroups[fi.SHA256], fi)
@@ -67,23 +67,23 @@ func (d *Detector) Insert(fi FileInfo) []DupeGroup {
 
 	if totalExisting == 1 {
 		// Strategy 3: exactly 2 files → chunked SHA-256 comparison with early-stop.
-		return []DupeGroup{{Key: key, Original: zeroFiles[0], Candidate: fi}}
+		return []Execution{{Key: key, Original: zeroFiles[0], Candidate: fi}}
 	}
 
 	// Strategy 4: 3+ files.
 	// Emit pre-verified matches against known-SHA sub-groups, plus one
 	// chunked-comparison group against the first zero-SHA file.
-	var groups []DupeGroup
+	var groups []Execution
 	for sha, files := range shaGroups {
 		if sha == zeroSHA || len(files) == 0 {
 			continue
 		}
-		groups = append(groups, DupeGroup{Key: key, Original: files[0], Candidate: fi})
+		groups = append(groups, Execution{Key: key, Original: files[0], Candidate: fi})
 	}
 	// Also emit one group for chunked comparison against the first zero-SHA file
 	// (the original file that started this group).
 	if len(zeroFiles) > 0 {
-		groups = append(groups, DupeGroup{Key: key, Original: zeroFiles[0], Candidate: fi})
+		groups = append(groups, Execution{Key: key, Original: zeroFiles[0], Candidate: fi})
 	}
 
 	return groups

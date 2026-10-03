@@ -7,25 +7,25 @@ import (
 )
 
 // deleteFile removes the duplicate file.
-func (e *Executor) deleteFile(group dupe.DupeGroup) (Result, error) {
+func (e *Executor) deleteFile(group dupe.Execution) (Result, error) {
 	// Check if the file is read-only.
-	if isReadOnly(group.Candidate.Path) {
+	if isReadOnly(group.Files[0].Path) {
 		if !e.opts.IncludeReadonly {
 			return ResultSkippedRO, nil
 		}
 		// Make writable before deleting.
 		// Only add user-write permission (mode | 0200) rather than 0666 to
 		// avoid a TOCTOU window where the file is temporarily world-writable.
-		info, statErr := os.Stat(group.Candidate.Path)
+		info, statErr := os.Stat(group.Files[0].Path)
 		if statErr != nil {
 			return ResultError, statErr
 		}
-		if chmodErr := os.Chmod(group.Candidate.Path, info.Mode()|0200); chmodErr != nil {
+		if chmodErr := os.Chmod(group.Files[0].Path, info.Mode()|0200); chmodErr != nil {
 			return ResultError, chmodErr
 		}
 	}
 
-	if err := os.Remove(group.Candidate.Path); err != nil {
+	if err := os.Remove(group.Files[0].Path); err != nil {
 		return ResultError, err
 	}
 

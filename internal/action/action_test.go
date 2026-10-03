@@ -24,7 +24,7 @@ func TestVerifyChunked_Identical(t *testing.T) {
 	os.WriteFile(b, data, 0644)
 
 	exec := action.New(action.Options{Action: config.ActionReport})
-	result, upOrig, upCand, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+	result, upOrig, upCand, err := exec.VerifyChunked(context.Background(), dupe.Execution{
 		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
 		Candidate: dupe.FileInfo{Path: b, Size: int64(len(data))},
 		Original:  dupe.FileInfo{Path: a, Size: int64(len(data))},
@@ -52,7 +52,7 @@ func TestVerifyChunked_Different(t *testing.T) {
 	os.WriteFile(b, []byte("bbbb"), 0644)
 
 	exec := action.New(action.Options{Action: config.ActionReport})
-	result, _, upCand, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+	result, _, upCand, err := exec.VerifyChunked(context.Background(), dupe.Execution{
 		Key:       dupe.GroupKey{Signature: 1, Size: 4},
 		Candidate: dupe.FileInfo{Path: b, Size: 4},
 		Original:  dupe.FileInfo{Path: a, Size: 4},
@@ -84,7 +84,7 @@ func TestVerifyChunked_DifferentSizes(t *testing.T) {
 	os.WriteFile(b, []byte("longer_file"), 0644)
 
 	exec := action.New(action.Options{Action: config.ActionReport})
-	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
 		Key:       dupe.GroupKey{Signature: 1, Size: 5},
 		Candidate: dupe.FileInfo{Path: b, Size: 11},
 		Original:  dupe.FileInfo{Path: a, Size: 5},
@@ -115,7 +115,7 @@ func TestVerifyChunked_PartialStateResume(t *testing.T) {
 	exec := action.New(action.Options{Action: config.ActionReport})
 
 	// First comparison: should early-stop, saving partial state.
-	_, upOrig, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+	_, upOrig, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
 		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
 		Candidate: dupe.FileInfo{Path: b, Size: int64(len(dataB))},
 		Original:  dupe.FileInfo{Path: a, Size: int64(len(data))},
@@ -132,7 +132,7 @@ func TestVerifyChunked_PartialStateResume(t *testing.T) {
 	c := filepath.Join(dir, "c.bin")
 	os.WriteFile(c, dataB, 0644)
 
-	_, upOrig2, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+	_, upOrig2, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
 		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(dataB))},
 		Candidate: dupe.FileInfo{Path: c, Size: int64(len(dataB))},
 		Original:  upOrig, // has partial state from first comparison
@@ -155,7 +155,7 @@ func TestDelete_Success(t *testing.T) {
 	os.WriteFile(dupPath, data, 0644)
 
 	exec := action.New(action.Options{Action: config.ActionDelete})
-	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
 		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
 		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
 		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
@@ -182,7 +182,7 @@ func TestHardlink_Created(t *testing.T) {
 	os.WriteFile(dupPath, data, 0644)
 
 	exec := action.New(action.Options{Action: config.ActionHardlink})
-	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
 		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
 		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
 		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
@@ -216,7 +216,7 @@ func TestReport_NoAction(t *testing.T) {
 	os.WriteFile(dupPath, data, 0644)
 
 	exec := action.New(action.Options{Action: config.ActionReport})
-	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
 		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
 		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
 		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
@@ -242,7 +242,7 @@ func TestCoW_Unsupported(t *testing.T) {
 	os.WriteFile(dupPath, data, 0644)
 
 	exec := action.New(action.Options{Action: config.ActionCoWClone})
-	_, _, _, err := exec.VerifyChunked(context.Background(), dupe.DupeGroup{
+	_, _, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
 		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
 		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
 		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
