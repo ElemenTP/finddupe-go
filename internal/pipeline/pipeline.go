@@ -34,6 +34,9 @@ const (
 	// Byte units used when formatting sizes.
 	bytesPerKB = 1024
 	bytesPerMB = 1024 * 1024
+
+	// percentScale converts a ratio to a percentage.
+	percentScale = 100
 )
 
 // Run executes the full duplicate detection pipeline.
@@ -89,10 +92,33 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}()
 
 	// The coordinator owns the detector and decides when work is finished.
-	err := coordinate(ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh)
+	// In CoW-detect mode, after the input is drained, it emits one CoWDetect
+	// execution per identical-content group.
+	var final func() []dupe.Execution
+	if cfg.CoWDetect {
+		final = func() []dupe.Execution { return cowGroupExecutions(detector) }
+	}
+
+	err := coordinate(ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh, final)
 
 	printSummary(stats)
 	return err
+}
+
+// cowGroupExecutions turns the detector's identical-content groups into
+// CoWDetect executions, one per group.
+func cowGroupExecutions(detector *dupe.Detector) []dupe.Execution {
+	groups := detector.CoWGroups()
+	execs := make([]dupe.Execution, 0, len(groups))
+
+	for _, group := range groups {
+		execs = append(execs, dupe.Execution{
+			Key:   dupe.GroupKey{Signature: group[0].Signature, Size: group[0].Size},
+			Type:  dupe.CoWDetect,
+			Files: group,
+		})
+	}
+	return execs
 }
 
 // resolveThreads applies the default worker count when none is configured.
@@ -267,12 +293,15 @@ type coordinator struct {
 	stats       *dupe.Stats
 	logger      *slog.Logger
 	executionCh chan<- dupe.Execution
+	final       func() []dupe.Execution
+	finalDone   bool
 	inFlight    int
 	execClosed  bool
 }
 
 // coordinate runs the coordinator loop until the input and all executor
-// outcomes are drained.
+// outcomes are drained. final, when non-nil, is called once after the input is
+// drained to produce any last batch of work (the CoW groups).
 //
 //nolint:gocognit // the coordinator is an explicit state machine over two channels
 func coordinate(
@@ -283,6 +312,7 @@ func coordinate(
 	fileInfoCh <-chan dupe.FileInfo,
 	executionCh chan<- dupe.Execution,
 	outcomeCh <-chan action.Outcome,
+	final func() []dupe.Execution,
 ) error {
 	c := &coordinator{
 		ctx:         ctx,
@@ -290,6 +320,7 @@ func coordinate(
 		stats:       stats,
 		logger:      logger,
 		executionCh: executionCh,
+		final:       final,
 	}
 	defer c.closeExec()
 
@@ -305,7 +336,9 @@ func coordinate(
 			if !ok {
 				fiCh = nil
 				if c.inFlight == 0 {
-					c.closeExec()
+					if !c.finish() {
+						return ctx.Err()
+					}
 				}
 				continue
 			}
@@ -322,12 +355,42 @@ func coordinate(
 				return ctx.Err()
 			}
 			if fiCh == nil && c.inFlight == 0 {
-				c.closeExec()
+				if !c.finish() {
+					return ctx.Err()
+				}
 			}
 		}
 	}
 
 	return nil
+}
+
+// finish dispatches the one-shot final batch (the CoW groups) and closes the
+// execution channel when nothing is left. It must only be called once the input
+// is drained and all hashing work has completed, so the detector state is final.
+func (c *coordinator) finish() bool {
+	if !c.dispatchFinal() {
+		return false
+	}
+	if c.inFlight == 0 {
+		c.closeExec()
+	}
+	return true
+}
+
+// dispatchFinal dispatches the one-shot final batch of work, if any.
+func (c *coordinator) dispatchFinal() bool {
+	if c.finalDone || c.final == nil {
+		return true
+	}
+	c.finalDone = true
+
+	for _, ex := range c.final() {
+		if !c.dispatch(ex) {
+			return false
+		}
+	}
+	return true
 }
 
 // insert feeds a scanned file to the detector and dispatches the work it
@@ -483,6 +546,10 @@ func reportElimination(ctx context.Context, out action.Outcome, stats *dupe.Stat
 		// Silently skipped; verbose mode logs the pair.
 		logger.InfoContext(ctx, "already hardlinked",
 			"keeper", keeper.Path, "victim", victim.Path)
+	case action.ResultAlreadyShared:
+		// Already a CoW clone/share; no work needed.
+		logger.InfoContext(ctx, "already shared",
+			"keeper", keeper.Path, "victim", victim.Path)
 	case action.ResultHardlinkLimit:
 		logger.WarnContext(ctx, "hardlink limit reached",
 			"keeper", keeper.Path, "victim", victim.Path)
@@ -493,26 +560,42 @@ func reportElimination(ctx context.Context, out action.Outcome, stats *dupe.Stat
 	}
 }
 
-// reportCoW records a CoWDetect outcome.
+// reportCoW prints one identical-content group and, for every member, how much
+// of it is already shared with the rest of the group. The group is what should
+// end up sharing storage (CoW); the ratios show what still needs to be done.
 func reportCoW(out action.Outcome, stats *dupe.Stats) {
 	if len(out.Files) < minCompareFiles {
 		return
 	}
 
-	keeper := out.Files[0]
-	victim := out.Files[1]
+	stats.CoWGroups.Add(1)
+	stats.DuplicateFiles.Add(int64(len(out.Files) - 1))
+	stats.DuplicateBytes.Add(int64(len(out.Files)-1) * out.Files[0].Size)
 
-	stats.DuplicateFiles.Add(1)
-	stats.DuplicateBytes.Add(victim.Size)
+	fmt.Fprintf(os.Stderr, "CoW candidate group (%d files, identical content):\n", len(out.Files))
 
-	if !out.Shared {
+	if out.FileShared == nil {
+		fmt.Fprintln(os.Stderr, "    extent information unavailable on this filesystem; listing members only")
+		for _, fi := range out.Files {
+			fmt.Fprintf(os.Stderr, "    '%s'\n", fi.Path)
+		}
 		return
 	}
 
-	stats.CoWGroups.Add(1)
-	stats.CoWSharedBytes.Add(out.SharedBytes)
-	fmt.Fprintf(os.Stderr, "CoW group: '%s' and '%s' share %s\n",
-		keeper.Path, victim.Path, formatSize(out.SharedBytes))
+	for i, fi := range out.Files {
+		shared := int64(0)
+		if i < len(out.FileShared) {
+			shared = out.FileShared[i]
+		}
+		stats.CoWSharedBytes.Add(shared)
+
+		percent := 0.0
+		if fi.Size > 0 {
+			percent = float64(shared) / float64(fi.Size) * percentScale
+		}
+		fmt.Fprintf(os.Stderr, "    '%s'  shared: %5.1f%% (%s of %s)\n",
+			fi.Path, percent, formatSize(shared), formatSize(fi.Size))
+	}
 }
 
 // runListLink implements find --listlink: enumerate files that share a physical
@@ -585,7 +668,10 @@ func printSummary(stats *dupe.Stats) {
 		fmt.Fprintf(os.Stderr, "  %d hardlink groups found\n", n)
 	}
 	if n := stats.CoWGroups.Load(); n > 0 {
-		fmt.Fprintf(os.Stderr, "  %d CoW groups found, %s shared\n",
+		// CoWSharedBytes is a per-file sum and would double-count storage, so
+		// only the group count is shown here; per-file ratios are printed with
+		// each group.
+		fmt.Fprintf(os.Stderr, "  %d CoW groups found (%s of file bytes already shared)\n",
 			n, formatSize(stats.CoWSharedBytes.Load()))
 	}
 	if n := stats.SkippedROFiles.Load(); n > 0 {

@@ -270,21 +270,38 @@ func TestDetector_CoWDetectMode(t *testing.T) {
 
 	a := fi("/a", 100)
 	a.SHA256 = shaOf(1)
+	a.Dev, a.Inode = 1, 10
 	d.Insert(a)
 
 	b := fi("/b", 100)
 	b.SHA256 = shaOf(1)
-	execs := d.Insert(b)
-	if len(execs) != 1 || execs[0].Type != dupe.CoWDetect {
-		t.Fatalf("CoW match = %v, want CoWDetect", execTypes(execs))
+	b.Dev, b.Inode = 1, 11
+	if execs := d.Insert(b); len(execs) != 0 {
+		t.Fatalf("CoW mode must not emit per-pair work, got %v", execTypes(execs))
 	}
 
-	// Detection never schedules victims, so a third clone still compares.
+	// A hardlinked alias of /a must collapse to one representative.
+	alias := fi("/a-link", 100)
+	alias.SHA256 = shaOf(1)
+	alias.Dev, alias.Inode = 1, 10
+	d.Insert(alias)
+
 	c := fi("/c", 100)
 	c.SHA256 = shaOf(1)
-	execs = d.Insert(c)
-	if len(execs) != 1 || execs[0].Type != dupe.CoWDetect || execs[0].Files[0].Path != "/a" {
-		t.Fatalf("third CoW match = %v, want CoWDetect against /a", execTypes(execs))
+	c.Dev, c.Inode = 1, 12
+	d.Insert(c)
+
+	groups := d.CoWGroups()
+	if len(groups) != 1 {
+		t.Fatalf("CoWGroups() = %d groups, want 1", len(groups))
+	}
+	if len(groups[0]) != 3 {
+		t.Fatalf("group size = %d, want 3 (hardlink alias collapsed)", len(groups[0]))
+	}
+	for _, g := range groups[0] {
+		if g.Path == "/a-link" {
+			t.Fatal("hardlinked alias must not appear as a group member")
+		}
 	}
 }
 

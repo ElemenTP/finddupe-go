@@ -47,6 +47,88 @@ func SharedBytes(a, b []Extent) int64 {
 	return rangeOverlap(a, b, sharedLogicalRange)
 }
 
+// Equal reports whether two extent lists describe the same physical storage
+// layout: same count in the same logical order, with equal logical offset,
+// physical start, and length.
+//
+// It is deliberately conservative: it returns false for empty lists and for any
+// list containing an encoded (compressed/inline) extent or an unknown (zero)
+// physical address, where physical identity cannot be trusted. Callers use this
+// only as a "already sharing, skip the work" fast path; returning false merely
+// means the work is attempted.
+func Equal(a, b []Extent) bool {
+	if len(a) == 0 || len(b) == 0 || len(a) != len(b) {
+		return false
+	}
+
+	for i := range a {
+		if a[i].Encoded || b[i].Encoded {
+			return false
+		}
+		if a[i].Physical == 0 || b[i].Physical == 0 {
+			return false
+		}
+		if a[i].Logical != b[i].Logical ||
+			a[i].Physical != b[i].Physical ||
+			a[i].Length != b[i].Length {
+			return false
+		}
+	}
+	return true
+}
+
+// SharedFlagBytes returns the number of bytes covered by extents the filesystem
+// marked as shared (Linux FIEMAP_EXTENT_SHARED). This is a per-file signal: it
+// says the extent is shared with someone, not with whom.
+func SharedFlagBytes(e []Extent) int64 {
+	var n int64
+	for _, x := range e {
+		if x.Shared && x.Length > 0 {
+			n += int64(x.Length) //nolint:gosec // extent lengths are bounded by the file size
+		}
+	}
+	return n
+}
+
+// SharedWithOthers returns the number of bytes of own whose physical start is
+// also present in one of the other extent lists. Extents without a known
+// physical address are ignored, and a match is capped to the shorter extent so
+// a longer own extent is not over-counted.
+//
+// It is meant for in-group diagnostics on filesystems that do not expose a
+// "shared" flag: identity is the physical start, as reported by the platform.
+func SharedWithOthers(own []Extent, others [][]Extent) int64 {
+	if len(own) == 0 || len(others) == 0 {
+		return 0
+	}
+
+	shortest := make(map[uint64]uint64, len(own))
+	for _, list := range others {
+		for _, e := range list {
+			if e.Physical == 0 || e.Length == 0 {
+				continue
+			}
+			if cur, ok := shortest[e.Physical]; !ok || e.Length < cur {
+				shortest[e.Physical] = e.Length
+			}
+		}
+	}
+
+	var n int64
+	for _, e := range own {
+		if e.Physical == 0 || e.Length == 0 {
+			continue
+		}
+		other, ok := shortest[e.Physical]
+		if !ok {
+			continue
+		}
+		shared := min(e.Length, other)
+		n += int64(shared) //nolint:gosec // extent lengths are bounded by the file size
+	}
+	return n
+}
+
 // interval is a half-open byte range used for overlap arithmetic.
 type interval struct {
 	start uint64

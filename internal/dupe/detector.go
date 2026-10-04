@@ -212,15 +212,60 @@ func (d *Detector) placeShaLocked(key GroupKey, shaGroups map[[32]byte][]FileInf
 
 	keeper := bucket[0]
 
-	// Detection mode never eliminates: keep every file in the bucket and let
-	// the executor compare extents against the keeper.
+	// CoW-detect mode never eliminates and emits no per-pair work: every file
+	// is kept in the bucket so the final CoWGroups() pass can report each
+	// identical-content group with per-file sharing ratios.
 	if d.coWDetect {
 		shaGroups[fi.SHA256] = append(bucket, fi)
-		return []Execution{{Key: key, Type: CoWDetect, Files: []FileInfo{keeper, fi}}}
+		return nil
 	}
 
 	d.scheduled[fi.Path] = struct{}{}
 	return []Execution{{Key: key, Type: DupeElim, Files: []FileInfo{keeper, fi}}}
+}
+
+// CoWGroups returns the identical-content groups that should share storage:
+// for every SHA-256 bucket with at least two distinct physical files, one
+// representative per (Dev, Inode). Hardlinked aliases collapse to a single
+// entry, so listing hardlink groups is left to --listlink.
+func (d *Detector) CoWGroups() [][]FileInfo {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var out [][]FileInfo
+	for _, shaGroups := range d.groups {
+		for sha, files := range shaGroups {
+			if sha == zeroSHA || len(files) < minGroupSize {
+				continue
+			}
+			group := dedupeByInode(files)
+			if len(group) >= minGroupSize {
+				out = append(out, group)
+			}
+		}
+	}
+	return out
+}
+
+// minGroupSize is the smallest number of files that can share storage.
+const minGroupSize = 2
+
+// dedupeByInode keeps the first path of each physical file.
+func dedupeByInode(files []FileInfo) []FileInfo {
+	seen := make(map[InodeKey]struct{}, len(files))
+	out := make([]FileInfo, 0, len(files))
+
+	for _, fi := range files {
+		if fi.Inode != 0 {
+			k := InodeKey{Dev: fi.Dev, Inode: fi.Inode}
+			if _, ok := seen[k]; ok {
+				continue
+			}
+			seen[k] = struct{}{}
+		}
+		out = append(out, fi)
+	}
+	return out
 }
 
 // applyHashLocked moves a file between the zero-SHA bucket and a concrete

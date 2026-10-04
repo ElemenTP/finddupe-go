@@ -15,7 +15,13 @@ import (
 var ErrCoWNotSupported = errors.New("CoW clone not supported on this filesystem; use --hardlink or --delete instead")
 
 // cloneFile replaces the duplicate (Files[1]) with a CoW clone of the original
-// (Files[0]).
+// (Files[0]). If the two already share all their storage — because they are the
+// same physical file or their extent layout is identical — nothing is done.
+//
+// The extent check is only a "skip the work" fast path: content equality was
+// already established by the detector, so cloning anyway is safe and
+// idempotent. Uncertainty (unsupported filesystem, compressed extents) simply
+// results in a clone.
 func (e *Executor) cloneFile(ex dupe.Execution) (Result, error) {
 	keeper := ex.Files[0]
 	victim := ex.Files[1]
@@ -24,15 +30,45 @@ func (e *Executor) cloneFile(ex dupe.Execution) (Result, error) {
 		return ResultSkippedRO, nil
 	}
 
+	if alreadyShared(keeper, victim) {
+		return ResultAlreadyShared, nil
+	}
+
 	if err := cloneReplace(keeper.Path, victim.Path); err != nil {
 		return ResultError, err
 	}
 	return ResultCoWCloned, nil
 }
 
-// detectCoW reports whether the identical files of a CoWDetect execution share
-// physical extents. Detection is only meaningful for byte-identical files on
-// the same device.
+// alreadyShared reports whether the keeper and victim already share all of
+// their storage. It is deliberately conservative: any uncertainty returns false
+// so the caller performs the clone.
+func alreadyShared(keeper, victim dupe.FileInfo) bool {
+	if samePhysicalFile(keeper, victim) {
+		return true
+	}
+
+	keeperExtents, err := extent.Query(keeper.Path)
+	if err != nil {
+		return false
+	}
+	victimExtents, err := extent.Query(victim.Path)
+	if err != nil {
+		return false
+	}
+	return extent.Equal(keeperExtents, victimExtents)
+}
+
+// detectCoW reports, for every file of an identical-content group, how many of
+// its bytes are already shared with another group member.
+//
+// Signal selection:
+//   - if any extent in the group carries the filesystem's "shared" flag
+//     (Linux FIEMAP_EXTENT_SHARED), that per-extent flag is used;
+//   - otherwise the physical start address is used as identity and compared
+//     within the group.
+//
+// FileShared is nil when extent information is unavailable for the whole group.
 func (e *Executor) detectCoW(ctx context.Context, ex dupe.Execution) (Outcome, error) {
 	out := Outcome{Kind: ex.Type, Key: ex.Key, Files: ex.Files}
 	if len(ex.Files) < minFilesPerExecution {
@@ -45,27 +81,75 @@ func (e *Executor) detectCoW(ctx context.Context, ex dupe.Execution) (Outcome, e
 	default:
 	}
 
-	keeper := ex.Files[0]
-	victim := ex.Files[1]
-
-	// Physical offsets are only comparable within one device.
-	if keeper.Dev != 0 && victim.Dev != 0 && keeper.Dev != victim.Dev {
+	groupExtents, queried := queryGroupExtents(ex.Files)
+	if queried == 0 {
+		// Unsupported filesystem: leave FileShared nil.
 		return out, nil
 	}
 
-	keeperExtents, err := extent.Query(keeper.Path)
-	if err != nil {
-		return out, nil //nolint:nilerr // unsupported filesystem: report no sharing
-	}
-	victimExtents, err := extent.Query(victim.Path)
-	if err != nil {
-		return out, nil //nolint:nilerr // unsupported filesystem: report no sharing
+	useSharedFlag := usesSharedFlag(groupExtents)
+	shared := make([]int64, len(ex.Files))
+	for i := range ex.Files {
+		shared[i] = fileSharedBytes(ex.Files, i, groupExtents, useSharedFlag)
 	}
 
-	shared := extent.SharedBytes(keeperExtents, victimExtents)
-	out.Shared = shared > 0
-	out.SharedBytes = shared
+	out.FileShared = shared
 	return out, nil
+}
+
+// queryGroupExtents queries every file in the group, returning nils for files
+// whose extents could not be read, plus the number of successful queries.
+func queryGroupExtents(files []dupe.FileInfo) ([][]extent.Extent, int) {
+	groupExtents := make([][]extent.Extent, len(files))
+	queried := 0
+
+	for i, fi := range files {
+		extents, err := extent.Query(fi.Path)
+		if err != nil {
+			continue
+		}
+		groupExtents[i] = extents
+		queried++
+	}
+	return groupExtents, queried
+}
+
+// usesSharedFlag reports whether any extent in the group carries the
+// filesystem's "shared" flag.
+func usesSharedFlag(groupExtents [][]extent.Extent) bool {
+	for _, extents := range groupExtents {
+		for _, x := range extents {
+			if x.Shared {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// fileSharedBytes returns the already-shared bytes of one group member.
+func fileSharedBytes(files []dupe.FileInfo, i int, groupExtents [][]extent.Extent, useSharedFlag bool) int64 {
+	own := groupExtents[i]
+	if own == nil {
+		return 0
+	}
+	if useSharedFlag {
+		return extent.SharedFlagBytes(own)
+	}
+
+	fi := files[i]
+	others := make([][]extent.Extent, 0, len(files)-1)
+	for j, list := range groupExtents {
+		if j == i || list == nil {
+			continue
+		}
+		// Physical addresses are only comparable within one device.
+		if fi.Dev != 0 && files[j].Dev != 0 && fi.Dev != files[j].Dev {
+			continue
+		}
+		others = append(others, list)
+	}
+	return extent.SharedWithOthers(own, others)
 }
 
 // cloneReplace writes a CoW clone of src to a temporary file next to dst and

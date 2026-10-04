@@ -1281,20 +1281,25 @@ func TestDedupeCoW_CreateAndDetect(t *testing.T) {
 		t.Fatal("cloned file content differs from the original")
 	}
 
-	// find --cow must now detect the shared extents.
+	// find --cow must now report the group with both files fully shared.
 	_, stderr, code = run(t, "find", "--cow", dir, "--no-progress")
 	if code != 0 {
 		t.Fatalf("find --cow exited %d\n%s", code, stderr)
 	}
-	if !strings.Contains(stderr, "CoW group") {
-		t.Errorf("expected a CoW group after cloning, got:\n%s", stderr)
+	if !strings.Contains(stderr, "CoW candidate group") {
+		t.Errorf("expected a CoW candidate group after cloning, got:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "shared: 100.0%") {
+		t.Errorf("expected the cloned pair to be reported as 100%% shared, got:\n%s", stderr)
 	}
 	if !strings.Contains(stderr, "1 CoW groups found") {
 		t.Errorf("expected CoW group summary, got:\n%s", stderr)
 	}
 }
 
-func TestFind_CoW_IndependentCopiesNotGrouped(t *testing.T) {
+// TestFind_CoW_IndependentCopiesZeroShared verifies that independent copies are
+// still listed as a CoW candidate group, but reported as 0% shared.
+func TestFind_CoW_IndependentCopiesZeroShared(t *testing.T) {
 	t.Parallel()
 
 	dir := fsTestDir(t, func(d string) bool { return extentsProbe(t, d) })
@@ -1307,8 +1312,40 @@ func TestFind_CoW_IndependentCopiesNotGrouped(t *testing.T) {
 		t.Fatalf("find --cow exited %d\n%s", code, stderr)
 	}
 
-	if strings.Contains(stderr, "CoW group") {
-		t.Errorf("independent copies must not be reported as a CoW group:\n%s", stderr)
+	if !strings.Contains(stderr, "CoW candidate group") {
+		t.Errorf("expected the identical copies to be listed as a candidate group:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "0.0%") {
+		t.Errorf("expected independent copies to be reported as 0%% shared:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "100.0%") {
+		t.Errorf("independent copies must not be reported as fully shared:\n%s", stderr)
+	}
+}
+
+// TestDedupe_CoW_PreservesHardlink verifies that dedupe --cow never breaks an
+// existing hardlink: it already shares all storage.
+func TestDedupe_CoW_PreservesHardlink(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := randomContent(t)
+	a := makeFile(t, dir, "a.bin", content)
+	b := filepath.Join(dir, "b.bin")
+	if err := os.Link(a, b); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+
+	_, stderr, code := run(t, "dedupe", "--cow", dir, "--no-progress")
+	if code != 0 {
+		t.Fatalf("dedupe --cow exited %d\n%s", code, stderr)
+	}
+
+	if strings.Contains(stderr, "CoW cloned:") {
+		t.Errorf("an existing hardlink must not be replaced by a clone:\n%s", stderr)
+	}
+	if !sameInode(t, a, b) {
+		t.Fatal("hardlink relationship was broken by dedupe --cow")
 	}
 }
 

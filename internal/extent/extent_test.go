@@ -184,3 +184,84 @@ func TestQuery_IndependentCopiesShareNothing(t *testing.T) {
 		t.Fatalf("independent copies share %d bytes, want 0", got)
 	}
 }
+
+func TestEqual(t *testing.T) {
+	t.Parallel()
+
+	base := []extent.Extent{
+		{Logical: 0, Physical: 4096, Length: 4096},
+		{Logical: 4096, Physical: 8192, Length: 4096},
+	}
+	same := []extent.Extent{
+		{Logical: 0, Physical: 4096, Length: 4096},
+		{Logical: 4096, Physical: 8192, Length: 4096},
+	}
+
+	if !extent.Equal(base, same) {
+		t.Error("identical layouts must compare equal")
+	}
+	if extent.Equal(base, same[:1]) {
+		t.Error("different extent counts must not compare equal")
+	}
+
+	shifted := []extent.Extent{
+		{Logical: 0, Physical: 4096, Length: 4096},
+		{Logical: 4096, Physical: 12288, Length: 4096},
+	}
+	if extent.Equal(base, shifted) {
+		t.Error("different physical starts must not compare equal")
+	}
+
+	if extent.Equal(base, nil) || extent.Equal(nil, nil) {
+		t.Error("empty lists must not compare equal")
+	}
+
+	encoded := []extent.Extent{{Logical: 0, Physical: 4096, Length: 4096, Encoded: true}}
+	if extent.Equal(encoded, encoded) {
+		t.Error("encoded extents must not compare equal")
+	}
+
+	zero := []extent.Extent{{Logical: 0, Physical: 0, Length: 4096}}
+	if extent.Equal(zero, zero) {
+		t.Error("unknown (zero) physical addresses must not compare equal")
+	}
+}
+
+func TestSharedFlagBytes(t *testing.T) {
+	t.Parallel()
+
+	extents := []extent.Extent{
+		{Logical: 0, Physical: 4096, Length: 100, Shared: true},
+		{Logical: 100, Physical: 8192, Length: 200, Shared: false},
+		{Logical: 300, Physical: 12288, Length: 50, Shared: true},
+	}
+	if got := extent.SharedFlagBytes(extents); got != 150 {
+		t.Fatalf("SharedFlagBytes = %d, want 150", got)
+	}
+}
+
+func TestSharedWithOthers(t *testing.T) {
+	t.Parallel()
+
+	own := []extent.Extent{
+		{Logical: 0, Physical: 4096, Length: 100},
+		{Logical: 100, Physical: 8192, Length: 100},
+	}
+	other := []extent.Extent{
+		{Logical: 0, Physical: 4096, Length: 100},    // shared
+		{Logical: 100, Physical: 16384, Length: 100}, // not shared
+	}
+
+	if got := extent.SharedWithOthers(own, [][]extent.Extent{other}); got != 100 {
+		t.Fatalf("SharedWithOthers = %d, want 100", got)
+	}
+	if got := extent.SharedWithOthers(own, nil); got != 0 {
+		t.Fatalf("SharedWithOthers(nil) = %d, want 0", got)
+	}
+
+	// A shorter other extent caps the counted bytes.
+	short := []extent.Extent{{Logical: 0, Physical: 4096, Length: 40}}
+	if got := extent.SharedWithOthers(own, [][]extent.Extent{short}); got != 40 {
+		t.Fatalf("SharedWithOthers(short) = %d, want 40", got)
+	}
+}

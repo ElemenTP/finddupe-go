@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+#
+# cow-probe.sh - exercise finddupe's CoW features and dump platform extent data.
+#
+# Run this on macOS (APFS) or Linux (btrfs/XFS) from a directory that contains
+# the matching finddupe and extentdump binaries (e.g. an unpacked cow-test
+# bundle), or with them available in ../bin.
+#
+#   ./cow-probe.sh [target-directory]
+#
+# The target directory must be on the filesystem you want to test (APFS volume
+# / btrfs subvolume). Everything it creates stays inside that directory.
+#
+# Output is split into clearly marked sections; please send back the whole log.
+
+set -u
+
+DIR="${1:-}"
+if [ -z "$DIR" ]; then
+	DIR="$(mktemp -d "${TMPDIR:-/tmp}/finddupe-cow-probe.XXXXXX")"
+else
+	mkdir -p "$DIR" || exit 1
+	DIR="$(cd "$DIR" && pwd)"
+fi
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+find_bin() {
+	for candidate in "$HERE/$1" "$HERE/$2" "$HERE/../bin/$2"; do
+		if [ -x "$candidate" ]; then
+			echo "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+case "$OS-$ARCH" in
+Darwin-arm64) FD="$(find_bin finddupe finddupe-darwin-arm64)"; ED="$(find_bin extentdump extentdump-darwin-arm64)" ;;
+Darwin-x86_64) FD="$(find_bin finddupe finddupe-darwin-amd64)"; ED="$(find_bin extentdump extentdump-darwin-amd64)" ;;
+Linux-x86_64) FD="$(find_bin finddupe finddupe-linux-amd64)"; ED="$(find_bin extentdump extentdump-linux-amd64)" ;;
+*)
+	echo "unsupported platform $OS-$ARCH" >&2
+	exit 1
+	;;
+esac
+
+if [ -z "${FD:-}" ] || [ ! -x "$FD" ]; then
+	echo "finddupe binary not found next to the script or in ../bin" >&2
+	exit 1
+fi
+if [ -z "${ED:-}" ] || [ ! -x "$ED" ]; then
+	echo "extentdump binary not found next to the script or in ../bin" >&2
+	exit 1
+fi
+
+section() {
+	echo
+	echo "================================================================"
+	echo "== $*"
+	echo "================================================================"
+}
+
+show() {
+	echo "\$ $*"
+	"$@" 2>&1
+	echo "(exit=$?)"
+}
+
+# clone_one SRC DST - make a CoW clone using the platform's own tooling.
+clone_one() {
+	if [ "$OS" = "Darwin" ]; then
+		cp -c "$1" "$2"
+	else
+		cp --reflink=always "$1" "$2"
+	fi
+}
+
+# random_file PATH SIZE - incompressible content.
+random_file() {
+	dd if=/dev/urandom of="$1" bs=1024 count=$(( $2 / 1024 )) 2>/dev/null
+}
+
+# independent_copy SRC DST - make a real (non-shared) copy. Linux cp defaults
+# to reflink when the filesystem supports it, so it must be disabled.
+independent_copy() {
+	if [ "$OS" = "Darwin" ]; then
+		cp "$1" "$2"
+	else
+		cp --reflink=never "$1" "$2"
+	fi
+}
+
+section "environment"
+echo "date: $(date)"
+echo "uname: $(uname -a)"
+echo "target dir: $DIR"
+if [ "$OS" = "Darwin" ]; then
+	mount | grep -E ' on /' | head -5
+	df -h "$DIR" 2>&1 | head -3
+else
+	findmnt -no SOURCE,FSTYPE,OPTIONS --target "$DIR" 2>&1 || df -T "$DIR"
+fi
+
+section "binaries"
+echo "finddupe:   $FD"
+"$FD" version 2>&1
+echo "extentdump: $ED"
+
+# ---------------------------------------------------------------------------
+# 1. Independent copies (same content, separate storage)
+# ---------------------------------------------------------------------------
+IND="$DIR/independent"
+rm -rf "$IND"
+mkdir -p "$IND"
+random_file "$IND/a.bin" 1048576
+independent_copy "$IND/a.bin" "$IND/b.bin"
+
+section "extentdump: independent copies"
+"$ED" "$IND/a.bin" "$IND/b.bin"
+
+section "find --cow: independent copies (expect 0% shared)"
+show "$FD" find --cow --no-progress "$IND"
+
+section "dedupe --cow: independent copies (expect a clone)"
+show "$FD" dedupe --cow --no-progress "$IND"
+
+section "find --cow: after cloning (expect 100% shared)"
+show "$FD" find --cow --no-progress "$IND"
+
+section "dedupe --cow: second run (expect no clone, already shared)"
+show "$FD" dedupe --cow --no-progress "$IND"
+
+section "extentdump: after cloning"
+"$ED" "$IND/a.bin" "$IND/b.bin"
+
+# ---------------------------------------------------------------------------
+# 2. Pre-existing clone
+# ---------------------------------------------------------------------------
+CLO="$DIR/preclone"
+rm -rf "$CLO"
+mkdir -p "$CLO"
+random_file "$CLO/orig.bin" 1048576
+if clone_one "$CLO/orig.bin" "$CLO/clone.bin"; then
+	section "extentdump: pre-existing clone"
+	"$ED" "$CLO/orig.bin" "$CLO/clone.bin"
+
+	section "find --cow: pre-existing clone (expect 100% shared)"
+	show "$FD" find --cow --no-progress "$CLO"
+
+	section "dedupe --cow: pre-existing clone (expect no clone)"
+	show "$FD" dedupe --cow --no-progress "$CLO"
+else
+	echo "could not create a clone with the platform tooling (skipping section 2)"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Existing hardlink must never be touched
+# ---------------------------------------------------------------------------
+HL="$DIR/hardlink"
+rm -rf "$HL"
+mkdir -p "$HL"
+random_file "$HL/a.bin" 262144
+ln "$HL/a.bin" "$HL/b.bin"
+
+section "hardlink: inodes before"
+ls -li "$HL" 2>&1
+
+section "dedupe --cow: hardlink (expect no clone and no inode change)"
+show "$FD" dedupe --cow --no-progress "$HL"
+
+section "hardlink: inodes after (must be identical)"
+ls -li "$HL" 2>&1
+
+section "find --listlink: hardlink group"
+show "$FD" find --listlink --no-progress "$HL"
+
+# ---------------------------------------------------------------------------
+# 4. Compressible content (tests transparent compression, if enabled)
+# ---------------------------------------------------------------------------
+CMP="$DIR/compressible"
+rm -rf "$CMP"
+mkdir -p "$CMP"
+yes "finddupe compressible probe line" 2>/dev/null | head -c 2097152 >"$CMP/src.bin" || true
+
+if [ "$OS" = "Darwin" ] && command -v ditto >/dev/null 2>&1; then
+	ditto --hfsCompression "$CMP/src.bin" "$CMP/compA.bin" 2>/dev/null || independent_copy "$CMP/src.bin" "$CMP/compA.bin"
+	ditto --hfsCompression "$CMP/src.bin" "$CMP/compB.bin" 2>/dev/null || independent_copy "$CMP/src.bin" "$CMP/compB.bin"
+	clone_one "$CMP/compA.bin" "$CMP/compClone.bin" 2>/dev/null || independent_copy "$CMP/compA.bin" "$CMP/compClone.bin"
+	echo "--- ls -lO (look for 'compressed') ---"
+	ls -lO "$CMP" 2>&1
+else
+	independent_copy "$CMP/src.bin" "$CMP/compA.bin"
+	independent_copy "$CMP/src.bin" "$CMP/compB.bin"
+	clone_one "$CMP/compA.bin" "$CMP/compClone.bin" 2>/dev/null || independent_copy "$CMP/compA.bin" "$CMP/compClone.bin"
+fi
+
+section "extentdump: compressible files (independent + clone)"
+"$ED" "$CMP/compA.bin" "$CMP/compB.bin" "$CMP/compClone.bin"
+
+section "find --cow: compressible independent copies (expect 0% shared)"
+show "$FD" find --cow --no-progress "$CMP"
+
+echo
+echo "================================================================"
+echo "== probe finished; target directory kept at: $DIR"
+echo "================================================================"

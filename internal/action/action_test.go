@@ -351,11 +351,11 @@ func TestDoExecution_DupeElim_ReadOnly(t *testing.T) {
 	}
 }
 
-// randomBytes returns size bytes of incompressible data so filesystem
-// compression cannot distort the physical extent layout.
-func randomBytes(t *testing.T, size int) []byte {
+// randomBytes returns incompressible data so filesystem compression cannot
+// distort the physical extent layout.
+func randomBytes(t *testing.T) []byte {
 	t.Helper()
-	buf := make([]byte, size)
+	buf := make([]byte, 128*1024)
 	if _, err := rand.Read(buf); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
@@ -366,7 +366,7 @@ func randomBytes(t *testing.T, size int) []byte {
 func tryCoWClone(t *testing.T, dir string) bool {
 	t.Helper()
 
-	data := randomBytes(t, 128*1024)
+	data := randomBytes(t)
 	a := filepath.Join(dir, "probe-a.bin")
 	b := filepath.Join(dir, "probe-b.bin")
 	if err := os.WriteFile(a, data, 0o644); err != nil {
@@ -430,7 +430,7 @@ func TestDoExecution_CoWClone(t *testing.T) {
 	t.Parallel()
 
 	dir := cloneCapableDir(t)
-	data := randomBytes(t, 128*1024)
+	data := randomBytes(t)
 	keeper := writeFile(t, dir, "a.bin", data)
 	victim := writeFile(t, dir, "b.bin", data)
 
@@ -462,5 +462,129 @@ func TestDoExecution_CoWClone(t *testing.T) {
 	vi, _ := os.Stat(victim)
 	if os.SameFile(ki, vi) {
 		t.Fatal("CoW clone must be a distinct inode, not a hardlink")
+	}
+}
+
+// TestDoExecution_SamePhysicalFile_NoAction verifies that no action ever
+// touches a path that is the same physical file as the keeper (a hardlink).
+func TestDoExecution_SamePhysicalFile_NoAction(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	data := []byte("hardlinked content")
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
+
+	kp := fileInfo(t, keeper)
+	vp := fileInfo(t, victim)
+	kp.Dev, kp.Inode = 1, 7
+	vp.Dev, vp.Inode = 1, 7
+
+	for _, actionKind := range []config.Action{
+		config.ActionDelete, config.ActionHardlink, config.ActionCoWClone,
+	} {
+		exec := action.New(action.Options{Action: actionKind})
+		out, err := exec.DoExecution(context.Background(), dupe.Execution{
+			Key:   testKey,
+			Type:  dupe.DupeElim,
+			Files: []dupe.FileInfo{kp, vp},
+		})
+		if err != nil {
+			t.Fatalf("action %v: %v", actionKind, err)
+		}
+		if out.Result != action.ResultAlreadyHardlinked {
+			t.Fatalf("action %v: Result = %v, want ResultAlreadyHardlinked", actionKind, out.Result)
+		}
+	}
+
+	if _, err := os.Stat(victim); err != nil {
+		t.Fatalf("victim must be preserved: %v", err)
+	}
+}
+
+// TestDoExecution_CoWClone_SkipsAlreadyShared verifies the skip fast path: a
+// second clone of an already-shared pair is a no-op.
+func TestDoExecution_CoWClone_SkipsAlreadyShared(t *testing.T) {
+	t.Parallel()
+
+	dir := cloneCapableDir(t)
+	data := randomBytes(t)
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
+
+	exec := action.New(action.Options{Action: config.ActionCoWClone})
+
+	// First pass creates the clone.
+	if out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, keeper), fileInfo(t, victim)},
+	}); err != nil || out.Result != action.ResultCoWCloned {
+		t.Fatalf("first clone: result=%v err=%v", out.Result, err)
+	}
+
+	// Second pass must notice they already share storage.
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, keeper), fileInfo(t, victim)},
+	})
+	if err != nil {
+		t.Fatalf("second clone: %v", err)
+	}
+	if out.Result != action.ResultAlreadyShared {
+		t.Fatalf("second clone: Result = %v, want ResultAlreadyShared", out.Result)
+	}
+}
+
+// TestDoExecution_CoWDetect_GroupRatios checks per-file sharing ratios for a
+// group of [original, clone, independent copy].
+func TestDoExecution_CoWDetect_GroupRatios(t *testing.T) {
+	t.Parallel()
+
+	dir := cloneCapableDir(t)
+	data := randomBytes(t)
+	size := int64(len(data))
+
+	original := writeFile(t, dir, "a.bin", data)
+	clone := writeFile(t, dir, "clone.bin", data)
+	copied := writeFile(t, dir, "copy.bin", data)
+
+	exec := action.New(action.Options{Action: config.ActionCoWClone})
+	if out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, original), fileInfo(t, clone)},
+	}); err != nil || out.Result != action.ResultCoWCloned {
+		t.Fatalf("clone setup: result=%v err=%v", out.Result, err)
+	}
+
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:  testKey,
+		Type: dupe.CoWDetect,
+		Files: []dupe.FileInfo{
+			fileInfo(t, original),
+			fileInfo(t, clone),
+			fileInfo(t, copied),
+		},
+	})
+	if err != nil {
+		t.Fatalf("CoWDetect: %v", err)
+	}
+	if out.FileShared == nil {
+		t.Skip("extent information unavailable")
+	}
+	if len(out.FileShared) != 3 {
+		t.Fatalf("FileShared length = %d, want 3", len(out.FileShared))
+	}
+
+	if out.FileShared[0] != size {
+		t.Errorf("original shared = %d, want %d", out.FileShared[0], size)
+	}
+	if out.FileShared[1] != size {
+		t.Errorf("clone shared = %d, want %d", out.FileShared[1], size)
+	}
+	if out.FileShared[2] != 0 {
+		t.Errorf("independent copy shared = %d, want 0", out.FileShared[2])
 	}
 }

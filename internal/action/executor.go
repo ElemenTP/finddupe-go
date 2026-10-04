@@ -47,6 +47,11 @@ const (
 	ResultHardlinkLimit
 	ResultNotDuplicate
 	ResultError
+
+	// ResultAlreadyShared means the keeper and victim already share all their
+	// storage (same physical file, or identical CoW extents), so no action was
+	// needed.
+	ResultAlreadyShared
 )
 
 // Options configures the executor's behavior.
@@ -82,12 +87,10 @@ type Outcome struct {
 	// Result is set for DupeElim outcomes.
 	Result Result
 
-	// Shared reports whether the files in a CoWDetect outcome share extents.
-	Shared bool
-
-	// SharedBytes is the number of bytes shared between the files of a
-	// CoWDetect outcome.
-	SharedBytes int64
+	// FileShared is set for CoWDetect outcomes: the number of already-shared
+	// bytes for each entry of Files. It is nil when extent information is not
+	// available for the group (unsupported filesystem).
+	FileShared []int64
 }
 
 // chunkSizeFor returns an appropriate I/O chunk size for a file of the given size.
@@ -298,12 +301,13 @@ func (e *Executor) execute(ctx context.Context, ex dupe.Execution) (Result, erro
 	keeper := ex.Files[0]
 	victim := ex.Files[1]
 
-	// Skip already-hardlinked pairs (same physical file).
-	if e.opts.SkipHardlinked && keeper.Inode != 0 &&
-		keeper.Dev == victim.Dev &&
-		keeper.Inode == victim.Inode &&
-		keeper.NumLinks > 1 {
-		return ResultAlreadyHardlinked, nil
+	// Never act on the same physical file. In report mode a hardlinked pair is
+	// still a duplicate worth reporting unless --hardlink asked to skip it.
+	if samePhysicalFile(keeper, victim) {
+		if e.opts.Action != config.ActionReport || e.opts.SkipHardlinked {
+			return ResultAlreadyHardlinked, nil
+		}
+		return ResultVerifiedDuplicate, nil
 	}
 
 	if victim.IsRef && e.opts.Action != config.ActionReport {
@@ -322,6 +326,12 @@ func (e *Executor) execute(ctx context.Context, ex dupe.Execution) (Result, erro
 	default:
 		return ResultNotDuplicate, nil
 	}
+}
+
+// samePhysicalFile reports whether two FileInfo records describe the same
+// physical file (a hardlink of each other, or the same path).
+func samePhysicalFile(a, b dupe.FileInfo) bool {
+	return a.Inode != 0 && a.Dev == b.Dev && a.Inode == b.Inode
 }
 
 // restoreHasher creates a new SHA-256 hasher. If state is non-nil, it restores
