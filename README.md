@@ -6,13 +6,14 @@ A fast, cross-platform duplicate file finder and eliminator written in Go with m
 
 - **Multi-threaded scanning**: Uses worker pools to scan files in parallel for improved performance
 - **Cross-platform**: Supports Linux, macOS, and Windows
-- **Hard link detection**: Find existing hard link groups
-- **CoW detection**: Find CoW generated same files (if FS supports CoW)
+- **Hard link detection**: List existing hard link groups with `find --listlink`
+- **CoW detection**: List duplicate files that share physical extents (CoW-generated copies) with `find --cow`
 - **Duplicate deletion**: Safely delete duplicate files
 - **Duplicate hard link**: Create hard links to eliminate duplicate files and save disk space
-- **Duplicate CoW**: Create CoW copies to eliminate duplicate files and save disk space (if FS supports CoW)
+- **Duplicate CoW**: Create CoW clones to eliminate duplicate files and save disk space on filesystems that support reflinks/block clones
+- **Reference paths**: Protect a set of original files with `--ref`; they become keepers and are never eliminated
 - **Unicode support**: Handles filenames with Unicode characters properly
-- **Long path support**: long path for windows
+- **Long path support**: Long path support for Windows
 
 ## Installation
 
@@ -64,6 +65,26 @@ finddupe dedupe --delete /data
 finddupe dedupe --hardlink /backup
 ```
 
+**Replace duplicates with CoW clones (saves space on btrfs/XFS/APFS/ReFS):**
+```bash
+finddupe dedupe --cow /btrfs-volume
+```
+
+**List existing hard link groups:**
+```bash
+finddupe find --listlink /data
+```
+
+**List duplicate files that share physical extents (CoW copies):**
+```bash
+finddupe find --cow /btrfs-volume
+```
+
+**Protect original files while deduplicating copies:**
+```bash
+finddupe dedupe --delete --ref /originals -- /copies
+```
+
 **Use multiple threads for faster scanning:**
 ```bash
 finddupe find --threads 8 /large/dataset
@@ -72,11 +93,6 @@ finddupe find --threads 8 /large/dataset
 **Find duplicates in all .jpg files in a tree:**
 ```bash
 finddupe find /photos/**/*.jpg
-```
-
-**Find existing hard link groups:**
-```bash
-finddupe find --hardlink /data
 ```
 
 ### Pattern Matching
@@ -89,32 +105,39 @@ finddupe supports flexible pattern matching:
 - `/path/**/*.txt` - Recursively scan all .txt files under path
 
 ### Options
+
 find mode:
+
 | Option | Description |
 |--------|-------------|
-| `-h, --hardlink` | list hardlink groups |
-| `-c, --cow` | list cow generated same copies |
-| `-s, --sigs` | Print computed file signatures |
+| `-H, --hardlink` | Skip already-hardlinked files when reporting duplicates |
+| `-l, --listlink` | List hardlink groups (files sharing a physical inode) and exit |
+| `-c, --cow` | List duplicate files that share physical extents (CoW copies) |
 | `-v, --verbose` | Verbose output |
-| `-z, --zero` | Include zero length files |
+| `-z, --zero` | Include zero-length files |
 | `-p, --no-progress` | Hide progress indicator |
 | `-j, --follow-symlinks` | Follow symbolic links |
-| `-t <n>, --threads <n>` | Number of worker threads (default: CPU count) |
+| `-t <n>, --threads <n>` | Number of worker threads (default: CPU count × 2) |
+| `--ref <path>` | Mark the next path/pattern as reference (compare against, never act on); repeatable |
 
-dedupe mode:
+`--hardlink`, `--listlink`, and `--cow` are mutually exclusive in find mode.
+
+dedupe mode (exactly one action is required):
+
 | Option | Description |
 |--------|-------------|
-| `-d, --delete` | Delete duplicate files (conflicts with -h and -c) |
-| `-h, --hardlink` | Create hardlinks to eliminate duplicates (conflicts with -d and -c) |
-| `-c, --cow` | Create cow dupes to eliminate duplicates (conflicts with -d and -h) |
-| `-s, --sigs` | Print computed file signatures |
+| `-d, --delete` | Delete duplicate files (conflicts with `-H` and `-c`) |
+| `-H, --hardlink` | Create hardlinks to eliminate duplicates (conflicts with `-d` and `-c`) |
+| `-c, --cow` | Create CoW clones to eliminate duplicates (conflicts with `-d` and `-H`) |
 | `-r, --rdonly` | Also operate on readonly files (for Windows) |
 | `-v, --verbose` | Verbose output |
 | `-z, --zero` | Include zero length files |
 | `-p, --no-progress` | Hide progress indicator |
 | `-j, --follow-symlinks` | Follow symbolic links |
-| `-t <n>, --threads <n>` | Number of worker threads (default: CPU count) |
-| `--ref` | Mark following pattern as reference files (not to be eliminated), can use multiple times |
+| `-t <n>, --threads <n>` | Number of worker threads (default: CPU count × 2) |
+| `--ref <path>` | Mark the next path/pattern as reference files (not to be eliminated); repeatable |
+
+> **Note:** `--sigs`/`-s` (signature printing) is not implemented; it was removed as dead code and is listed as future work in [docs/cli-spec.md](docs/cli-spec.md).
 
 ### Example Scenarios
 
@@ -139,11 +162,11 @@ finddupe find /drive1 /drive2 /drive3 --verbose
 
 ## How It Works
 
-1. **Scanning**: Uses multiple worker threads to scan files in parallel
-2. **Checkum Calculation**: Computes a fast checksum of the first 32KB of each file
-3. **Grouping**: Groups files with matching checksums
-4. **Verification**: Performs full byte-by-byte comparison on potential duplicates
-5. **Action**: Either reports, deletes, or replaces duplicates with hard links
+1. **Scanning**: Multiple worker threads walk paths/globs and compute a fast 64-bit checksum of the first 32KB of each file, plus its device/inode/link metadata.
+2. **Grouping**: A single coordinator goroutine owns a state machine (`dupe.Detector`) that groups files by `(signature, size)` and then by full SHA-256.
+3. **Comparison strategy**: one file is stored without hashing; exactly two unhashed files are compared in chunks with early-stop; three or more files get a full parallel SHA-256 pass. This guarantees every duplicate of N identical files is reported.
+4. **Execution**: Stateless executor workers hash, compare, and eliminate files as directed by the coordinator, feeding their results back for follow-up work.
+5. **Action**: Either report, delete, replace with hard links, or replace with CoW clones. With `--ref`, reference files are walked first, become keepers, and are never eliminated.
 
 ## Performance Tips
 
@@ -151,16 +174,22 @@ finddupe find /drive1 /drive2 /drive3 --verbose
 - SSD storage will provide significantly faster scanning than HDD
 - Network drives will be slower due to I/O limitations
 - The first scan of a directory will be slower as the OS caches file metadata
+- `find --cow` costs an extra open + extent query per file, so use it only when you need CoW detection
 
 ## Platform-Specific Notes
 
 ### Linux/macOS
 - Hard links work within the same filesystem
 - Symbolic links are not followed by default (use `-j` to follow)
-- File permissions are preserved when creating hard links
+- File permissions are preserved when creating hard links and CoW clones
+- **CoW clone** (`dedupe --cow`): Linux uses `FICLONE` on btrfs/XFS; macOS uses `clonefile(2)` on APFS
+- **CoW detection** (`find --cow`): Linux uses FIEMAP; macOS uses the undocumented `F_LOG2PHYS_EXT` fcntl (experimental, may change across OS releases)
+- On unsupported filesystems the CoW clone is refused and the victim is left untouched (`ErrCoWNotSupported`)
 
 ### Windows
-- Hard links require NTFS filesystem
+- Hard links require NTFS
+- **CoW clone** (`dedupe --cow`) requires ReFS (including Dev Drive) via `FSCTL_DUPLICATE_EXTENTS_TO_FILE`; NTFS is not supported
+- **CoW detection** (`find --cow`) uses `FSCTL_GET_RETRIEVAL_POINTERS`
 - Administrator privileges may be needed for some operations
 - Long paths (260+ characters) are fully supported
 
@@ -170,9 +199,11 @@ finddupe find /drive1 /drive2 /drive3 --verbose
 |---------|-----------|------------|
 | Multi-threading | No | Yes |
 | Cross-platform | Windows only | Linux, macOS, Windows |
+| Hard link listing | Yes | Yes (`find --listlink`) |
+| CoW clone | Partial | Yes (Linux/macOS/Windows, per-filesystem) |
+| CoW detection | No | Yes (`find --cow`) |
 | Unicode support | Limited | Full |
 | Long paths | Limited | Full |
-| Modern features | No | Yes |
 | Performance | Good | Better (multi-threaded) |
 
 ## License

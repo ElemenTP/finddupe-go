@@ -7,44 +7,68 @@ Two test suites complement each other:
 - **Unit tests**: `internal/*/` — test individual packages in isolation
 - **System tests**: `test/system_test.go` — test the compiled binary end-to-end against real filesystems
 
-All tests run with the `-race` flag where available.
+All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 
 ## Test Requirements (from .golangci.yml)
 
 - **`paralleltest`**: All test functions must call `t.Parallel()`
 - **`testpackage`**: Tests use a separate `_test` package
-- **`exhaustruct`**: Tests must initialize all struct fields
+- **`tparallel`**: Detects inappropriate `t.Parallel()` usage
+
+`exhaustruct` is present in the config file but **disabled** (commented out in the enabled-linters list), so tests do not have to initialize every struct field.
 
 ## Unit Tests by Package
 
-### `internal/checksum`
+### `internal/checksum` (9 tests)
 
 | Test | Description |
 |------|-------------|
 | `TestCompute_EmptyFile` | Empty file → signature 0 |
-| `TestCompute_SmallFile` | File smaller than 32KB → entire file used |
+| `TestCompute_SmallFile` | File smaller than 32KB → non-zero signature |
 | `TestCompute_Deterministic` | Same content → same signature |
 | `TestCompute_DifferentFiles` | Different content → different signature |
 | `TestCompute_FileSizeFoldedIn` | Same content, different reported sizes → different signatures |
-| `TestCompute_LargeFile` | File larger than 32KB → only first 32KB used |
+| `TestCompute_LargeFile` | File larger than 32KB → only first 32KB used (same first 32KB collides) |
 | `TestComputeFromReader` | Reader-based computation |
 | `TestCompute_NonExistentFile` | Non-existent path → error |
 | `TestCompute_CRCAndSumComponents` | Signature packs crc and sum correctly |
 
-### `internal/dupe` (Detector)
+### `internal/dupe` (Detector, 14 tests)
 
 | Test | Description |
 |------|-------------|
-| `TestDetector_FirstInsert` | First file → nil |
-| `TestDetector_DuplicateSignature` | Same checksum → DupeGroup |
-| `TestDetector_MultipleCollisions` | Third collision → one group (against first) |
-| `TestDetector_DifferentSignatures` | Different checksums → all nil |
-| `TestDetector_StatsUpdate` | Stats incremented correctly |
-| `TestDetector_HardlinkMode` | InsertHardlink groups by inode |
-| `TestDetector_HardlinkMode_SingleLink` | NumLinks==1 files skipped |
-| `TestDetector_EmptyDetector` | Zero state verification |
+| `TestDetector_FirstInsert` | First file → no executions; stats updated |
+| `TestDetector_TwoUnhashedFiles_EmitHashComp` | Exactly two unhashed files → one `HashComp` |
+| `TestDetector_ThirdUnhashedFile_EmitHashCalc` | Third unhashed file → `HashCalc` for the new file only |
+| `TestDetector_KnownShaMatch_EmitDupeElim` | Known matching SHA-256 → `DupeElim` keeper/victim |
+| `TestDetector_KnownShaMismatch_NoExec` | Known different SHA-256 → no work |
+| `TestDetector_ThreeIdenticalFiles_AllReported` | Regression: 4 identical files → exactly 3 eliminations, one keeper |
+| `TestDetector_NoDoubleElimination` | A scheduled victim is never handed out twice |
+| `TestDetector_PartialProgressPreserved` | Early-stop state carried into a later `HashCalc` |
+| `TestDetector_PartialProgressKeepsLargerOffset` | The most advanced partial offset wins |
+| `TestDetector_CRCCollisionSeparatesBuckets` | Different SHA-256 buckets → matched against the right keeper |
+| `TestDetector_CoWDetectMode` | `WithCoWDetect()` emits `CoWDetect`, never schedules victims |
+| `TestDetector_InsertInodeGroups` | `InsertInode`/`InodeGroups` group by `(Dev, Inode)` |
+| `TestDetector_Empty` | Zero state: `Len()==0`, no inode groups, non-nil stats |
+| `TestDetector_SamePathInsertedTwice` | Inserting one path twice is ignored (overlapping patterns cannot self-eliminate) |
 
-### `internal/fswalker`
+### `internal/action` (11 tests)
+
+| Test | Description |
+|------|-------------|
+| `TestDoExecution_HashCalc_Complete` | Full-file SHA-256 for a multi-chunk file |
+| `TestDoExecution_HashCalc_Resumes` | Hashing resumes from `HashState`/`HashOffset` |
+| `TestDoExecution_HashComp_Identical` | Identical pair → both SHA-256 complete and equal |
+| `TestDoExecution_HashComp_EarlyStop` | Differing chunks stop early and save partial state |
+| `TestDoExecution_DupeElim_Delete` | Victim deleted, keeper preserved |
+| `TestDoExecution_DupeElim_RefVictimSkipped` | Reference victim → `ResultSkippedRef`, file preserved |
+| `TestDoExecution_DupeElim_SkipHardlinked` | Same `(Dev, Inode)` pair → `ResultAlreadyHardlinked` |
+| `TestDoExecution_DupeElim_Report` | Report action → `ResultVerifiedDuplicate` |
+| `TestDoExecution_DupeElim_Hardlink` | Victim replaced with a hardlink to the keeper |
+| `TestDoExecution_DupeElim_ReadOnly` | Read-only victim skipped, then deleted with `IncludeReadonly` |
+| `TestDoExecution_CoWClone` | Victim replaced with a CoW clone; skips when unsupported |
+
+### `internal/fswalker` (11 tests)
 
 | Test | Description |
 |------|-------------|
@@ -60,90 +84,108 @@ All tests run with the `-race` flag where available.
 | `TestWalk_FileInfoFields` | FileInfo populated correctly |
 | `TestWalk_MultiplePatterns` | Multiple patterns combined |
 
-### `internal/action`
-
-| Test | Description |
-|------|-------------|
-| `TestVerifyFullFile_Identical` | Same content → true |
-| `TestVerifyFullFile_Different` | Different content → false |
-| `TestVerifyFullFile_DifferentSizes` | Different sizes → false |
-| `TestVerifyFullFile_LargeFiles` | >64KB files compared correctly |
-| `TestVerifyFullFile_DifferAfterFirstChunk` | Mismatch after 100KB detected |
-| `TestDelete_Success` | Duplicate deleted |
-| `TestHardlink_Created` | Hardlink created, `os.SameFile` true |
-| `TestHardlink_NotDuplicate` | Non-duplicate → ResultNotDuplicate |
-| `TestCoW_Unsupported` | CoW returns unsupported error |
-| `TestReport_NoAction` | Report mode: file preserved |
-
-### `internal/worker`
+### `internal/worker` (5 tests)
 
 | Test | Description |
 |------|-------------|
 | `TestPool_AllTasksExecute` | N tasks, all complete |
 | `TestPool_Bounded` | Concurrency limited to pool size |
 | `TestPool_ContextCancellation` | Cancelled ctx prevents execution |
-| `TestPool_WaitBlocks` | Wait() blocks until completion |
-| `TestPool_ZeroSize` | Size 0 → default to NumCPU |
+| `TestPool_WaitBlocks` | `Wait()` blocks until completion |
+| `TestPool_ZeroSize` | Size 0 → defaults to `runtime.NumCPU()` |
+
+### `internal/extent` (3 tests)
+
+| Test | Description |
+|------|-------------|
+| `TestSharedBytes` | Table test: partial/identical/disjoint/multiple overlaps, encoded extents ignored, shared-logical fallback |
+| `TestQuery_HardlinksShareExtents` | Two hardlinked 64KB files share every byte; skips if `ErrUnsupported` |
+| `TestQuery_IndependentCopiesShareNothing` | Two independent copies share nothing; skips if `ErrUnsupported` |
+
+The `Query` tests skip themselves with `t.Skipf` when the filesystem cannot report extents, so they run meaningfully on Linux (FIEMAP/`FICLONE`), macOS (APFS), and Windows (ReFS).
+
+### `internal/pipeline` (3 tests)
+
+| Test | Description |
+|------|-------------|
+| `TestRun_CancelledContext` | A pre-cancelled context returns `context.Canceled` without deadlocking |
+| `TestRun_EmptyPatterns` | No patterns completes cleanly |
+| `TestRun_ListLink` | `--listlink` mode runs end to end |
 
 ## System Tests (`test/system_test.go`)
 
-System tests compile the `finddupe` binary once via `TestMain` and run it against real temp directories. 46 tests in total:
+System tests build the `finddupe` binary once in `TestMain` and run it against real temp directories. The package is split: `test/doc.go` declares `package test` while the tests use `package test_test`.
 
-### Find Mode (16 tests)
+There are **51 test functions** (plus `TestMain`).
 
-Basic duplicates, no duplicates, empty directory, zero-length files (skipped/included), verbose mode, threads flag, multiple paths, glob patterns, recursive glob, large files, CRC near-collision, binary files, many duplicates, single file, multiple duplicate groups.
+### Find Mode (18 tests)
 
-### Dedupe --delete (7 tests)
+Basic duplicates, no duplicates, empty directory, zero-length files (skipped/included), verbose mode, threads flag, multiple paths, glob patterns, recursive glob, large files, CRC near-collision (same first chunk, different after), binary files, many duplicates, single file, multiple duplicate groups, `TestFind_ThreeOrMoreIdenticalFiles` (the regression test that 4 identical files yield exactly 3 duplicate reports), and `TestFind_DuplicatePathArgs_NoSelfDuplicate` (a directory passed twice must not report a file against itself).
 
-Basic deletion, content preservation, missing action flag error, multiple actions error, readonly file handling (skipped, forced with `-r`), many duplicates.
+### Dedupe `--delete` (9 tests)
 
-### Dedupe --hardlink (4 tests)
+Basic deletion, content preservation, missing action flag error, multiple actions error, read-only handling (skipped, forced with `-r`), many duplicates, `TestDedupeDelete_ThreeIdenticalFiles` (3 identical files → 2 deletions, 1 survivor), and `TestDedupeDelete_DuplicatePathArgs_NoDataLoss` (overlapping patterns must not delete every copy).
 
-Hardlink creation, content preservation, same-inode verification, readonly handling.
+### Dedupe `--hardlink` (4 tests)
 
-### Edge Cases / Error Handling (7 tests)
+Hardlink creation, content preservation, same-inode verification, read-only handling.
+
+### CoW (3 tests)
+
+`TestDedupeCoW_Unsupported` (graceful failure when cloning is unavailable), `TestDedupeCoW_CreateAndDetect` (clone then detect shared extents; conditionally `t.Skip`s when CoW is unsupported), and `TestFind_CoW_IndependentCopiesNotGrouped` (independent copies must not report a CoW group).
+
+### Reference Paths (1 test)
+
+`TestDedupe_RefKeptAndDuplicateRemoved` — the `--ref` file is kept and the non-reference duplicate is removed.
+
+### Hardlink Listing (1 test)
+
+`TestFind_ListLink` — lists the group, prints both paths, does not run duplicate detection, and reports the group count.
+
+### Edge Cases / Error Handling (8 tests)
 
 No paths error, nonexistent path, no subcommand error, zero threads, many threads, version output, help output, subcommand help.
 
-### Additional (4 tests)
+### Nested Directories and Complex Trees (2 tests)
 
-Nested directories (find + dedupe), glob edge cases, stats verification, concurrent runs.
+`TestNestedDirectories`, `TestDedupe_NestedDirectories`.
+
+### Glob Edge Cases (2 tests)
+
+`TestGlob_StarExtension`, `TestGlob_CurrentDirPattern`.
+
+### Stats (2 tests)
+
+`TestStats_Find` (exact `Files:`/`Dupes:` counts) and `TestStats_FileSizes` (byte totals).
+
+### Concurrency (1 test)
+
+`TestConcurrentRuns` — three concurrent runs must not corrupt global state.
 
 ## Race Detection
 
-All tests should pass with `-race`:
+All tests should pass with `-race`. Because the race detector needs cgo, set `CGO_ENABLED=1` (the normal build uses `CGO_ENABLED=0`):
 
 ```bash
-CGO_ENABLED=1 go test -race ./...
+CGO_ENABLED=1 go test -race ./... -count=1
 ```
 
 Key race-prone areas:
 - `Stats` atomic counters
-- `Detector` map access (single goroutine)
+- `Detector` map access (single coordinator goroutine, guarded by its own mutex)
 - Worker pool concurrent submissions
-- Pipeline channels
-
-## Benchmarks
-
-```go
-// internal/checksum/checksum_test.go
-func BenchmarkCompute(b *testing.B)
-
-// internal/action/action_test.go
-func BenchmarkVerifyFullFile(b *testing.B)
-
-// internal/dupe/detector_test.go
-func BenchmarkDetectorInsert(b *testing.B)
-```
+- Pipeline channels and the `inFlight` counter
 
 ## CI Test Matrix
 
-```yaml
-strategy:
-  matrix:
-    os: [ubuntu-latest, macos-latest, windows-latest]
-    go: ['1.26']
-```
+`.github/workflows/ci.yml` runs three jobs:
+
+- **test**: `ubuntu-latest`, `macos-latest`, `windows-latest`; each builds, vets, and
+  runs the suite. The Go version is read from `go.mod` via `actions/setup-go`
+  (`go-version-file`). The race detector runs on Ubuntu only
+  (`go test ./... -race -count=1`); the other platforms run `go test ./... -count=1`.
+- **lint**: `golangci-lint` v2.14.0 on Ubuntu.
+- **cross-compile**: `make all-arch` on Ubuntu (all 21 supported targets).
 
 Minimum: compile-test on all platforms:
 ```bash
@@ -162,10 +204,11 @@ go tool cover -func=coverage.out
 ```
 
 Critical paths requiring high coverage:
-- Checksum computation (correctness-critical)
-- Duplicate detection insert/lookup
-- Full file verification
-- Hardlink creation/deletion logic
+- Checksum and identity computation (correctness-critical)
+- Detector state machine (`Insert` / `OnHashDone` / `OnCompareDone`, no double elimination)
+- Chunked comparison / early-stop and resume
+- Hardlink creation and deletion logic
+- Extent overlap arithmetic
 
 ## Running Tests
 
@@ -178,4 +221,7 @@ go test ./test/... -count=1 -timeout 120s
 
 # All tests
 go test ./... -count=1 -timeout 120s
+
+# Race detector
+CGO_ENABLED=1 go test -race ./... -count=1
 ```

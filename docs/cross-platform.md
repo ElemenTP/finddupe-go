@@ -2,86 +2,83 @@
 
 ## Overview
 
-finddupe-go targets three platforms: **Linux**, **macOS**, and **Windows**. Platform-specific code is isolated behind build-tagged files (`_unix.go` / `_windows.go`).
+finddupe-go targets three platforms: **Linux**, **macOS**, and **Windows**. Platform-specific code is isolated behind build-tagged files (`_unix.go`, `_linux.go`, `_darwin.go`, `_windows.go`, `_other.go`).
 
 ## Platform Abstraction Strategy
 
 ```
 internal/
 ├── checksum/
-│   ├── inode_unix.go      // //go:build unix
-│   └── inode_windows.go   // //go:build windows
+│   ├── inode_unix.go      // //go:build unix     → fileIdentity
+│   └── inode_windows.go   // //go:build windows  → fileIdentity
 ├── fswalker/
-│   ├── walker_unix.go     // //go:build unix
-│   └── walker_windows.go  // //go:build windows
+│   ├── walker_unix.go     // //go:build unix     → getFileIdentity
+│   └── walker_windows.go  // //go:build windows  → getFileIdentity
+├── extent/
+│   ├── query_linux.go     // //go:build linux    → FIEMAP
+│   ├── query_darwin.go    // //go:build darwin   → F_LOG2PHYS_EXT
+│   ├── query_windows.go   // //go:build windows  → FSCTL_GET_RETRIEVAL_POINTERS
+│   └── query_other.go     // //go:build !linux && !darwin && !windows
 └── action/
     ├── hardlink_unix.go   // //go:build unix
     ├── hardlink_windows.go// //go:build windows
-    ├── cow_unix.go        // //go:build unix
-    └── cow_windows.go     // //go:build windows
+    ├── clone_linux.go     // //go:build linux    → FICLONE
+    ├── clone_darwin.go    // //go:build darwin   → clonefile(2)
+    ├── clone_windows.go   // //go:build windows  → FSCTL_DUPLICATE_EXTENTS_TO_FILE
+    ├── clone_other.go     // //go:build !linux && !darwin && !windows
+    ├── replace_unix.go    // //go:build unix     → os.Rename
+    └── replace_windows.go // //go:build windows  → MoveFileEx
 ```
 
 ## 1. Inode / File Index Retrieval
 
 ### Strategy
 
-Inode retrieval happens in the **parallel worker pool goroutines**, not in the sequential walker. This is critical for performance: on Windows, `GetFileInformationByHandle` requires a file handle. Opening files in the walker would serialize all I/O and kill multi-threading.
+Identity retrieval has two entry points with the same `(dev, inode, numLinks)` result:
+
+- `checksum.fileIdentity(f *os.File)` — called in the **parallel worker pool** after `os.Open`.
+- `fswalker.getFileIdentity(path, info fs.FileInfo)` — called from the walker; on Unix it uses the already-available stat struct, on Windows it returns zeros.
+
+This split matters for performance: on Windows `GetFileInformationByHandle` requires a handle, and opening files in the walker would serialize all I/O and kill multi-threading.
 
 ### Unix (Linux, macOS)
 
 `checksum/inode_unix.go`:
 ```go
-func fileInode(f *os.File) (inode uint64, numLinks uint64) {
+func fileIdentity(f *os.File) (uint64, uint64, uint64) {
     info, _ := f.Stat()
     stat, ok := info.Sys().(*syscall.Stat_t)
-    // read stat.Ino, stat.Nlink
+    // read stat.Dev, stat.Ino, stat.Nlink
 }
 ```
 
-Called from `checksum.ComputeFileInfo` after `os.Open`, so the file is already open.
+`fswalker/walker_unix.go` reads the same fields directly from `info.Sys().(*syscall.Stat_t)` inside the walk callback (essentially free).
 
 ### Windows
 
 `checksum/inode_windows.go`:
 ```go
-func fileInode(f *os.File) (inode uint64, numLinks uint64) {
+func fileIdentity(f *os.File) (dev, inode, numLinks uint64) {
     var info syscall.ByHandleFileInformation
     syscall.GetFileInformationByHandle(syscall.Handle(f.Fd()), &info)
+    dev = uint64(info.VolumeSerialNumber)
     inode = (uint64(info.FileIndexHigh) << 32) | uint64(info.FileIndexLow)
     numLinks = uint64(info.NumberOfLinks)
+    return dev, inode, numLinks
 }
 ```
 
-The NTFS file index serves the same role as the Unix inode. `GetFileInformationByHandle` is called on the already-open handle from `os.Open` — no separate `CreateFile` call.
+The NTFS file index serves the same role as the Unix inode, and the volume serial number is the `Dev` component. `GetFileInformationByHandle` is called on the already-open handle from `os.Open` — no separate `CreateFile` call.
+
+### Device Matters
+
+`Dev` is part of the identity because inode numbers are only unique per device. Both hardlink detection (`--hardlink`, `--listlink`) and CoW extent comparison compare `(Dev, Inode)` / `Dev`, so files on different volumes are never confused.
 
 ### Fallback
 
-If inode retrieval fails, `Inode` and `NumLinks` are 0. Duplicate detection still works via checksum, but the `--hardlink` flag (skip same-inode pairs) will be ineffective.
+If identity retrieval fails, `Dev`, `Inode`, and `NumLinks` are 0. Duplicate detection still works via checksum, but `--hardlink`/`--listlink` are ineffective and CoW detection cannot compare physical extents.
 
-## 2. Walker Inode Retrieval
-
-### Unix
-
-`fswalker/walker_unix.go`:
-```go
-func getInode(_ string, info fs.FileInfo) (inode uint64, numLinks uint64) {
-    stat, ok := info.Sys().(*syscall.Stat_t)
-    return stat.Ino, uint64(stat.Nlink)
-}
-```
-Called from the walker callback — reads from the already-available stat struct (essentially free).
-
-### Windows
-
-`fswalker/walker_windows.go`:
-```go
-func getInode(_ string, _ fs.FileInfo) (inode uint64, numLinks uint64) {
-    return 0, 0
-}
-```
-Returns zero. Inode retrieval happens later in `checksum.ComputeFileInfo` where the file handle is already open and the operation is parallelized.
-
-## 3. Hardlink Creation
+## 2. Hardlink Creation
 
 ### Unix
 
@@ -100,34 +97,86 @@ func createPlatformHardlink(linkPath, targetPath string) error {
 }
 ```
 Go's `os.Link` wraps `CreateHardLinkW`. Additional considerations:
-- **NTFS hardlink limit**: 1023 links per file. Checked against `NumLinks` before linking.
+- **NTFS hardlink limit**: 1023 links per file. Checked against `NumLinks` before linking (`ResultHardlinkLimit`).
 - **Administrator privileges**: May be required (caller's responsibility).
-- **Cross-drive**: Impossible. Must validate drives are the same.
+- **Cross-drive**: Impossible. Hardlinks must be on the same volume.
 
-## 4. CoW (Copy-on-Write) Clone
+## 3. CoW (Copy-on-Write) Clone
 
-Not yet implemented — all platforms return `ErrCoWNotSupported`.
+CoW elimination is implemented for each platform. `cloneReplace` in `internal/action/cow.go` clones the keeper into a temporary file next to the victim, preserves the victim's mode/mtime, and atomically replaces it. Unsupported filesystems return `ErrCoWNotSupported` and the victim is left untouched.
 
-Planned implementations:
-- **Linux**: `ioctl FICLONERANGE` (btrfs/xfs) via `golang.org/x/sys/unix`
-- **macOS**: `clonefile(2)` via `golang.org/x/sys/unix`
-- **Windows**: `FSCTL_DUPLICATE_EXTENTS_TO_FILE` via DeviceIoControl (ReFS only)
+### Linux — `FICLONE`
+
+`clone_linux.go` opens the clone destination with `O_CREATE|O_EXCL` and calls `unix.IoctlFileClone` (`FICLONE`) on the destination handle with the source handle. Supported on **btrfs** and **XFS** (reflink). Unsupported errors (`EOPNOTSUPP`, `ENOTTY`, `EINVAL`, `EXDEV`, `ENOSYS`) are joined with `ErrCoWNotSupported`.
+
+### macOS — `clonefile(2)`
+
+`clone_darwin.go` calls `unix.Clonefile(src, dst, 0)`. Supported on **APFS**. `clonefile` requires the destination not to exist, which `cloneReplace` guarantees by removing the temporary file first.
+
+### Windows — `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
+
+`clone_windows.go` implements block cloning on **ReFS** (including Dev Drive):
+1. Determine the volume cluster size with `GetDiskFreeSpaceW` (cached per volume root).
+2. Create the destination and preallocate it with `SetFileInformationByHandle(FileAllocationInfo)`.
+3. Duplicate whole clusters with `DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)`.
+4. Copy the unaligned tail with a normal read/write.
+
+NTFS returns `ERROR_INVALID_FUNCTION`; unsupported errors are joined with `ErrCoWNotSupported`.
+
+### Atomic Replace
+
+- **Unix** (`replace_unix.go`): `os.Rename(tmp, dst)` — atomic within a filesystem.
+- **Windows** (`replace_windows.go`): `MoveFileEx(from, to, MOVEFILE_REPLACE_EXISTING)`.
+
+## 4. Extent Querying (CoW Detection)
+
+`find --cow` uses `internal/extent` to decide whether byte-identical files share physical storage. `Query(path) ([]Extent, error)` is implemented per platform; `Supported()` reports whether the platform has an implementation, and `ErrUnsupported` is returned when the filesystem cannot report extents.
+
+### Linux — FIEMAP
+
+`query_linux.go` issues the `FS_IOC_FIEMAP` ioctl (`0xC020660B`) in batches, with `FIEMAP_FLAG_SYNC` so freshly written files are written back before mapping (otherwise dirty files report zero-length extents). Extents flagged `FIEMAP_EXTENT_ENCODED` or `FIEMAP_EXTENT_UNKNOWN` are marked `Encoded` and excluded from physical comparison; the `FIEMAP_EXTENT_SHARED` flag sets `Shared`.
+
+### macOS — `F_LOG2PHYS_EXT` (experimental / undocumented API)
+
+`query_darwin.go` walks the file with the `F_LOG2PHYS_EXT` fcntl (command `65`). This interface is **undocumented** by Apple and is not part of a stable public API; it is what APFS uses to expose extent sharing, but its behavior and availability may change across OS releases. It maps a logical offset to a device offset via `struct log2phys` and returns `ErrUnsupported` for `EINVAL`, `ENOTTY`, `ENOTSUP`, or `EOPNOTSUPP`.
+
+### Windows — `FSCTL_GET_RETRIEVAL_POINTERS`
+
+`query_windows.go` calls `DeviceIoControl(FSCTL_GET_RETRIEVAL_POINTERS)` with a `STARTING_VCN_INPUT_BUFFER`, growing the buffer on `ERROR_MORE_DATA`. The returned VCN→LCN pairs are converted to byte offsets using the volume cluster size from `GetDiskFreeSpaceW` (cached). ReFS block clones make two files reference the same LCNs, so overlapping mappings reveal shared extents.
+
+### Other Platforms
+
+`query_other.go` reports `Supported() == false` and `Query` always returns `ErrUnsupported`.
+
+### Comparing Extents
+
+`extent.SharedBytes(a, b)`:
+1. Sums the overlap of **non-encoded physical** ranges (the primary signal).
+2. If that yields nothing, falls back to comparing the **logical** ranges of extents the filesystem marked `Shared` — needed for compressed btrfs, where physical offsets are not comparable.
+
+### Compressed-btrfs Caveat
+
+On btrfs with compression, extents are reported as `Encoded`: their physical offsets and logical lengths cannot be compared directly, so the physical pass is skipped. Detection then depends on the filesystem's `FIEMAP_EXTENT_SHARED` hint and the logical-range fallback; if the kernel does not set that hint, two compressed clones may not be detected as sharing.
+
+### Same-Device Rule
+
+Physical offsets are only comparable within one device, so the executor skips CoW comparison when the two files have different non-zero `Dev` values.
 
 ## 5. Read-Only Files
 
 ### Unix
 
-Read-only determined by file permission bits. To make writable: `os.Chmod(path, 0666)`.
+Read-only is determined by file permission bits (`info.Mode().Perm()&0200 == 0`). To make writable, `os.Chmod(path, mode|0200)`.
 
 ### Windows
 
-Read-only determined by `FILE_ATTRIBUTE_READONLY`. Go normalizes this to the Unix permission model: `info.Mode()&0200 == 0` means read-only.
+Read-only is determined by `FILE_ATTRIBUTE_READONLY`; Go normalizes this to the Unix permission model, so the same `&0200 == 0` check works.
 
 ## 6. Symlinks and Reparse Points
 
 ### Unix
 
-Symbolic links detected via `info.Mode()&os.ModeSymlink`. The `-j` flag controls whether `filepath.WalkDir` follows them.
+Symbolic links are detected via `d.Type()&os.ModeSymlink`. The `-j` flag controls whether the walker follows them (with a `seen` set to prevent loops).
 
 ### Windows
 
@@ -138,11 +187,14 @@ Reparse points (junctions, symlinks, mount points) are not followed by default. 
 | Feature | Linux ext4 | Linux btrfs/xfs | macOS APFS | Windows NTFS | Windows ReFS |
 |---------|------------|-----------------|------------|--------------|--------------|
 | Hardlinks | ✓ | ✓ | ✓ | ✓ (≤1023) | ✓ |
-| CoW Clone | ✗ | ✓ (FICLONERANGE) | ✓ (clonefile) | ✗ | ✓ (FSCTL) |
+| CoW clone (write) | ✗ | ✓ (FICLONE) | ✓ (clonefile) | ✗ | ✓ (FSCTL_DUPLICATE_EXTENTS_TO_FILE) |
+| Extent query (`--cow`) | ✓ (FIEMAP) | ✓ (FIEMAP) | ✓ (F_LOG2PHYS_EXT, undocumented) | ✓ (FSCTL_GET_RETRIEVAL_POINTERS) | ✓ (FSCTL_GET_RETRIEVAL_POINTERS) |
 | Inode via stat | ✓ | ✓ | ✓ | ✗ | ✗ |
 | Inode via handle | — | — | — | ✓ | ✓ |
 | Long paths | N/A | N/A | N/A | ✓ (\\?\\) | ✓ (\\?\\) |
 | Symlinks | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+Extent querying is best-effort: on a filesystem without support the query returns `ErrUnsupported`, `find --cow` simply reports no CoW groups, and the files are still listed as duplicates.
 
 ## 8. Path Separators
 

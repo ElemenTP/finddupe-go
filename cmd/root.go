@@ -23,6 +23,10 @@ It supports:
   - Long path support
 
 Original C version by Matthias Wandel, Go rewrite with multi-threading support.`,
+
+	// Runtime failures (I/O errors, cancellation) should not dump the full
+	// usage text; cobra still reports argument errors.
+	SilenceUsage: true,
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.

@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"syscall"
 
 	"finddupe/internal/action"
 	"finddupe/internal/checksum"
@@ -37,7 +38,7 @@ const (
 
 // Run executes the full duplicate detection pipeline.
 func Run(ctx context.Context, cfg *config.Config) error {
-	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	threads := resolveThreads(cfg.Threads)
