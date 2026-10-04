@@ -267,11 +267,21 @@ rm -rf "$PART"
 mkdir -p "$PART"
 random_file "$PART/a.bin" 1048576
 clone_one "$PART/a.bin" "$PART/b.bin" 2>/dev/null || independent_copy "$PART/a.bin" "$PART/b.bin"
+
+section "extentdump: partial - clone before the rewrite (expect identical extents)"
+"$ED" "$PART/a.bin" "$PART/b.bin"
+
+section "find --cow: partial - clone before the rewrite (expect 100%)"
+show "$FD" find --cow --no-progress "$PART"
+
 # Rewrite the first 256 KiB of the clone with the very same bytes: the content
 # stays identical, but the filesystem has to stop sharing that range.
 dd if="$PART/a.bin" of="$PART/b.bin" bs=4096 count=64 conv=notrunc 2>/dev/null
 
-section "find --cow: partially shared clone (expect a partial ratio, e.g. 75%)"
+section "extentdump: partial - after rewriting 256 KiB of the clone with identical bytes"
+"$ED" "$PART/a.bin" "$PART/b.bin"
+
+section "find --cow: partially shared clone (a partial ratio if the rest stayed shared)"
 echo "(the per-file FIEMAP Shared flag may still report the untouched file as 100%)"
 show "$FD" find --cow --no-progress "$PART"
 
