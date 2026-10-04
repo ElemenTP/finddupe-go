@@ -176,6 +176,15 @@ Verified on a Darwin 27.0.0 / macOS 27 ARM64 APFS data volume:
 Note that APFS native compression is exposed through the `SF_COMPRESSED` flag
 (`ls -lO` prints `compressed`), not as a readable `com.apple.decmpfs` xattr.
 
+`getattrlist` is invoked through the raw syscall trap because
+`golang.org/x/sys/unix` (through v0.48.0) exports no libSystem wrapper for it —
+it provides `Setattrlist` and the deprecated `SYS_*` numbers only — and cgo
+would break the `CGO_ENABLED=0` release and cross-compiled bundles. The call is
+isolated in one function and every failure path returns `ErrUnsupported`, so a
+future macOS that removes the trap degrades to "cannot tell" instead of
+reporting wrong sharing. If x/sys adds `Getattrlist`, that single call site can
+switch to it.
+
 ### Windows — `FSCTL_GET_RETRIEVAL_POINTERS`
 
 `query_windows.go` calls `DeviceIoControl(FSCTL_GET_RETRIEVAL_POINTERS)` with a `STARTING_VCN_INPUT_BUFFER`, growing the buffer on `ERROR_MORE_DATA`. The returned VCN→LCN pairs are converted to byte offsets using the volume cluster size from `GetDiskFreeSpaceW` (cached), and `Logical` is the VCN-derived byte offset. ReFS block clones make two files reference the same LCNs, so overlapping mappings reveal shared extents.

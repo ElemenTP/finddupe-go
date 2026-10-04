@@ -75,6 +75,14 @@ func cloneID(path string) (uint64, error) {
 	}
 	options := uintptr(fsoptNoFollow | fsoptPackInvalAttrs | fsoptAttrCmnExtended)
 
+	// getattrlist is called through the raw trap on purpose: golang.org/x/sys
+	// (through v0.48.0) exports no libSystem wrapper for it (it has Setattrlist
+	// and the deprecated SYS_* numbers only), and cgo would break the
+	// CGO_ENABLED=0 release/cross-builds. Apple's deprecation note is about
+	// direct syscalls in general, so this is isolated here and every failure
+	// path degrades to ErrUnsupported; an OS that drops the trap reports
+	// "cannot tell" rather than a wrong answer. If x/sys ever exports
+	// Getattrlist, this is the single call site to switch.
 	var out [64]byte
 	_, _, errno := syscall.Syscall6(
 		unix.SYS_GETATTRLIST,
