@@ -5,7 +5,7 @@
 | Platform | Filesystem | Clone | Extent / sharing signal |
 |---|---|---|---|
 | Linux | btrfs, XFS | `FICLONE` ioctl | `FS_IOC_FIEMAP` + `FIEMAP_EXTENT_SHARED` |
-| macOS | APFS | `clonefile(2)` | `getattrlist(ATTR_CMNEXT_CLONEID)` (APFS clone ID) |
+| macOS | APFS | `clonefile(2)` | `fcntl(F_LOG2PHYS_EXT)`; `getattrlist` clone ID for compressed files |
 | Windows | ReFS / Dev Drive | `FSCTL_DUPLICATE_EXTENTS_TO_FILE` | `FSCTL_GET_RETRIEVAL_POINTERS` |
 
 Linux is covered by the automated test suite. macOS and Windows need a real
@@ -95,9 +95,10 @@ The whole script output (it is split into `== section ==` markers), plus:
 
 - Compressed extents (`encoded=true`) are excluded from physical comparison:
   the reported logical length overstates the compressed physical allocation.
-- macOS uses the APFS clone ID from `getattrlist(ATTR_CMNEXT_CLONEID)`: all files
-  of one clone family share it, but APFS gives no per-byte granularity, so
-  `find --cow` reports 100% or 0% rather than a partial ratio.
+- macOS maps uncompressed files with `fcntl(F_LOG2PHYS_EXT)` through libSystem,
+  giving real per-extent device offsets (partial ratios included). decmpfs
+  compressed files answer `ENOTSUP`, so they fall back to the APFS clone ID from
+  `getattrlist(ATTR_CMNEXT_CLONEID)`, which is family-level (100% or 0%).
 - Windows `FSCTL_GET_RETRIEVAL_POINTERS` reports cluster runs; the probe checks
   whether clones actually share them and whether NTFS-vs-ReFS behaves as
   expected.

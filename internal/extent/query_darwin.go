@@ -4,8 +4,10 @@ package extent
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"syscall"
 	"unsafe"
 
@@ -16,7 +18,32 @@ import (
 func Supported() bool { return true }
 
 // Identity describes what Extent.Physical carries on this platform.
-func Identity() string { return "APFS clone id" }
+func Identity() string {
+	return "physical offset (F_LOG2PHYS_EXT), APFS clone id for compressed files"
+}
+
+// errCloneIDFallback marks files whose extents the kernel refuses to report
+// (decmpfs-compressed files return ENOTSUP), for which the APFS clone ID is
+// used instead.
+var errCloneIDFallback = errors.New("F_LOG2PHYS_EXT not supported for this file")
+
+// struct log2phys from <sys/fcntl.h> is declared under #pragma pack(4):
+//
+//	#pragma pack(4)
+//	struct log2phys {
+//	    unsigned int l2p_flags;        /* offset 0  */
+//	    off_t        l2p_contigbytes;  /* offset 4  */
+//	    off_t        l2p_devoffset;    /* offset 12 */
+//	};                                 /* sizeof 20 */
+//
+// The 4-byte packing must be reproduced explicitly: a Go struct with natural
+// alignment would place the fields at 8 and 16 and read the kernel's output
+// from the wrong bytes.
+const (
+	l2pSize      = 20
+	l2pContigOff = 4
+	l2pDevOff    = 12
+)
 
 // getattrlist(2) constants, verified against sys/attr.h.
 const (
@@ -29,17 +56,104 @@ const (
 	fsoptAttrCmnExtended = 0x00000020
 )
 
-// query returns one synthetic extent whose Physical field carries the APFS
-// clone ID.
+// query returns the physical extents of path.
 //
-// Every file of one clone family (an original and the copies made by
-// clonefile(2)) reports the same clone ID, while independent files report
-// different ones. Using the clone ID as the physical identity lets the generic
-// sharing comparisons (Equal, SharedWithOthers) work unchanged.
+// The primary source is fcntl(F_LOG2PHYS_EXT), called through the libSystem
+// wrapper (unix.FcntlInt, no raw syscall), which maps a logical offset to a
+// device byte offset plus the length of the contiguous run. That gives the same
+// per-extent physical identity as Linux FIEMAP, so clone detection and partial
+// sharing work exactly as on the other platforms.
 //
-// APFS only exposes family-level sharing this way, not per-extent byte ranges,
-// so a file is either fully shared with its family or not at all.
+// APFS returns ENOTSUP for decmpfs-compressed files (the whole file lives in a
+// compressed container), so those fall back to the APFS clone ID from
+// getattrlist(2), which is family-level: 100% or 0% shared, never partial.
 func query(path string) ([]Extent, error) {
+	extents, err := extentsFcntl(path)
+	if err == nil {
+		return extents, nil
+	}
+	if !errors.Is(err, errCloneIDFallback) {
+		return nil, err
+	}
+	return cloneIDExtents(path)
+}
+
+// extentsFcntl enumerates extents with fcntl(F_LOG2PHYS_EXT), skipping whole
+// contiguous runs. errCloneIDFallback is returned when the filesystem does not
+// implement the query for this file.
+func extentsFcntl(path string) ([]Extent, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := info.Size()
+	if size <= 0 {
+		return nil, nil
+	}
+
+	blksize := int64(4096)
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Blksize > 0 {
+		blksize = int64(st.Blksize)
+	}
+
+	var extents []Extent
+	offset := int64(0)
+
+	for offset < size {
+		var rec [l2pSize]byte
+		binary.LittleEndian.PutUint64(rec[l2pContigOff:l2pDevOff], uint64(size-offset))
+		binary.LittleEndian.PutUint64(rec[l2pDevOff:l2pSize], uint64(offset))
+
+		_, err := unix.FcntlInt(f.Fd(), unix.F_LOG2PHYS_EXT, int(uintptr(unsafe.Pointer(&rec[0]))))
+		runtime.KeepAlive(&rec)
+
+		if err != nil {
+			var errno syscall.Errno
+			if errors.As(err, &errno) {
+				switch errno {
+				case unix.ENOTSUP, unix.EOPNOTSUPP, unix.EINVAL, unix.ENOTTY, unix.ENOSYS:
+					return nil, errCloneIDFallback
+				case unix.ERANGE:
+					// Past the end of the mapped range.
+					return extents, nil
+				}
+			}
+			return nil, err
+		}
+
+		contig := int64(binary.LittleEndian.Uint64(rec[l2pContigOff:l2pDevOff]))
+		devOffset := int64(binary.LittleEndian.Uint64(rec[l2pDevOff:l2pSize]))
+
+		// A non-positive device offset is a hole or an unmapped range; the
+		// length still advances the walk.
+		if devOffset > 0 && contig > 0 {
+			extents = append(extents, Extent{
+				Logical:  uint64(offset),
+				Physical: uint64(devOffset),
+				Length:   uint64(contig),
+			})
+		}
+
+		if contig <= 0 {
+			contig = blksize
+		}
+		offset += contig
+	}
+
+	return extents, nil
+}
+
+// cloneIDExtents returns one synthetic extent whose Physical field carries the
+// APFS clone ID. Every file of one clone family (an original and the copies made
+// by clonefile(2)) reports the same clone ID, while independent files report
+// different ones, so the generic Equal/SharedWithOthers comparisons still work.
+func cloneIDExtents(path string) ([]Extent, error) {
 	clone, err := cloneID(path)
 	if err != nil {
 		return nil, err

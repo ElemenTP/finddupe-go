@@ -16,10 +16,10 @@ var ErrUnsupported = errors.New("extent query not supported on this filesystem")
 // Query returns the extent information for path as this platform can report it.
 //
 // On Linux this is FIEMAP, on Windows FSCTL_GET_RETRIEVAL_POINTERS, and on
-// macOS a single synthetic extent carrying the APFS clone ID (see
-// Extent.Physical). A non-empty file for which the platform reports no extents
-// is treated as unsupported rather than as "shares nothing", so callers can
-// distinguish "0% shared" from "cannot tell".
+// macOS fcntl(F_LOG2PHYS_EXT) (with the APFS clone ID as the fallback for
+// decmpfs-compressed files; see Extent.Physical). A non-empty file for which the
+// platform reports no extents is treated as unsupported rather than as "shares
+// nothing", so callers can distinguish "0% shared" from "cannot tell".
 func Query(path string) ([]Extent, error) {
 	extents, err := query(path)
 	if err != nil {
@@ -39,10 +39,10 @@ type Extent struct {
 	// Logical is the byte offset of the run within the file.
 	Logical uint64
 
-	// Physical is the platform's sharing identity for this run. On Linux and
-	// Windows it is the device-relative physical offset in bytes; on macOS it
-	// is the APFS clone ID (so files of one clone family share a value). It is
-	// only meaningful when Encoded is false.
+	// Physical is the platform's sharing identity for this run: the
+	// device-relative physical offset in bytes on Linux, Windows and macOS
+	// (F_LOG2PHYS_EXT), or the APFS clone ID on macOS for decmpfs-compressed
+	// files, where files of one clone family share a value.
 	Physical uint64
 
 	// Length is the run length in bytes.

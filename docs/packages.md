@@ -43,7 +43,7 @@ finddupe-go/
 │   ├── extent/                # Physical extent query for CoW detection
 │   │   ├── extent.go          # Extent, SharedBytes, Equal, SharedFlagBytes, SharedWithOthers
 │   │   ├── query_linux.go     # Linux: FS_IOC_FIEMAP
-│   │   ├── query_darwin.go    # macOS: getattrlist ATTR_CMNEXT_CLONEID (APFS clone ID)
+│   │   ├── query_darwin.go    # macOS: F_LOG2PHYS_EXT (libSystem), clone ID fallback
 │   │   ├── query_windows.go   # Windows: FSCTL_GET_RETRIEVAL_POINTERS
 │   │   └── query_other.go     # Other platforms: Supported()==false
 │   ├── worker/                # Worker pool
@@ -229,7 +229,7 @@ func SharedWithOthers(own []Extent, others [][]Extent) int64
 func Supported() bool
 ```
 
-**Platform implementations**: Linux FIEMAP (`FS_IOC_FIEMAP`), macOS `getattrlist` with `ATTR_CMNEXT_CLONEID` (the `Physical` field then carries the APFS clone ID), Windows `FSCTL_GET_RETRIEVAL_POINTERS`; other platforms return `ErrUnsupported`.
+**Platform implementations**: Linux FIEMAP (`FS_IOC_FIEMAP`), macOS `fcntl(F_LOG2PHYS_EXT)` through the libSystem wrapper (`unix.FcntlInt`) with a `getattrlist(ATTR_CMNEXT_CLONEID)` fallback for decmpfs-compressed files, Windows `FSCTL_GET_RETRIEVAL_POINTERS`; other platforms return `ErrUnsupported`.
 
 **Helpers**: `SharedBytes` is the pairwise physical-overlap helper (falling back to shared logical ranges for compressed btrfs). `Equal` is the conservative already-sharing fast path for `dedupe --cow`. `SharedFlagBytes` sums extents the filesystem marked `Shared` (a per-file signal). `SharedWithOthers` sums in-group physical-start matches, capped to the shorter extent, for filesystems without a shared flag.
 

@@ -140,50 +140,72 @@ report extents.
 
 `query_linux.go` issues the `FS_IOC_FIEMAP` ioctl (`0xC020660B`) in batches, with `FIEMAP_FLAG_SYNC` so freshly written files are written back before mapping (otherwise dirty files report zero-length extents). Extents flagged `FIEMAP_EXTENT_ENCODED` or `FIEMAP_EXTENT_UNKNOWN` are marked `Encoded` and excluded from physical comparison; the `FIEMAP_EXTENT_SHARED` flag sets `Shared`.
 
-### macOS — `getattrlist` APFS clone ID
+### macOS — `fcntl(F_LOG2PHYS_EXT)` via libSystem
 
-`query_darwin.go` does **not** use physical extents. It calls
-`getattrlist(path, ...)` with `ATTR_CMNEXT_CLONEID` (bit `0x100`, declared in
-the macOS SDK `sys/attr.h`) and turns the result into one synthetic `Extent`
-whose `Physical` field carries the **APFS clone ID**. All files of one clone
-family — an original and the copies made by `clonefile(2)` — report the same
-clone ID, while independently written files report different ones, so the
-generic `Equal`/`SharedWithOthers` comparisons work unchanged. `Identity()`
-returns `"APFS clone id"` on this platform.
+`query_darwin.go` enumerates extents with `fcntl(fd, F_LOG2PHYS_EXT, &l2p)`,
+called through the **libSystem wrapper** (`unix.FcntlInt`, no raw syscall, no
+cgo): `l2p_devoffset` is the input logical offset and the output device byte
+offset, `l2p_contigbytes` is the input query length and the output length of the
+contiguous run. The loop advances by that run length, which turns APFS into a
+Linux-FIEMAP equivalent: a 1 MiB file typically resolves in one or two calls.
 
-APFS only exposes family-level sharing this way, not per-extent byte ranges, so
-`find --cow` reports each APFS file as either 100% shared (same clone ID as
-another group member) or 0% shared. The earlier attempt to use the undocumented
-`fcntl(F_LOG2PHYS_EXT)` returned success with zero-length mappings on macOS
-Darwin 27 ARM64, i.e. no usable data, which is why it was replaced.
+The struct must be reproduced byte-exactly. `<sys/fcntl.h>` declares it under
+`#pragma pack(4)`, so `l2p_contigbytes` is at offset **4** and `l2p_devoffset` at
+offset **12** (`sizeof = 20`):
 
-`getattrlist` failures (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`, `ENOTTY`, a missing
-clone-ID attribute, or a zero ID) become `ErrUnsupported`, so a non-APFS volume
+```c
+#pragma pack(4)
+struct log2phys {
+	unsigned int l2p_flags;        /* offset 0  */
+	off_t        l2p_contigbytes;  /* offset 4  */
+	off_t        l2p_devoffset;    /* offset 12 */
+};
+```
+
+A Go struct with natural alignment puts the fields at 8 and 16 and then reads the
+kernel's output from the wrong bytes — that alignment bug (contigbytes read as
+garbage or 0, so the walk stopped immediately) is what made an earlier attempt
+conclude, wrongly, that `F_LOG2PHYS_EXT` was unusable on macOS.
+
+APFS returns `ENOTSUP` for decmpfs-compressed files: the whole file lives in a
+compressed container and the kernel refuses to map it. Those files fall back to
+`getattrlist(path, ...)` with `ATTR_CMNEXT_CLONEID` (bit `0x100`), turned into one
+synthetic `Extent` whose `Physical` field carries the **APFS clone ID**: all files
+of one clone family report the same value, independent files report different
+ones. That is family-level only (100% or 0% shared, never partial), which the
+docs and `Identity()` state explicitly:
+
+```
+physical offset (F_LOG2PHYS_EXT), APFS clone id for compressed files
+```
+
+Failures (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`, `ENOTTY`, a missing clone-ID
+attribute, or a zero ID) become `ErrUnsupported`, so a volume that can do neither
 reports "extent information unavailable" rather than a misleading 0%.
 
 Verified on a Darwin 27.0.0 / macOS 27 ARM64 APFS data volume:
 
-- independently written copies get distinct clone IDs (e.g. inode/clone ID
-  `52136416` vs `52136417`) and `find --cow` reports 0%;
-- after `dedupe --cow`, the victim carries the original's clone ID, `find --cow`
+- an uncompressed 1 MiB file resolves to two extents (a 4 KiB run plus a
+  1044480-byte run); a `cp -c` clone returns the *same* device offsets and run
+  lengths, an independently written copy returns different ones;
+- `find --cow` therefore reports real percentages for uncompressed files, and a
+  clone whose first 256 KiB were rewritten with identical bytes (a COW split) is
+  reported as partially shared rather than 100%;
+- after `dedupe --cow` the victim maps to the original's extents, `find --cow`
   reports 100%, and a second `dedupe --cow` is a no-op (`Dupes: 0`);
-- a `cp -c` clone reports the same clone ID as its original, and
-  `dedupe --cow` leaves it alone;
-- `afsctool -c`-compressed files behave the same way (the clone ID is returned
-  for compressed files too), `clonefile(2)` preserves compression, and a cloned
-  file is byte-identical to its source.
+- `afsctool -c`-compressed files (and `cp -c` clones of them) return `ENOTSUP`
+  from `F_LOG2PHYS_EXT`, take the clone-ID fallback, and still report 100%/0%;
+  `clonefile(2)` preserves compression and the clone is byte-identical;
+- APFS native compression is exposed through the `SF_COMPRESSED` flag
+  (`ls -lO` prints `compressed`), not as a readable `com.apple.decmpfs` xattr.
 
-Note that APFS native compression is exposed through the `SF_COMPRESSED` flag
-(`ls -lO` prints `compressed`), not as a readable `com.apple.decmpfs` xattr.
-
-`getattrlist` is invoked through the raw syscall trap because
+`getattrlist` itself is still invoked through the raw syscall trap because
 `golang.org/x/sys/unix` (through v0.48.0) exports no libSystem wrapper for it —
-it provides `Setattrlist` and the deprecated `SYS_*` numbers only — and cgo
-would break the `CGO_ENABLED=0` release and cross-compiled bundles. The call is
-isolated in one function and every failure path returns `ErrUnsupported`, so a
-future macOS that removes the trap degrades to "cannot tell" instead of
-reporting wrong sharing. If x/sys adds `Getattrlist`, that single call site can
-switch to it.
+it provides `Setattrlist` and the deprecated `SYS_*` numbers only — and cgo would
+break the `CGO_ENABLED=0` release and cross-compiled bundles. It is now only the
+compressed-file fallback, is isolated in one function, and degrades to
+`ErrUnsupported` on any failure. If x/sys adds `Getattrlist`, that single call
+site can switch to it.
 
 ### Windows — `FSCTL_GET_RETRIEVAL_POINTERS`
 
@@ -225,8 +247,9 @@ For the group ratios there are two signals:
 2. `extent.SharedWithOthers(own, others)` sums the bytes of `own` whose physical
    identity also appears in another member's list, capped to the shorter extent.
    It is used where no shared flag exists, and only between members on the same
-   device. On macOS the identity is the APFS clone ID, so a clone-family member
-   reports 100% and an independent copy 0%.
+   device. On macOS it is the device offset from `F_LOG2PHYS_EXT` for
+   uncompressed files (partial ratios included) and the APFS clone ID for
+   decmpfs-compressed files (family-level: 100% or 0%).
 
 `extent.SharedBytes(a, b)` (pairwise overlap) is kept as a library helper:
 
@@ -248,7 +271,7 @@ shared.
 
 ### Validating Extent APIs on Real Machines
 
-Linux is exercised by the automated test suite. macOS (`getattrlist` clone ID)
+Linux is exercised by the automated test suite. macOS (`F_LOG2PHYS_EXT`)
 and Windows (`FSCTL_GET_RETRIEVAL_POINTERS`) need a real APFS/ReFS machine, so two
 diagnostic tools exist:
 
@@ -296,7 +319,7 @@ Reparse points (junctions, symlinks, mount points) are not followed by default. 
 |---------|------------|-----------------|------------|--------------|--------------|
 | Hardlinks | ✓ | ✓ | ✓ | ✓ (≤1023) | ✓ |
 | CoW clone (write) | ✗ | ✓ (FICLONE) | ✓ (clonefile) | ✗ | ✓ (FSCTL_DUPLICATE_EXTENTS_TO_FILE) |
-| Extent query (`--cow`) | ✓ (FIEMAP) | ✓ (FIEMAP) | ✓ (`getattrlist` clone ID) | ✓ (FSCTL_GET_RETRIEVAL_POINTERS) | ✓ (FSCTL_GET_RETRIEVAL_POINTERS) |
+| Extent query (`--cow`) | ✓ (FIEMAP) | ✓ (FIEMAP) | ✓ (F_LOG2PHYS_EXT; clone ID for compressed files) | ✓ (FSCTL_GET_RETRIEVAL_POINTERS) | ✓ (FSCTL_GET_RETRIEVAL_POINTERS) |
 | Inode via stat | ✓ | ✓ | ✓ | ✗ | ✗ |
 | Inode via handle | — | — | — | ✓ | ✓ |
 | Long paths | N/A | N/A | N/A | ✓ (\\?\\) | ✓ (\\?\\) |

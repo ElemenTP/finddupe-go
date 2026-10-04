@@ -259,6 +259,28 @@ show "$FD" find --cow --no-progress "$CMP"
 section "dedupe --cow: compressible second run (expect no clone)"
 show "$FD" dedupe --cow --no-progress "$CMP"
 
+# ---------------------------------------------------------------------------
+# 4b. Partially shared clone (identical content, only part of the extents shared)
+# ---------------------------------------------------------------------------
+PART="$DIR/partial"
+rm -rf "$PART"
+mkdir -p "$PART"
+random_file "$PART/a.bin" 1048576
+clone_one "$PART/a.bin" "$PART/b.bin" 2>/dev/null || independent_copy "$PART/a.bin" "$PART/b.bin"
+# Rewrite the first 256 KiB of the clone with the very same bytes: the content
+# stays identical, but the filesystem has to stop sharing that range.
+dd if="$PART/a.bin" of="$PART/b.bin" bs=4096 count=64 conv=notrunc 2>/dev/null
+
+section "find --cow: partially shared clone (expect a partial ratio, e.g. 75%)"
+echo "(the per-file FIEMAP Shared flag may still report the untouched file as 100%)"
+show "$FD" find --cow --no-progress "$PART"
+
+section "dedupe --cow: partially shared clone (expect the extents to be unified)"
+show "$FD" dedupe --cow --no-progress "$PART"
+
+section "find --cow: partial after dedupe (expect 100% again)"
+show "$FD" find --cow --no-progress "$PART"
+
 section "compressed content check (cloned file must equal the source)"
 if command -v cmp >/dev/null 2>&1; then
 	if cmp -s "$CMP/src.bin" "$CMP/compClone.bin"; then
