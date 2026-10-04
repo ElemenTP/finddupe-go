@@ -161,9 +161,32 @@ Darwin 27 ARM64, i.e. no usable data, which is why it was replaced.
 clone-ID attribute, or a zero ID) become `ErrUnsupported`, so a non-APFS volume
 reports "extent information unavailable" rather than a misleading 0%.
 
+Verified on a Darwin 27.0.0 / macOS 27 ARM64 APFS data volume:
+
+- independently written copies get distinct clone IDs (e.g. inode/clone ID
+  `52136416` vs `52136417`) and `find --cow` reports 0%;
+- after `dedupe --cow`, the victim carries the original's clone ID, `find --cow`
+  reports 100%, and a second `dedupe --cow` is a no-op (`Dupes: 0`);
+- a `cp -c` clone reports the same clone ID as its original, and
+  `dedupe --cow` leaves it alone;
+- `afsctool -c`-compressed files behave the same way (the clone ID is returned
+  for compressed files too), `clonefile(2)` preserves compression, and a cloned
+  file is byte-identical to its source.
+
+Note that APFS native compression is exposed through the `SF_COMPRESSED` flag
+(`ls -lO` prints `compressed`), not as a readable `com.apple.decmpfs` xattr.
+
 ### Windows — `FSCTL_GET_RETRIEVAL_POINTERS`
 
-`query_windows.go` calls `DeviceIoControl(FSCTL_GET_RETRIEVAL_POINTERS)` with a `STARTING_VCN_INPUT_BUFFER`, growing the buffer on `ERROR_MORE_DATA`. The returned VCN→LCN pairs are converted to byte offsets using the volume cluster size from `GetDiskFreeSpaceW` (cached). ReFS block clones make two files reference the same LCNs, so overlapping mappings reveal shared extents.
+`query_windows.go` calls `DeviceIoControl(FSCTL_GET_RETRIEVAL_POINTERS)` with a `STARTING_VCN_INPUT_BUFFER`, growing the buffer on `ERROR_MORE_DATA`. The returned VCN→LCN pairs are converted to byte offsets using the volume cluster size from `GetDiskFreeSpaceW` (cached), and `Logical` is the VCN-derived byte offset. ReFS block clones make two files reference the same LCNs, so overlapping mappings reveal shared extents.
+
+Verified on a ReFS 3.14 Dev Drive (Windows 11, 4 KiB cluster): independent copies
+map to different LCNs and report 0%; after `dedupe --cow` both files map to the
+same runs (`28074434560+4096`, `28053598208+1044480`), `find --cow` reports 100%,
+and a second `dedupe --cow` is a no-op. An existing hardlink is left untouched
+and appears in `find --listlink`. ReFS has no NTFS-style transparent compression,
+and files smaller than one cluster are reported as unsupported rather than
+silently copied.
 
 ### Other Platforms
 

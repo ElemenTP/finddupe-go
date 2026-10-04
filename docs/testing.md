@@ -203,6 +203,10 @@ machine, so two committed tools support hand-run validation:
   `finddupe` + `extentdump` for linux-amd64, darwin-amd64/arm64, and
   windows-amd64/arm64 into `bin/cow-test/<platform>/`, together with the probe
   script and README. `bin/` is gitignored, so bundles are build output.
+- The probes have been run on real hardware: an Apple Silicon MacBook (macOS 27
+  / APFS, with and without `afsctool` compression) and a Windows 11 desktop with
+  a ReFS 3.14 Dev Drive. Both reported 0% before cloning, 100% after, a no-op
+  second `dedupe --cow`, and untouched hardlinks.
 - `testscripts/cow-probe.sh` (macOS/Linux bash) and
   `testscripts/cow-probe-windows.ps1` (Windows PowerShell) exercise independent
   copies, `dedupe --cow` then a second run, a pre-existing clone, an existing

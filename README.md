@@ -209,13 +209,14 @@ machine. `testtools/extentdump` prints exactly what finddupe sees per file, and
 - File permissions are preserved when creating hard links and CoW clones
 - **CoW clone** (`dedupe --cow`): Linux uses `FICLONE` on btrfs/XFS; macOS uses `clonefile(2)` on APFS
 - **CoW detection** (`find --cow`): Linux uses FIEMAP; macOS uses `getattrlist` with `ATTR_CMNEXT_CLONEID`, i.e. the APFS clone ID (family-level: a file is reported 100% or 0% shared)
+- Verified on macOS 27 / APFS, including `afsctool`-compressed files: `dedupe --cow` preserves compression and a re-run is a no-op
 - On unsupported filesystems the CoW clone is refused and the victim is left untouched (`ErrCoWNotSupported`)
 - `dedupe --cow` never touches a pair that is already the same physical file, so an existing hardlink is preserved
 
 ### Windows
 - Hard links require NTFS
 - **CoW clone** (`dedupe --cow`) requires ReFS (including Dev Drive) via `FSCTL_DUPLICATE_EXTENTS_TO_FILE`; NTFS is not supported
-- **CoW detection** (`find --cow`) uses `FSCTL_GET_RETRIEVAL_POINTERS`
+- **CoW detection** (`find --cow`) uses `FSCTL_GET_RETRIEVAL_POINTERS`; verified on a ReFS 3.14 Dev Drive, including idempotent re-runs and untouched hardlinks
 - Administrator privileges may be needed for some operations
 - Long paths (260+ characters) are fully supported
 

@@ -210,9 +210,11 @@ compress_file() {
 	return 1
 }
 
-# is_compressed PATH - true when the decmpfs marker is present.
+# is_compressed PATH - true when the filesystem reports the file as compressed.
+# APFS native compression is exposed through the SF_COMPRESSED flag (`ls -lO`
+# prints "compressed"), not as a readable com.apple.decmpfs xattr.
 is_compressed() {
-	xattr -p com.apple.decmpfs "$1" >/dev/null 2>&1
+	ls -lO "$1" 2>/dev/null | grep -q compressed
 }
 
 independent_copy "$CMP/src.bin" "$CMP/compA.bin"
@@ -225,9 +227,9 @@ if [ "$OS" = "Darwin" ]; then
 	echo "--- compression: compA=[$HOW_A] compB=[$HOW_B] ---"
 	COMPRESSION="${HOW_A:-none}"
 	if is_compressed "$CMP/compA.bin"; then
-		echo "compA.bin has com.apple.decmpfs: yes"
+		echo "compA.bin is compressed: yes"
 	else
-		echo "compA.bin has com.apple.decmpfs: no"
+		echo "compA.bin is compressed: no"
 	fi
 	if command -v afsctool >/dev/null 2>&1; then
 		echo "--- afsctool -v ---"
