@@ -270,4 +270,25 @@ func TestSharedWithOthers(t *testing.T) {
 	if got := extent.SharedWithOthers(own, [][]extent.Extent{short}); got != 40 {
 		t.Fatalf("SharedWithOthers(short) = %d, want 40", got)
 	}
+
+	// A shared run that starts mid-way through own's run is still counted: this
+	// is the APFS partial-clone shape, where the untouched tail becomes its own
+	// extent starting inside the original's run.
+	big := []extent.Extent{{Logical: 0, Physical: 1000, Length: 1044480}}
+	tail := []extent.Extent{{Logical: 262144, Physical: 1000 + 258048, Length: 786432}}
+	if got := extent.SharedWithOthers(big, [][]extent.Extent{tail}); got != 786432 {
+		t.Fatalf("SharedWithOthers(mid-run tail) = %d, want 786432", got)
+	}
+
+	// A byte shared with several others is counted once.
+	if got := extent.SharedWithOthers(own, [][]extent.Extent{other, other}); got != 100 {
+		t.Fatalf("SharedWithOthers(duplicated others) = %d, want 100", got)
+	}
+
+	// Encoded (compressed) extents have no comparable physical range, so they
+	// fall back to an exact physical start match.
+	encoded := []extent.Extent{{Logical: 0, Physical: 4096, Length: 100, Encoded: true}}
+	if got := extent.SharedWithOthers(encoded, [][]extent.Extent{encoded}); got != 100 {
+		t.Fatalf("SharedWithOthers(encoded) = %d, want 100", got)
+	}
 }

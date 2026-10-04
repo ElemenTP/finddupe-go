@@ -115,18 +115,39 @@ func SharedFlagBytes(e []Extent) int64 {
 	return n
 }
 
-// SharedWithOthers returns the number of bytes of own whose physical start is
-// also present in one of the other extent lists. Extents without a known
-// physical address are ignored, and a match is capped to the shorter extent so
-// a longer own extent is not over-counted.
+// SharedWithOthers returns the number of bytes of own that are physically
+// shared with at least one of the other extent lists.
 //
-// It is meant for in-group diagnostics on filesystems that do not expose a
-// "shared" flag: identity is the physical start, as reported by the platform.
+// Identity is the physical range: allocated extents of different files never
+// overlap unless the blocks really are shared, so intersecting ranges counts a
+// shared run even when the filesystem splits it at different boundaries in each
+// file (for example an APFS clone whose first blocks were rewritten, where the
+// untouched tail becomes its own run starting mid-way through the original's
+// run). A byte shared with several others is counted once.
+//
+// Encoded (compressed) extents have no comparable physical range and fall back
+// to matching physical starts, which stays valid for aligned runs.
 func SharedWithOthers(own []Extent, others [][]Extent) int64 {
 	if len(own) == 0 || len(others) == 0 {
 		return 0
 	}
 
+	var all []Extent
+	for _, list := range others {
+		all = append(all, list...)
+	}
+	union := mergeIntervals(collectRanges(all, physicalRange))
+
+	if shared := overlapSum(collectRanges(own, physicalRange), union); shared > 0 {
+		return shared
+	}
+	return sharedStartBytes(own, others)
+}
+
+// sharedStartBytes returns the bytes of own whose physical start is also present
+// in one of the other lists, capped to the shorter extent. It is the fallback
+// for encoded extents, where only aligned starts are comparable.
+func sharedStartBytes(own []Extent, others [][]Extent) int64 {
 	shortest := make(map[uint64]uint64, len(own))
 	for _, list := range others {
 		for _, e := range list {
@@ -183,28 +204,47 @@ func sharedLogicalRange(e Extent) (interval, bool) {
 
 // rangeOverlap sums the overlap of the ranges both sides map through key.
 func rangeOverlap(a, b []Extent, key rangeKey) int64 {
-	ia := collectRanges(a, key)
-	ib := collectRanges(b, key)
-	if len(ia) == 0 || len(ib) == 0 {
-		return 0
-	}
+	return overlapSum(collectRanges(a, key), collectRanges(b, key))
+}
 
+// overlapSum sums the overlap of two start-sorted interval lists.
+func overlapSum(a, b []interval) int64 {
 	var shared int64
 	i, j := 0, 0
-	for i < len(ia) && j < len(ib) {
-		lo := max(ia[i].start, ib[j].start)
-		hi := min(ia[i].end, ib[j].end)
+	for i < len(a) && j < len(b) {
+		lo := max(a[i].start, b[j].start)
+		hi := min(a[i].end, b[j].end)
 		if lo < hi {
 			shared += int64(hi - lo) //nolint:gosec // extent lengths are bounded by the file size
 		}
 
-		if ia[i].end <= ib[j].end {
+		if a[i].end <= b[j].end {
 			i++
 		} else {
 			j++
 		}
 	}
 	return shared
+}
+
+// mergeIntervals returns the union of start-sorted half-open ranges, merging
+// overlapping and adjacent ones.
+func mergeIntervals(ranges []interval) []interval {
+	if len(ranges) == 0 {
+		return nil
+	}
+	out := ranges[:1]
+	for _, r := range ranges[1:] {
+		last := &out[len(out)-1]
+		if r.start <= last.end {
+			if r.end > last.end {
+				last.end = r.end
+			}
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // collectRanges extracts and sorts the intervals an extent list maps through key.

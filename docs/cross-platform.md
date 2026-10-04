@@ -244,8 +244,13 @@ For the group ratios there are two signals:
    `Shared` (Linux `FIEMAP_EXTENT_SHARED`). It is a per-file signal: it says the
    extent is shared with *someone*, not with whom. It is used for the whole group
    as soon as any member's extents carry the flag.
-2. `extent.SharedWithOthers(own, others)` sums the bytes of `own` whose physical
-   identity also appears in another member's list, capped to the shorter extent.
+2. `extent.SharedWithOthers(own, others)` intersects `own`'s physical ranges
+   with the union of the other members' ranges. Allocated extents of different
+   files never overlap unless the blocks are shared, so this counts a shared run
+   even when the filesystem splits it at different boundaries in each file (an
+   APFS clone whose first blocks were rewritten keeps sharing its untouched tail,
+   reported as an extent starting mid-way through the original's run).
+   Encoded (compressed) extents fall back to an exact physical-start match.
    It is used where no shared flag exists, and only between members on the same
    device. On macOS it is the device offset from `F_LOG2PHYS_EXT` for
    uncompressed files (partial ratios included) and the APFS clone ID for

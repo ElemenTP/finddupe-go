@@ -279,10 +279,11 @@ func SharedWithOthers(own []Extent, others [][]Extent) int64 // in-group physica
 ```
 
 - On macOS, `Physical` is the device byte offset from `fcntl(F_LOG2PHYS_EXT)`; for decmpfs-compressed files, where the kernel returns `ENOTSUP`, it is the APFS clone ID instead (family-level identity).
+- `SharedWithOthers` intersects physical ranges (a byte shared with several group members counts once); encoded extents fall back to an exact physical-start match.
 - `SharedBytes` is the original pairwise helper: it sums the overlap of non-encoded physical ranges and, when that yields nothing, falls back to the logical ranges of extents marked `Shared` (compressed btrfs).
 - `Equal` is a conservative "already sharing" fast path for `dedupe --cow`: true only when both lists are non-empty, have the same length in the same logical order, every pair has equal `Logical`/`Physical`/`Length`, and no `Physical` is 0. `Encoded` extents are compared too: exact start+length identity stays sound under compression (only range arithmetic is not). Anything else returns false, which merely means the clone is attempted.
 - `SharedFlagBytes` sums the lengths of extents the filesystem marked `Shared` (Linux `FIEMAP_EXTENT_SHARED`). It is a per-file signal: it says the extent is shared with someone, not with whom.
-- `SharedWithOthers` sums the bytes of `own` whose `Physical` start also appears in another list, capped to the shorter extent; it is used for in-group ratios on filesystems without a shared flag.
+- `SharedWithOthers` is used for in-group ratios on filesystems without a shared flag; it intersects `own`'s physical ranges with the union of the other members' ranges, so a shared run split at different boundaries per file is still counted once.
 
 ## Constants
 
