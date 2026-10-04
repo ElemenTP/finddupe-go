@@ -178,30 +178,96 @@ section "find --listlink: hardlink group"
 show "$FD" find --listlink --no-progress "$HL"
 
 # ---------------------------------------------------------------------------
-# 4. Compressible content (tests transparent compression, if enabled)
+# 4. Compressed content (APFS decmpfs, via afsctool when available)
 # ---------------------------------------------------------------------------
 CMP="$DIR/compressible"
 rm -rf "$CMP"
 mkdir -p "$CMP"
 yes "finddupe compressible probe line" 2>/dev/null | head -c 2097152 >"$CMP/src.bin" || true
 
-if [ "$OS" = "Darwin" ] && command -v ditto >/dev/null 2>&1; then
-	ditto --hfsCompression "$CMP/src.bin" "$CMP/compA.bin" 2>/dev/null || independent_copy "$CMP/src.bin" "$CMP/compA.bin"
-	ditto --hfsCompression "$CMP/src.bin" "$CMP/compB.bin" 2>/dev/null || independent_copy "$CMP/src.bin" "$CMP/compB.bin"
-	clone_one "$CMP/compA.bin" "$CMP/compClone.bin" 2>/dev/null || independent_copy "$CMP/compA.bin" "$CMP/compClone.bin"
+# compress_file PATH - apply filesystem compression; echoes how it was done.
+compress_file() {
+	if [ "$OS" != "Darwin" ]; then
+		return 1
+	fi
+	if command -v afsctool >/dev/null 2>&1; then
+		if afsctool -c "$1" >/dev/null 2>&1; then
+			echo "afsctool -c"
+			return 0
+		fi
+		if afsctool -c -T zlib "$1" >/dev/null 2>&1; then
+			echo "afsctool -c -T zlib"
+			return 0
+		fi
+	fi
+	if command -v ditto >/dev/null 2>&1; then
+		if ditto --hfsCompression "$1" "$1.compressed" >/dev/null 2>&1; then
+			mv "$1.compressed" "$1"
+			echo "ditto --hfsCompression"
+			return 0
+		fi
+	fi
+	return 1
+}
+
+# is_compressed PATH - true when the decmpfs marker is present.
+is_compressed() {
+	xattr -p com.apple.decmpfs "$1" >/dev/null 2>&1
+}
+
+independent_copy "$CMP/src.bin" "$CMP/compA.bin"
+independent_copy "$CMP/src.bin" "$CMP/compB.bin"
+
+COMPRESSION="none"
+if [ "$OS" = "Darwin" ]; then
+	HOW_A="$(compress_file "$CMP/compA.bin" || true)"
+	HOW_B="$(compress_file "$CMP/compB.bin" || true)"
+	echo "--- compression: compA=[$HOW_A] compB=[$HOW_B] ---"
+	COMPRESSION="${HOW_A:-none}"
+	if is_compressed "$CMP/compA.bin"; then
+		echo "compA.bin has com.apple.decmpfs: yes"
+	else
+		echo "compA.bin has com.apple.decmpfs: no"
+	fi
+	if command -v afsctool >/dev/null 2>&1; then
+		echo "--- afsctool -v ---"
+		afsctool -v "$CMP" 2>&1 | head -12
+	fi
 	echo "--- ls -lO (look for 'compressed') ---"
 	ls -lO "$CMP" 2>&1
 else
-	independent_copy "$CMP/src.bin" "$CMP/compA.bin"
-	independent_copy "$CMP/src.bin" "$CMP/compB.bin"
-	clone_one "$CMP/compA.bin" "$CMP/compClone.bin" 2>/dev/null || independent_copy "$CMP/compA.bin" "$CMP/compClone.bin"
+	echo "--- non-macOS: no transparent compression involved ---"
 fi
 
-section "extentdump: compressible files (independent + clone)"
-"$ED" "$CMP/compA.bin" "$CMP/compB.bin" "$CMP/compClone.bin"
+clone_one "$CMP/compA.bin" "$CMP/compClone.bin" 2>/dev/null || independent_copy "$CMP/compA.bin" "$CMP/compClone.bin"
 
-section "find --cow: compressible independent copies (expect 0% shared)"
+section "extentdump: compressed files (independent + clone)"
+"$ED" "$CMP/compA.bin" "$CMP/compB.bin" "$CMP/compClone.bin" 2>&1
+
+section "find --cow: compressed files (only the cp -c clone should be shared)"
 show "$FD" find --cow --no-progress "$CMP"
+
+section "dedupe --cow: compressible files (clones the independent copies)"
+show "$FD" dedupe --cow --no-progress "$CMP"
+
+section "find --cow: compressible after dedupe (expect all in the clone family)"
+show "$FD" find --cow --no-progress "$CMP"
+
+section "dedupe --cow: compressible second run (expect no clone)"
+show "$FD" dedupe --cow --no-progress "$CMP"
+
+section "compressed content check (cloned file must equal the source)"
+if command -v cmp >/dev/null 2>&1; then
+	if cmp -s "$CMP/src.bin" "$CMP/compClone.bin"; then
+		echo "cmp src.bin compClone.bin: identical"
+	else
+		echo "cmp src.bin compClone.bin: DIFFERENT"
+	fi
+fi
+if [ "$OS" = "Darwin" ] && command -v afsctool >/dev/null 2>&1; then
+	echo "--- afsctool -v after cloning ---"
+	afsctool -v "$CMP" 2>&1 | head -12
+fi
 
 echo
 echo "================================================================"

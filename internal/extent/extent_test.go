@@ -216,9 +216,15 @@ func TestEqual(t *testing.T) {
 		t.Error("empty lists must not compare equal")
 	}
 
+	// Encoded (compressed) extents still have a usable identity: an exact
+	// start+length match is sound; only range arithmetic is not.
 	encoded := []extent.Extent{{Logical: 0, Physical: 4096, Length: 4096, Encoded: true}}
-	if extent.Equal(encoded, encoded) {
-		t.Error("encoded extents must not compare equal")
+	if !extent.Equal(encoded, encoded) {
+		t.Error("identical encoded extents must compare equal")
+	}
+	encodedShifted := []extent.Extent{{Logical: 0, Physical: 8192, Length: 4096, Encoded: true}}
+	if extent.Equal(encoded, encodedShifted) {
+		t.Error("encoded extents with different physical identities must not compare equal")
 	}
 
 	zero := []extent.Extent{{Logical: 0, Physical: 0, Length: 4096}}

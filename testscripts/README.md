@@ -40,8 +40,15 @@ The script exercises:
 1. independent copies, `dedupe --cow`, then `find --cow` before/after;
 2. a pre-existing `cp -c` clone;
 3. an existing hardlink (must never be replaced by a clone);
-4. compressible files created with `ditto --hfsCompression` when available,
-   including `ls -lO` to show the `compressed` flag.
+4. compressed files (APFS decmpfs) and their clones.
+
+APFS does not compress files automatically, so step 4 needs a compressor. If
+`afsctool` is installed (`brew install afsctool`) the script runs
+`afsctool -c` on two independently written copies, verifies the
+`com.apple.decmpfs` xattr, and prints `afsctool -v`. `ditto --hfsCompression`
+is used as a fallback, otherwise the files stay uncompressed. The section then
+clones one of them with `cp -c`, reports `find --cow`, runs `dedupe --cow`
+twice, and `cmp`s a cloned file against the source to prove content is intact.
 
 ## Windows (ReFS or Dev Drive)
 

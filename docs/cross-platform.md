@@ -176,10 +176,12 @@ computes, for every member, how many bytes are already shared (`FileShared`).
 
 `extent.Equal(a, b)` is the "already sharing, skip the work" fast path used by
 `dedupe --cow`: it is true only when both lists are non-empty, have the same
-length in the same logical order, and every extent has equal
-`Logical`/`Physical`/`Length` with none `Encoded` and no `Physical` equal to 0.
-It is deliberately conservative — anything uncertain compares unequal and the
-caller clones anyway, which is safe because content equality was already
+length in the same logical order, every extent has equal
+`Logical`/`Physical`/`Length`, and no `Physical` is 0. `Encoded` (compressed)
+extents are compared as well, because an exact start+length match remains a
+sound identity signal under compression — only the range-overlap arithmetic is
+unreliable there. It stays conservative: anything uncertain compares unequal and
+the caller clones anyway, which is safe because content equality was already
 established.
 
 For the group ratios there are two signals:

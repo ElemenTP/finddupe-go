@@ -279,7 +279,7 @@ func SharedWithOthers(own []Extent, others [][]Extent) int64 // in-group physica
 ```
 
 - `SharedBytes` is the original pairwise helper: it sums the overlap of non-encoded physical ranges and, when that yields nothing, falls back to the logical ranges of extents marked `Shared` (compressed btrfs).
-- `Equal` is a conservative "already sharing" fast path for `dedupe --cow`: true only when both lists are non-empty, have the same length in the same logical order, and every pair has equal `Logical`/`Physical`/`Length` with none `Encoded` and no `Physical` equal to 0. Anything else returns false, which merely means the clone is attempted.
+- `Equal` is a conservative "already sharing" fast path for `dedupe --cow`: true only when both lists are non-empty, have the same length in the same logical order, every pair has equal `Logical`/`Physical`/`Length`, and no `Physical` is 0. `Encoded` extents are compared too: exact start+length identity stays sound under compression (only range arithmetic is not). Anything else returns false, which merely means the clone is attempted.
 - `SharedFlagBytes` sums the lengths of extents the filesystem marked `Shared` (Linux `FIEMAP_EXTENT_SHARED`). It is a per-file signal: it says the extent is shared with someone, not with whom.
 - `SharedWithOthers` sums the bytes of `own` whose `Physical` start also appears in another list, capped to the shorter extent; it is used for in-group ratios on filesystems without a shared flag.
 

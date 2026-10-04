@@ -42,7 +42,8 @@ func (e *Executor) cloneFile(ex dupe.Execution) (Result, error) {
 
 // alreadyShared reports whether the keeper and victim already share all of
 // their storage. It is deliberately conservative: any uncertainty returns false
-// so the caller performs the clone.
+// so the caller performs the clone. Encoded (compressed) extents participate,
+// because exact start+length identity is still meaningful for them.
 func alreadyShared(keeper, victim dupe.FileInfo) bool {
 	if samePhysicalFile(keeper, victim) {
 		return true

@@ -73,14 +73,16 @@ func SharedBytes(a, b []Extent) int64 {
 	return rangeOverlap(a, b, sharedLogicalRange)
 }
 
-// Equal reports whether two extent lists describe the same physical storage
-// layout: same count in the same logical order, with equal logical offset,
-// physical start, and length.
+// Equal reports whether two extent lists describe the same storage layout:
+// same count in the same logical order, with equal logical offset, physical
+// identity, and length.
 //
 // It is deliberately conservative: it returns false for empty lists and for any
-// list containing an encoded (compressed/inline) extent or an unknown (zero)
-// physical address, where physical identity cannot be trusted. Callers use this
-// only as a "already sharing, skip the work" fast path; returning false merely
+// unknown (zero) physical identity. Encoded (compressed/inline) extents are
+// compared too: an exact match of start+length is a sound identity signal even
+// when the extent is compressed — only the range-overlap arithmetic in
+// SharedBytes is unreliable for those, which is why Encoded exists. Callers use
+// this as an "already sharing, skip the work" fast path; returning false merely
 // means the work is attempted.
 func Equal(a, b []Extent) bool {
 	if len(a) == 0 || len(b) == 0 || len(a) != len(b) {
@@ -88,9 +90,6 @@ func Equal(a, b []Extent) bool {
 	}
 
 	for i := range a {
-		if a[i].Encoded || b[i].Encoded {
-			return false
-		}
 		if a[i].Physical == 0 || b[i].Physical == 0 {
 			return false
 		}
