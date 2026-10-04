@@ -97,7 +97,7 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestPool_WaitBlocks` | `Wait()` blocks until completion |
 | `TestPool_ZeroSize` | Size 0 → defaults to `runtime.NumCPU()` |
 
-### `internal/extent` (6 tests)
+### `internal/extent` (7 tests)
 
 | Test | Description |
 |------|-------------|
@@ -107,8 +107,9 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestEqual` | Equal layouts compare true; length/order/physical differences, empty lists, encoded extents, and zero physical addresses compare false |
 | `TestSharedFlagBytes` | Only extents flagged `Shared` contribute their lengths |
 | `TestSharedWithOthers` | Physical-start identity within a group, capped to the shorter extent; nil others → 0 |
+| `TestQuery_APFSCloneID` (darwin only) | A `cp -c` clone shares the APFS clone ID with its original; an independently written copy does not |
 
-The `Query` tests skip themselves with `t.Skipf` when the filesystem cannot report extents, so they run meaningfully on Linux (FIEMAP/`FICLONE`), macOS (APFS), and Windows (ReFS).
+The `Query` tests skip themselves with `t.Skipf` when the filesystem cannot report extents, so they run meaningfully on Linux (FIEMAP/`FICLONE`), macOS (APFS clone IDs), and Windows (ReFS).
 
 ### Filesystem-dependent tests
 
@@ -190,7 +191,7 @@ No paths error, nonexistent path, no subcommand error, zero threads, many thread
 ## Manual Platform Probes (macOS / Windows)
 
 The automated suite covers Linux FIEMAP and `FICLONE` when the workspace volume
-supports them. macOS (`F_LOG2PHYS_EXT`) and Windows
+supports them. macOS (`getattrlist` clone ID) and Windows
 (`FSCTL_GET_RETRIEVAL_POINTERS`, ReFS block clones) need a real APFS/ReFS
 machine, so two committed tools support hand-run validation:
 

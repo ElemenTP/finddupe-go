@@ -11,6 +11,9 @@ import (
 // Supported reports whether extent querying is implemented on this platform.
 func Supported() bool { return true }
 
+// Identity describes what Extent.Physical carries on this platform.
+func Identity() string { return "physical offset (FIEMAP)" }
+
 const (
 	// fsIOCFiemap is FS_IOC_FIEMAP (linux/fs.h).
 	fsIOCFiemap = 0xC020660B
@@ -52,8 +55,8 @@ type fiemapExtent struct {
 	Reserved   [3]uint32
 }
 
-// Query returns the physical extents of path using the FIEMAP ioctl.
-func Query(path string) ([]Extent, error) {
+// query returns the physical extents of path using the FIEMAP ioctl.
+func query(path string) ([]Extent, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err

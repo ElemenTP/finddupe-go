@@ -1,6 +1,6 @@
 // Command extentdump prints the physical extent information finddupe uses, as
 // the current platform reports it. It exists to validate the platform extent
-// APIs on real machines (macOS F_LOG2PHYS_EXT, Windows
+// APIs on real machines (macOS getattrlist clone IDs, Windows
 // FSCTL_GET_RETRIEVAL_POINTERS, Linux FIEMAP) and to diagnose why `find --cow`
 // does or does not report sharing.
 //
@@ -29,7 +29,7 @@ func main() {
 		os.Exit(exitUsage)
 	}
 
-	fmt.Printf("extentdump: extent query supported=%v\n", extent.Supported())
+	fmt.Printf("extentdump: supported=%v identity=%s\n", extent.Supported(), extent.Identity())
 
 	for _, path := range os.Args[1:] {
 		dump(path)

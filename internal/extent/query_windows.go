@@ -15,6 +15,9 @@ import (
 // Supported reports whether extent querying is implemented on this platform.
 func Supported() bool { return true }
 
+// Identity describes what Extent.Physical carries on this platform.
+func Identity() string { return "physical LCN (FSCTL_GET_RETRIEVAL_POINTERS)" }
+
 const (
 	retrievalPointersHeaderSize = 16
 	retrievalPointerPairSize    = 16
@@ -32,11 +35,11 @@ var (
 	procGetDiskFreeSpaceW = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetDiskFreeSpaceW")
 )
 
-// Query returns the physical extents of path using FSCTL_GET_RETRIEVAL_POINTERS,
+// query returns the physical extents of path using FSCTL_GET_RETRIEVAL_POINTERS,
 // which reports the VCN→LCN mapping on both NTFS and ReFS. ReFS block clones
 // make two files reference the same LCNs, so comparing the mappings reveals
 // extent sharing.
-func Query(path string) ([]Extent, error) {
+func query(path string) ([]Extent, error) {
 	abs, absErr := filepath.Abs(path)
 	if absErr != nil {
 		abs = path
@@ -102,6 +105,7 @@ func Query(path string) ([]Extent, error) {
 
 			if lcn >= 0 && lengthClusters > 0 {
 				out = append(out, Extent{
+					Logical:  uint64(prevVcn) * cluster,
 					Physical: uint64(lcn) * cluster,
 					Length:   uint64(lengthClusters) * cluster,
 				})

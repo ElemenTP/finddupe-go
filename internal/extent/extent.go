@@ -1,10 +1,11 @@
-// Package extent queries the physical extents backing files so that
-// Copy-on-Write clones (which share physical extents) can be distinguished from
+// Package extent queries the physical extent information backing files so that
+// Copy-on-Write clones (which share storage) can be distinguished from
 // independent copies.
 package extent
 
 import (
 	"errors"
+	"os"
 	"sort"
 )
 
@@ -12,19 +13,44 @@ import (
 // filesystem or platform.
 var ErrUnsupported = errors.New("extent query not supported on this filesystem")
 
+// Query returns the extent information for path as this platform can report it.
+//
+// On Linux this is FIEMAP, on Windows FSCTL_GET_RETRIEVAL_POINTERS, and on
+// macOS a single synthetic extent carrying the APFS clone ID (see
+// Extent.Physical). A non-empty file for which the platform reports no extents
+// is treated as unsupported rather than as "shares nothing", so callers can
+// distinguish "0% shared" from "cannot tell".
+func Query(path string) ([]Extent, error) {
+	extents, err := query(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(extents) == 0 {
+		if info, statErr := os.Stat(path); statErr == nil && info.Size() > 0 {
+			return nil, ErrUnsupported
+		}
+	}
+	return extents, nil
+}
+
 // Extent is one run of a file's data.
 type Extent struct {
 	// Logical is the byte offset of the run within the file.
 	Logical uint64
 
-	// Physical is the device-relative physical offset in bytes. It is only
-	// meaningful when Encoded is false.
+	// Physical is the platform's sharing identity for this run. On Linux and
+	// Windows it is the device-relative physical offset in bytes; on macOS it
+	// is the APFS clone ID (so files of one clone family share a value). It is
+	// only meaningful when Encoded is false.
 	Physical uint64
 
-	// Length is the logical run length in bytes.
+	// Length is the run length in bytes.
 	Length uint64
 
-	// Shared is the filesystem's "shared with another file" hint, when known.
+	// Shared is the filesystem's "shared with another file" hint, when known
+	// (Linux FIEMAP_EXTENT_SHARED). macOS reports family sharing through
+	// Physical instead.
 	Shared bool
 
 	// Encoded marks extents whose on-disk representation is not a plain block

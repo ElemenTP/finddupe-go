@@ -3,7 +3,10 @@
 package extent
 
 import (
+	"encoding/binary"
+	"fmt"
 	"os"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -12,67 +15,101 @@ import (
 // Supported reports whether extent querying is implemented on this platform.
 func Supported() bool { return true }
 
-// fLog2PhysExt is the F_LOG2PHYS_EXT fcntl command (Darwin, fcntl.h).
-// It is undocumented but maps a logical offset to a physical device offset and
-// is what APFS uses to expose extent sharing.
-const fLog2PhysExt = 65
+// Identity describes what Extent.Physical carries on this platform.
+func Identity() string { return "APFS clone id" }
 
-// log2phys mirrors struct log2phys (sys/fcntl.h): the caller sets DevOffset to
-// the logical offset and ContigBytes to the remaining length; on return
-// DevOffset holds the physical offset and ContigBytes the contiguous length.
-type log2phys struct {
-	Flags       uint32
-	_           uint32
-	ContigBytes int64
-	DevOffset   int64
+// getattrlist(2) constants, verified against sys/attr.h.
+const (
+	attrBitMapCount      = 5
+	attrCmnReturnedAttrs = 0x80000000
+	attrCmnextCloneID    = 0x00000100
+
+	fsoptNoFollow        = 0x00000001
+	fsoptPackInvalAttrs  = 0x00000008
+	fsoptAttrCmnExtended = 0x00000020
+)
+
+// query returns one synthetic extent whose Physical field carries the APFS
+// clone ID.
+//
+// Every file of one clone family (an original and the copies made by
+// clonefile(2)) reports the same clone ID, while independent files report
+// different ones. Using the clone ID as the physical identity lets the generic
+// sharing comparisons (Equal, SharedWithOthers) work unchanged.
+//
+// APFS only exposes family-level sharing this way, not per-extent byte ranges,
+// so a file is either fully shared with its family or not at all.
+func query(path string) ([]Extent, error) {
+	clone, err := cloneID(path)
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() <= 0 {
+		return nil, nil
+	}
+
+	return []Extent{{
+		Logical:  0,
+		Physical: clone, // APFS clone family identity, not a device offset
+		Length:   uint64(info.Size()),
+	}}, nil
 }
 
-// Query returns the physical extents of path using fcntl(F_LOG2PHYS_EXT).
-// On filesystems that do not expose extents (or sealed volumes) it returns
-// ErrUnsupported.
-func Query(path string) ([]Extent, error) {
-	f, err := os.Open(path)
+// cloneID returns the APFS clone ID of path using getattrlist(2).
+// ErrUnsupported is returned when the filesystem does not provide one.
+func cloneID(path string) (uint64, error) {
+	cpath, err := unix.BytePtrFromString(path)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	defer f.Close()
 
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
+	attrs := unix.Attrlist{
+		Bitmapcount: attrBitMapCount,
+		Commonattr:  attrCmnReturnedAttrs,
+		Forkattr:    attrCmnextCloneID,
 	}
-	size := info.Size()
+	options := uintptr(fsoptNoFollow | fsoptPackInvalAttrs | fsoptAttrCmnExtended)
 
-	var out []Extent
-	var off int64
-
-	for off < size {
-		l2p := log2phys{DevOffset: off, ContigBytes: size - off}
-
-		_, _, errno := unix.Syscall(
-			unix.SYS_FCNTL,
-			f.Fd(),
-			fLog2PhysExt,
-			uintptr(unsafe.Pointer(&l2p)),
-		)
-		if errno != 0 {
-			if errno == unix.EINVAL || errno == unix.ENOTTY ||
-				errno == unix.ENOTSUP || errno == unix.EOPNOTSUPP {
-				return nil, ErrUnsupported
-			}
-			return nil, errno
+	var out [64]byte
+	_, _, errno := syscall.Syscall6(
+		unix.SYS_GETATTRLIST,
+		uintptr(unsafe.Pointer(cpath)),
+		uintptr(unsafe.Pointer(&attrs)),
+		uintptr(unsafe.Pointer(&out[0])),
+		uintptr(len(out)),
+		options,
+		0,
+	)
+	if errno != 0 {
+		if errno == unix.EINVAL || errno == unix.ENOTSUP ||
+			errno == unix.EOPNOTSUPP || errno == unix.ENOTTY {
+			return 0, ErrUnsupported
 		}
-
-		if l2p.DevOffset < 0 || l2p.ContigBytes <= 0 {
-			break
-		}
-
-		out = append(out, Extent{
-			Physical: uint64(l2p.DevOffset),
-			Length:   uint64(l2p.ContigBytes),
-		})
-		off += l2p.ContigBytes
+		return 0, errno
 	}
 
-	return out, nil
+	// Layout with FSOPT_PACK_INVAL_ATTRS:
+	//   u32 total length @0
+	//   attribute_set_t returned @4 (forkattr @20)
+	//   u64 clone id @24
+	totalLen := binary.LittleEndian.Uint32(out[0:4])
+	if totalLen < 32 {
+		return 0, fmt.Errorf("%w: getattrlist returned %d bytes", ErrUnsupported, totalLen)
+	}
+
+	forkattr := binary.LittleEndian.Uint32(out[20:24])
+	if forkattr&attrCmnextCloneID == 0 {
+		return 0, fmt.Errorf("%w: no clone id in returned attributes (%#x)", ErrUnsupported, forkattr)
+	}
+
+	id := binary.LittleEndian.Uint64(out[24:32])
+	if id == 0 {
+		return 0, fmt.Errorf("%w: clone id is zero", ErrUnsupported)
+	}
+	return id, nil
 }

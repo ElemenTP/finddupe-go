@@ -16,7 +16,7 @@ internal/
 │   └── walker_windows.go  // //go:build windows  → getFileIdentity
 ├── extent/
 │   ├── query_linux.go     // //go:build linux    → FIEMAP
-│   ├── query_darwin.go    // //go:build darwin   → F_LOG2PHYS_EXT
+│   ├── query_darwin.go    // //go:build darwin   → getattrlist ATTR_CMNEXT_CLONEID
 │   ├── query_windows.go   // //go:build windows  → FSCTL_GET_RETRIEVAL_POINTERS
 │   └── query_other.go     // //go:build !linux && !darwin && !windows
 └── action/
@@ -140,9 +140,26 @@ report extents.
 
 `query_linux.go` issues the `FS_IOC_FIEMAP` ioctl (`0xC020660B`) in batches, with `FIEMAP_FLAG_SYNC` so freshly written files are written back before mapping (otherwise dirty files report zero-length extents). Extents flagged `FIEMAP_EXTENT_ENCODED` or `FIEMAP_EXTENT_UNKNOWN` are marked `Encoded` and excluded from physical comparison; the `FIEMAP_EXTENT_SHARED` flag sets `Shared`.
 
-### macOS — `F_LOG2PHYS_EXT` (experimental / undocumented API)
+### macOS — `getattrlist` APFS clone ID
 
-`query_darwin.go` walks the file with the `F_LOG2PHYS_EXT` fcntl (command `65`). This interface is **undocumented** by Apple and is not part of a stable public API; it is what APFS uses to expose extent sharing, but its behavior and availability may change across OS releases. It maps a logical offset to a device offset via `struct log2phys` and returns `ErrUnsupported` for `EINVAL`, `ENOTTY`, `ENOTSUP`, or `EOPNOTSUPP`.
+`query_darwin.go` does **not** use physical extents. It calls
+`getattrlist(path, ...)` with `ATTR_CMNEXT_CLONEID` (bit `0x100`, declared in
+the macOS SDK `sys/attr.h`) and turns the result into one synthetic `Extent`
+whose `Physical` field carries the **APFS clone ID**. All files of one clone
+family — an original and the copies made by `clonefile(2)` — report the same
+clone ID, while independently written files report different ones, so the
+generic `Equal`/`SharedWithOthers` comparisons work unchanged. `Identity()`
+returns `"APFS clone id"` on this platform.
+
+APFS only exposes family-level sharing this way, not per-extent byte ranges, so
+`find --cow` reports each APFS file as either 100% shared (same clone ID as
+another group member) or 0% shared. The earlier attempt to use the undocumented
+`fcntl(F_LOG2PHYS_EXT)` returned success with zero-length mappings on macOS
+Darwin 27 ARM64, i.e. no usable data, which is why it was replaced.
+
+`getattrlist` failures (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`, `ENOTTY`, a missing
+clone-ID attribute, or a zero ID) become `ErrUnsupported`, so a non-APFS volume
+reports "extent information unavailable" rather than a misleading 0%.
 
 ### Windows — `FSCTL_GET_RETRIEVAL_POINTERS`
 
@@ -172,9 +189,10 @@ For the group ratios there are two signals:
    extent is shared with *someone*, not with whom. It is used for the whole group
    as soon as any member's extents carry the flag.
 2. `extent.SharedWithOthers(own, others)` sums the bytes of `own` whose physical
-   start also appears in another member's list, capped to the shorter extent. It
-   is used where no shared flag exists, and only between members on the same
-   device.
+   identity also appears in another member's list, capped to the shorter extent.
+   It is used where no shared flag exists, and only between members on the same
+   device. On macOS the identity is the APFS clone ID, so a clone-family member
+   reports 100% and an independent copy 0%.
 
 `extent.SharedBytes(a, b)` (pairwise overlap) is kept as a library helper:
 
@@ -187,16 +205,17 @@ On btrfs with compression, extents are reported as `Encoded`: their physical off
 
 ### Same-Device Rule
 
-Physical offsets are only comparable within one device. `extent.SharedWithOthers`
-is therefore only given the members whose non-zero `Dev` matches the file being
-measured; a member on a different volume contributes nothing. The
-`FIEMAP_EXTENT_SHARED` flag path does not need this check, because the kernel
-already knows whether the extent is shared.
+Physical identities are only comparable within one device (an APFS clone ID is
+per-volume as well). `extent.SharedWithOthers` is therefore only given the
+members whose non-zero `Dev` matches the file being measured; a member on a
+different volume contributes nothing. The `FIEMAP_EXTENT_SHARED` flag path does
+not need this check, because the kernel already knows whether the extent is
+shared.
 
 ### Validating Extent APIs on Real Machines
 
-Linux is exercised by the automated test suite. macOS (`F_LOG2PHYS_EXT`) and
-Windows (`FSCTL_GET_RETRIEVAL_POINTERS`) need a real APFS/ReFS machine, so two
+Linux is exercised by the automated test suite. macOS (`getattrlist` clone ID)
+and Windows (`FSCTL_GET_RETRIEVAL_POINTERS`) need a real APFS/ReFS machine, so two
 diagnostic tools exist:
 
 - `testtools/extentdump` is a small CLI (`extentdump <file>...`) that prints, per
@@ -243,7 +262,7 @@ Reparse points (junctions, symlinks, mount points) are not followed by default. 
 |---------|------------|-----------------|------------|--------------|--------------|
 | Hardlinks | ✓ | ✓ | ✓ | ✓ (≤1023) | ✓ |
 | CoW clone (write) | ✗ | ✓ (FICLONE) | ✓ (clonefile) | ✗ | ✓ (FSCTL_DUPLICATE_EXTENTS_TO_FILE) |
-| Extent query (`--cow`) | ✓ (FIEMAP) | ✓ (FIEMAP) | ✓ (F_LOG2PHYS_EXT, undocumented) | ✓ (FSCTL_GET_RETRIEVAL_POINTERS) | ✓ (FSCTL_GET_RETRIEVAL_POINTERS) |
+| Extent query (`--cow`) | ✓ (FIEMAP) | ✓ (FIEMAP) | ✓ (`getattrlist` clone ID) | ✓ (FSCTL_GET_RETRIEVAL_POINTERS) | ✓ (FSCTL_GET_RETRIEVAL_POINTERS) |
 | Inode via stat | ✓ | ✓ | ✓ | ✗ | ✗ |
 | Inode via handle | — | — | — | ✓ | ✓ |
 | Long paths | N/A | N/A | N/A | ✓ (\\?\\) | ✓ (\\?\\) |

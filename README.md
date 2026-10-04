@@ -208,7 +208,7 @@ machine. `testtools/extentdump` prints exactly what finddupe sees per file, and
 - Symbolic links are not followed by default (use `-j` to follow)
 - File permissions are preserved when creating hard links and CoW clones
 - **CoW clone** (`dedupe --cow`): Linux uses `FICLONE` on btrfs/XFS; macOS uses `clonefile(2)` on APFS
-- **CoW detection** (`find --cow`): Linux uses FIEMAP; macOS uses the undocumented `F_LOG2PHYS_EXT` fcntl (experimental, may change across OS releases)
+- **CoW detection** (`find --cow`): Linux uses FIEMAP; macOS uses `getattrlist` with `ATTR_CMNEXT_CLONEID`, i.e. the APFS clone ID (family-level: a file is reported 100% or 0% shared)
 - On unsupported filesystems the CoW clone is refused and the victim is left untouched (`ErrCoWNotSupported`)
 - `dedupe --cow` never touches a pair that is already the same physical file, so an existing hardlink is preserved
 
