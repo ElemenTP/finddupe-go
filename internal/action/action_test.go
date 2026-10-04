@@ -3,6 +3,7 @@ package action_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding"
 	"errors"
@@ -350,11 +351,86 @@ func TestDoExecution_DupeElim_ReadOnly(t *testing.T) {
 	}
 }
 
+// randomBytes returns size bytes of incompressible data so filesystem
+// compression cannot distort the physical extent layout.
+func randomBytes(t *testing.T, size int) []byte {
+	t.Helper()
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	return buf
+}
+
+// tryCoWClone reports whether a CoW clone succeeds inside dir.
+func tryCoWClone(t *testing.T, dir string) bool {
+	t.Helper()
+
+	data := randomBytes(t, 128*1024)
+	a := filepath.Join(dir, "probe-a.bin")
+	b := filepath.Join(dir, "probe-b.bin")
+	if err := os.WriteFile(a, data, 0o644); err != nil {
+		return false
+	}
+	if err := os.WriteFile(b, data, 0o644); err != nil {
+		return false
+	}
+
+	exec := action.New(action.Options{Action: config.ActionCoWClone})
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, a), fileInfo(t, b)},
+	})
+	return err == nil && out.Result == action.ResultCoWCloned
+}
+
+// repoTestDir creates a temp dir in the package working directory, which is
+// often on the developer's real btrfs/XFS/APFS volume when /tmp is tmpfs.
+func repoTestDir(t *testing.T) string {
+	t.Helper()
+	//nolint:usetesting // the default temp dir may be on a filesystem without CoW
+	dir, err := os.MkdirTemp(".", "cow-fs-test-")
+	if err != nil {
+		return ""
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// cloneCapableDir returns a temp directory where CoW cloning works, falling
+// back to the package working directory (often the developer's real
+// btrfs/XFS/APFS volume) when the default temp dir is tmpfs.
+func cloneCapableDir(t *testing.T) string {
+	t.Helper()
+
+	candidates := []string{t.TempDir()}
+	if dir := repoTestDir(t); dir != "" {
+		candidates = append(candidates, dir)
+	}
+
+	for _, dir := range candidates {
+		//nolint:usetesting // the probe must live on the chosen filesystem
+		probe, err := os.MkdirTemp(dir, "cowprobe-")
+		if err != nil {
+			continue
+		}
+		ok := tryCoWClone(t, probe)
+		_ = os.RemoveAll(probe)
+		if ok {
+			return dir
+		}
+	}
+
+	t.Skip("CoW cloning not supported by the default temp dir or the repository filesystem")
+	return ""
+}
+
 func TestDoExecution_CoWClone(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	data := bytes.Repeat([]byte("cow"), 8*1024)
+	dir := cloneCapableDir(t)
+	data := randomBytes(t, 128*1024)
 	keeper := writeFile(t, dir, "a.bin", data)
 	victim := writeFile(t, dir, "b.bin", data)
 

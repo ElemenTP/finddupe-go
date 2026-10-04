@@ -104,6 +104,24 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 
 The `Query` tests skip themselves with `t.Skipf` when the filesystem cannot report extents, so they run meaningfully on Linux (FIEMAP/`FICLONE`), macOS (APFS), and Windows (ReFS).
 
+### Filesystem-dependent tests
+
+The CoW and extent tests need a filesystem that supports reflinks / extent
+queries. `t.TempDir()` uses `$TMPDIR`, which on many Linux systems is `tmpfs` and
+therefore reports neither extents nor clones. So `TestQuery_*`,
+`TestDoExecution_CoWClone`, `TestDedupeCoW_CreateAndDetect` and
+`TestFind_CoW_IndependentCopiesNotGrouped` probe the default temp dir first and
+then fall back to a temporary directory inside the package working directory
+(normally the repository, which is often on the developer's real btrfs/XFS/APFS
+volume). They skip only when neither location supports the feature, so a plain
+`go test ./...` exercises CoW on a btrfs workspace even when `/tmp` is tmpfs.
+
+To force a specific filesystem explicitly:
+
+```bash
+TMPDIR=/path/on/btrfs go test ./... -count=1
+```
+
 ### `internal/pipeline` (3 tests)
 
 | Test | Description |

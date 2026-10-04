@@ -97,11 +97,53 @@ func queryOrSkip(t *testing.T, path string) []extent.Extent {
 	return extents
 }
 
+// repoTestDir creates a temp dir in the package working directory, which is
+// often on the developer's real btrfs/XFS/APFS volume when /tmp is tmpfs.
+func repoTestDir(t *testing.T) string {
+	t.Helper()
+	//nolint:usetesting // the default temp dir may be on a filesystem without CoW
+	dir, err := os.MkdirTemp(".", "extent-fs-test-")
+	if err != nil {
+		return ""
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// extentCapableDir returns a temporary directory whose filesystem supports
+// extent queries, skipping the test when none is available. It first tries the
+// default temp dir (t.TempDir(), i.e. $TMPDIR, often tmpfs) and then a directory
+// inside the package working directory, which is often on the developer's real
+// btrfs/XFS/APFS volume.
+func extentCapableDir(t *testing.T, probeData []byte) string {
+	t.Helper()
+
+	candidates := []string{t.TempDir()}
+	if dir := repoTestDir(t); dir != "" {
+		candidates = append(candidates, dir)
+	}
+
+	for _, dir := range candidates {
+		probe := filepath.Join(dir, "probe.bin")
+		if err := os.WriteFile(probe, probeData, 0o644); err != nil {
+			continue
+		}
+		_, err := extent.Query(probe)
+		_ = os.Remove(probe)
+		if err == nil {
+			return dir
+		}
+	}
+
+	t.Skip("extent queries unsupported by the default temp dir and the repository filesystem")
+	return ""
+}
+
 func TestQuery_HardlinksShareExtents(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
 	data := randomData(t, 64*1024)
+	dir := extentCapableDir(t, data)
 
 	orig := filepath.Join(dir, "a.bin")
 	if err := os.WriteFile(orig, data, 0o644); err != nil {
@@ -123,8 +165,8 @@ func TestQuery_HardlinksShareExtents(t *testing.T) {
 func TestQuery_IndependentCopiesShareNothing(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
 	data := randomData(t, 64*1024)
+	dir := extentCapableDir(t, data)
 
 	a := filepath.Join(dir, "a.bin")
 	b := filepath.Join(dir, "b.bin")

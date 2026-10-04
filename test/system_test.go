@@ -4,6 +4,7 @@ package test_test
 
 import (
 	"bytes"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
@@ -1154,14 +1155,105 @@ func TestFind_ListLink(t *testing.T) {
 }
 
 // =============================================================================
+// Filesystem-capability helpers for CoW / extent tests
+// =============================================================================
+
+// randomContent returns incompressible data so filesystem compression cannot
+// distort the physical extent layout.
+func randomContent(t *testing.T) string {
+	t.Helper()
+	buf := make([]byte, 128*1024)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	return string(buf)
+}
+
+// repoTestDir creates a temp dir in the package working directory, which is
+// often on the developer's real btrfs/XFS/APFS volume when /tmp is tmpfs.
+func repoTestDir(t *testing.T) string {
+	t.Helper()
+	//nolint:usetesting // the default temp dir may be on a filesystem without CoW
+	dir, err := os.MkdirTemp(".", "finddupe-fs-test-")
+	if err != nil {
+		return ""
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// fsTestDir returns a temporary directory whose filesystem passes probe, or
+// skips the test. It first tries the default temp dir (t.TempDir(), i.e.
+// $TMPDIR) and then a directory inside the package working directory, which is
+// often on the developer's real btrfs/XFS/APFS volume when /tmp is tmpfs.
+func fsTestDir(t *testing.T, probe func(dir string) bool) string {
+	t.Helper()
+
+	candidates := []string{t.TempDir()}
+	if dir := repoTestDir(t); dir != "" {
+		candidates = append(candidates, dir)
+	}
+
+	for _, dir := range candidates {
+		if probe(dir) {
+			return dir
+		}
+	}
+
+	t.Skip("feature is not supported by the default temp dir or the repository filesystem")
+	return ""
+}
+
+// extentsProbe reports whether find --cow detects a hardlink pair sharing
+// physical extents inside dir.
+func extentsProbe(t *testing.T, dir string) bool {
+	t.Helper()
+
+	//nolint:usetesting // the probe must live on the chosen filesystem
+	probe, err := os.MkdirTemp(dir, "extprobe-")
+	if err != nil {
+		return false
+	}
+	defer os.RemoveAll(probe)
+
+	content := randomContent(t) // incompressible so extents stay physical
+	a := makeFile(t, probe, "a.bin", content)
+	if linkErr := os.Link(a, filepath.Join(probe, "b.bin")); linkErr != nil {
+		return false
+	}
+
+	_, stderr, code := run(t, "find", "--cow", probe, "--no-progress")
+	return code == 0 && strings.Contains(stderr, "CoW group")
+}
+
+// cloneProbe reports whether dedupe --cow can create a clone inside dir.
+func cloneProbe(t *testing.T, dir string) bool {
+	t.Helper()
+
+	//nolint:usetesting // the probe must live on the chosen filesystem
+	probe, err := os.MkdirTemp(dir, "cowprobe-")
+	if err != nil {
+		return false
+	}
+	defer os.RemoveAll(probe)
+
+	content := randomContent(t) // incompressible so clone extents stay physical
+	makeFile(t, probe, "a.bin", content)
+	makeFile(t, probe, "b.bin", content)
+
+	_, stderr, code := run(t, "dedupe", "--cow", probe, "--no-progress")
+	return code == 0 && strings.Contains(stderr, "CoW cloned:")
+}
+
+// =============================================================================
 // CoW clone detection (find --cow)
 // =============================================================================
 
 func TestDedupeCoW_CreateAndDetect(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	content := strings.Repeat("cow-clone-content", 4000)
+	dir := fsTestDir(t, func(d string) bool { return cloneProbe(t, d) })
+	content := randomContent(t) // incompressible so extents stay physical
 	a := makeFile(t, dir, "a.bin", content)
 	b := makeFile(t, dir, "b.bin", content)
 
@@ -1205,8 +1297,8 @@ func TestDedupeCoW_CreateAndDetect(t *testing.T) {
 func TestFind_CoW_IndependentCopiesNotGrouped(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	content := strings.Repeat("independent-copy-content", 4000)
+	dir := fsTestDir(t, func(d string) bool { return extentsProbe(t, d) })
+	content := randomContent(t) // incompressible so extents stay physical
 	makeFile(t, dir, "a.bin", content)
 	makeFile(t, dir, "b.bin", content)
 
