@@ -33,3 +33,7 @@ go.work.sum
 
 finddupe-orig
 bin
+
+# local cross-compiled diagnostics
+darwinfiemap
+extentdump
