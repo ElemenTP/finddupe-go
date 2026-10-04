@@ -197,7 +197,12 @@ Verified on a Darwin 27.0.0 / macOS 27 ARM64 APFS data volume:
   reports 100%, and a second `dedupe --cow` is a no-op (`Dupes: 0`);
 - `afsctool -c`-compressed files (and `cp -c` clones of them) return `ENOTSUP`
   from `F_LOG2PHYS_EXT`, take the clone-ID fallback, and still report 100%/0%;
-  `clonefile(2)` preserves compression and the clone is byte-identical;
+  the clone is byte-identical;
+- `clonefile(2)` preserves *the source's* compression. `dedupe --cow` clones each
+  victim from the group keeper, so when the keeper is uncompressed (which file is
+  first depends on directory order) compressed members become uncompressed clones
+  of equal content. The dedupe result is correct either way, but the compression
+  saving is lost in that case;
 - APFS native compression is exposed through the `SF_COMPRESSED` flag
   (`ls -lO` prints `compressed`), not as a readable `com.apple.decmpfs` xattr.
 
