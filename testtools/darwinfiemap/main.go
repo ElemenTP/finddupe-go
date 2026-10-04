@@ -4,14 +4,15 @@
 // logical-to-physical extent mapping (a Linux-FIEMAP equivalent) and whether
 // that mapping can tell APFS clones from independent copies.
 //
-// It tries several fcntl(F_LOG2PHYS_EXT) / fcntl(F_LOG2PHYS) input conventions
-// through the libSystem wrapper (golang.org/x/sys/unix.FcntlInt, no raw
-// syscall), prints the raw per-step results, and compares files pairwise.
+// It calls fcntl(F_LOG2PHYS_EXT) / fcntl(F_LOG2PHYS) through the libSystem
+// wrapper (golang.org/x/sys/unix.FcntlInt, no raw syscall), prints the raw
+// per-step results, and compares files block by block.
 //
 // Usage: darwinfiemap <file> [file...]
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"runtime"
@@ -22,13 +23,36 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// log2phys mirrors struct log2phys from <sys/fcntl.h>.
+// log2physSize is sizeof(struct log2phys) from <sys/fcntl.h>:
+//
+//	#pragma pack(4)
+//	struct log2phys {
+//	    unsigned int l2p_flags;        /* offset 0  */
+//	    off_t        l2p_contigbytes;  /* offset 4  */
+//	    off_t        l2p_devoffset;    /* offset 12 */
+//	};                                 /* sizeof 20 */
+//
+// The 4-byte packing is essential: with Go's natural alignment the fields land
+// at 8 and 16, so the kernel's output would be read from the wrong bytes.
+const log2physSize = 20
+
+// log2phys is a byte-exact mirror of struct log2phys.
 type log2phys struct {
-	Flags       uint32
-	_           uint32
-	ContigBytes int64
-	DevOffset   int64
+	raw [log2physSize]byte
 }
+
+func newLog2phys(flags uint32, contig, devOffset int64) log2phys {
+	var l log2phys
+	binary.LittleEndian.PutUint32(l.raw[0:4], flags)
+	binary.LittleEndian.PutUint64(l.raw[4:12], uint64(contig))
+	binary.LittleEndian.PutUint64(l.raw[12:20], uint64(devOffset))
+	return l
+}
+
+func (l *log2phys) flags() uint32    { return binary.LittleEndian.Uint32(l.raw[0:4]) }
+func (l *log2phys) contig() int64    { return int64(binary.LittleEndian.Uint64(l.raw[4:12])) }
+func (l *log2phys) devOffset() int64 { return int64(binary.LittleEndian.Uint64(l.raw[12:20])) }
+func (l *log2phys) hex() string      { return fmt.Sprintf("% x", l.raw[:]) }
 
 // errRange is ERANGE, which F_LOG2PHYS[_EXT] returns past the end of a file.
 const errRange = unix.ERANGE
@@ -46,28 +70,24 @@ type variant struct {
 
 var variants = []variant{
 	{
-		name:  "A libc F_LOG2PHYS_EXT {devoffset=offset}   (clone_checker style)",
+		name:  "A libc F_LOG2PHYS_EXT {devoffset=offset, contig=0} (clone_checker style)",
 		cmd:   unix.F_LOG2PHYS_EXT,
-		input: func(offset, _ int64) log2phys { return log2phys{DevOffset: offset} },
+		input: func(offset, _ int64) log2phys { return newLog2phys(0, 0, offset) },
 	},
 	{
-		name: "B libc F_LOG2PHYS_EXT {devoffset=offset, contig=remaining}",
-		cmd:  unix.F_LOG2PHYS_EXT,
-		input: func(offset, remaining int64) log2phys {
-			return log2phys{DevOffset: offset, ContigBytes: remaining}
-		},
+		name:  "B libc F_LOG2PHYS_EXT {devoffset=offset, contig=remaining} (documented)",
+		cmd:   unix.F_LOG2PHYS_EXT,
+		input: func(offset, remaining int64) log2phys { return newLog2phys(0, remaining, offset) },
 	},
 	{
-		name: "C libc F_LOG2PHYS_EXT {devoffset=0, contig=remaining}",
-		cmd:  unix.F_LOG2PHYS_EXT,
-		input: func(_, remaining int64) log2phys {
-			return log2phys{ContigBytes: remaining}
-		},
+		name:  "C libc F_LOG2PHYS_EXT {devoffset=0, contig=remaining}",
+		cmd:   unix.F_LOG2PHYS_EXT,
+		input: func(_, remaining int64) log2phys { return newLog2phys(0, remaining, 0) },
 	},
 	{
 		name:  "D libc F_LOG2PHYS after lseek(offset)",
 		cmd:   unix.F_LOG2PHYS,
-		input: func(_, _ int64) log2phys { return log2phys{} },
+		input: func(_, _ int64) log2phys { return newLog2phys(0, 0, 0) },
 		seek:  true,
 	},
 }
@@ -80,6 +100,7 @@ type step struct {
 	flags     uint32
 	contig    int64
 	devOffset int64
+	raw       string
 }
 
 func main() {
@@ -141,13 +162,15 @@ func inspect(path string) {
 	}
 
 	for _, v := range variants {
-		steps := enumerate(f, size, int64(st.Blksize), v)
+		steps := enumerate(f, size, int64(st.Blksize), v, true)
 		printSteps(v.name, steps, size)
 	}
 }
 
-// enumerate runs one variant over the whole file.
-func enumerate(f *os.File, size, blksize int64, v variant) []step {
+// enumerate runs one variant over the whole file. When byContig is true the
+// loop skips whole contiguous runs, otherwise it walks every blksize block (used
+// for comparisons so both files report the same logical offsets).
+func enumerate(f *os.File, size, blksize int64, v variant, byContig bool) []step {
 	steps := make([]step, 0, 64)
 	offset := int64(0)
 
@@ -159,13 +182,12 @@ func enumerate(f *os.File, size, blksize int64, v variant) []step {
 		}
 
 		rec := v.input(offset, size-offset)
-		ret, err := unix.FcntlInt(f.Fd(), v.cmd, int(uintptr(unsafe.Pointer(&rec))))
+		ret, err := unix.FcntlInt(f.Fd(), v.cmd, int(uintptr(unsafe.Pointer(&rec.raw[0]))))
 		runtime.KeepAlive(&rec)
 
 		var errno syscall.Errno
 		if err != nil {
-			var e syscall.Errno
-			if ok := asErrno(err, &e); ok {
+			if e, ok := err.(syscall.Errno); ok {
 				errno = e
 			}
 		}
@@ -174,21 +196,19 @@ func enumerate(f *os.File, size, blksize int64, v variant) []step {
 			offset:    offset,
 			ret:       ret,
 			errno:     errno,
-			flags:     rec.Flags,
-			contig:    rec.ContigBytes,
-			devOffset: rec.DevOffset,
+			flags:     rec.flags(),
+			contig:    rec.contig(),
+			devOffset: rec.devOffset(),
+			raw:       rec.hex(),
 		})
 
-		if errno == errRange {
-			break
-		}
 		if err != nil {
 			break
 		}
 
-		advance := rec.ContigBytes
-		if advance <= 0 {
-			advance = blksize
+		advance := blksize
+		if byContig && rec.contig() > 0 {
+			advance = rec.contig()
 		}
 		if advance <= 0 {
 			advance = 4096
@@ -197,15 +217,6 @@ func enumerate(f *os.File, size, blksize int64, v variant) []step {
 	}
 
 	return steps
-}
-
-// asErrno unwraps a syscall.Errno from err.
-func asErrno(err error, out *syscall.Errno) bool {
-	if e, ok := err.(syscall.Errno); ok {
-		*out = e
-		return true
-	}
-	return false
 }
 
 // printSteps prints the first few and last few results plus a summary.
@@ -217,8 +228,8 @@ func printSteps(name string, steps []step, size int64) {
 	}
 
 	show := func(s step) {
-		fmt.Printf("     off=%-10d ret=%-3d errno=%-3d flags=%-4d contig=%-10d devoffset=%d\n",
-			s.offset, s.ret, s.errno, s.flags, s.contig, s.devOffset)
+		fmt.Printf("     off=%-10d ret=%-3d errno=%-3d flags=%-4d contig=%-10d devoffset=%-14d raw=[%s]\n",
+			s.offset, s.ret, s.errno, s.flags, s.contig, s.devOffset, s.raw)
 	}
 
 	head := steps
@@ -287,13 +298,13 @@ func compare(pathA, pathB string) {
 	}
 
 	v := variants[0]
-	stepsA := enumerate(fa, ia.Size(), blksize, v)
+	stepsA := enumerate(fa, ia.Size(), blksize, v, false)
 	if len(stepsA) == 0 {
-		// Variant A returned nothing; try the full-input convention.
+		// Variant A returned nothing; try the documented convention.
 		v = variants[1]
-		stepsA = enumerate(fa, ia.Size(), blksize, v)
+		stepsA = enumerate(fa, ia.Size(), blksize, v, false)
 	}
-	stepsB := enumerate(fb, ib.Size(), blksize, v)
+	stepsB := enumerate(fb, ib.Size(), blksize, v, false)
 
 	if len(stepsA) == 0 || len(stepsB) == 0 {
 		fmt.Printf("  no mapping returned (A=%d steps, B=%d steps)\n", len(stepsA), len(stepsB))
