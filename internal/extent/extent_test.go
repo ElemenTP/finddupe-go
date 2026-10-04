@@ -291,4 +291,16 @@ func TestSharedWithOthers(t *testing.T) {
 	if got := extent.SharedWithOthers(encoded, [][]extent.Extent{encoded}); got != 100 {
 		t.Fatalf("SharedWithOthers(encoded) = %d, want 100", got)
 	}
+
+	// Opaque keys (the APFS clone ID used for compressed files) are not device
+	// offsets: two independent families with adjacent IDs must not be treated as
+	// overlapping ranges, while an identical key still means shared.
+	opaqueA := []extent.Extent{{Logical: 0, Physical: 52139610, Length: 2097152, Opaque: true}}
+	opaqueB := []extent.Extent{{Logical: 0, Physical: 52139611, Length: 2097152, Opaque: true}}
+	if got := extent.SharedWithOthers(opaqueA, [][]extent.Extent{opaqueB}); got != 0 {
+		t.Fatalf("SharedWithOthers(adjacent opaque keys) = %d, want 0", got)
+	}
+	if got := extent.SharedWithOthers(opaqueA, [][]extent.Extent{opaqueA}); got != 2097152 {
+		t.Fatalf("SharedWithOthers(same opaque key) = %d, want 2097152", got)
+	}
 }

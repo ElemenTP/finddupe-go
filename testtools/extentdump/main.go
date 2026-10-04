@@ -64,8 +64,8 @@ func dump(path string) {
 	var logicalBytes int64
 	for i, e := range extents {
 		logicalBytes += int64(e.Length) //nolint:gosec // diagnostic output
-		fmt.Printf("  [%d] logical=%d physical=%d length=%d shared=%v encoded=%v\n",
-			i, e.Logical, e.Physical, e.Length, e.Shared, e.Encoded)
+		fmt.Printf("  [%d] logical=%d physical=%d length=%d shared=%v encoded=%v opaque=%v\n",
+			i, e.Logical, e.Physical, e.Length, e.Shared, e.Encoded, e.Opaque)
 	}
 	fmt.Printf("  total logical bytes=%d\n", logicalBytes)
 }

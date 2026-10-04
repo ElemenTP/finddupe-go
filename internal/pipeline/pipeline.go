@@ -682,13 +682,22 @@ func printSummary(stats *dupe.Stats) {
 	}
 }
 
-// formatSize renders a byte count in a compact human-readable form.
+// formatSize renders a byte count in a compact human-readable form. Exact
+// multiples stay whole ("768 kB"); anything else keeps one decimal ("1.9 MB") so
+// a value just below a unit boundary is not truncated to the smaller unit.
 func formatSize(bytes int64) string {
-	if bytes < bytesPerKB {
+	switch {
+	case bytes < bytesPerKB:
 		return fmt.Sprintf("%d B", bytes)
+	case bytes < bytesPerMB:
+		if bytes%bytesPerKB == 0 {
+			return fmt.Sprintf("%d kB", bytes/bytesPerKB)
+		}
+		return fmt.Sprintf("%.1f kB", float64(bytes)/float64(bytesPerKB))
+	default:
+		if bytes%bytesPerMB == 0 {
+			return fmt.Sprintf("%d MB", bytes/bytesPerMB)
+		}
+		return fmt.Sprintf("%.1f MB", float64(bytes)/float64(bytesPerMB))
 	}
-	if bytes < bytesPerMB {
-		return fmt.Sprintf("%d kB", bytes/bytesPerKB)
-	}
-	return fmt.Sprintf("%d MB", bytes/bytesPerMB)
 }

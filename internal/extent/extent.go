@@ -42,7 +42,7 @@ type Extent struct {
 	// Physical is the platform's sharing identity for this run: the
 	// device-relative physical offset in bytes on Linux, Windows and macOS
 	// (F_LOG2PHYS_EXT), or the APFS clone ID on macOS for decmpfs-compressed
-	// files, where files of one clone family share a value.
+	// files (marked Opaque), where files of one clone family share a value.
 	Physical uint64
 
 	// Length is the run length in bytes.
@@ -57,6 +57,12 @@ type Extent struct {
 	// range (for example compressed btrfs extents). Physical offsets and the
 	// logical length are not comparable for such extents.
 	Encoded bool
+
+	// Opaque marks Physical as an abstract sharing key rather than a device
+	// offset (the APFS clone ID used for decmpfs-compressed files on macOS).
+	// Only exact equality is meaningful for such extents: their ranges must
+	// never be intersected, because unrelated keys can be numerically close.
+	Opaque bool
 }
 
 // SharedBytes returns the number of bytes that a and b map to the same physical
@@ -185,9 +191,11 @@ type interval struct {
 // byte range it contributes.
 type rangeKey func(Extent) (interval, bool)
 
-// physicalRange selects plain, non-encoded extents by physical offset.
+// physicalRange selects plain, non-encoded, non-opaque extents by physical
+// offset. Opaque identities are excluded: only exact equality is meaningful for
+// them, so they are handled by sharedStartBytes instead.
 func physicalRange(e Extent) (interval, bool) {
-	if e.Encoded || e.Length == 0 {
+	if e.Encoded || e.Opaque || e.Length == 0 {
 		return interval{}, false
 	}
 	return interval{start: e.Physical, end: e.Physical + e.Length}, true

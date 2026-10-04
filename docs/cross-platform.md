@@ -170,10 +170,12 @@ conclude, wrongly, that `F_LOG2PHYS_EXT` was unusable on macOS.
 APFS returns `ENOTSUP` for decmpfs-compressed files: the whole file lives in a
 compressed container and the kernel refuses to map it. Those files fall back to
 `getattrlist(path, ...)` with `ATTR_CMNEXT_CLONEID` (bit `0x100`), turned into one
-synthetic `Extent` whose `Physical` field carries the **APFS clone ID**: all files
-of one clone family report the same value, independent files report different
-ones. That is family-level only (100% or 0% shared, never partial), which the
-docs and `Identity()` state explicitly:
+synthetic `Extent` whose `Physical` field carries the **APFS clone ID**, marked
+`Opaque`: all files of one clone family report the same value, independent files
+report different ones. Opaque extents are compared by exact key only and never
+range-intersected, because unrelated clone IDs are numerically adjacent. That is
+family-level only (100% or 0% shared, never partial), which the docs and
+`Identity()` state explicitly:
 
 ```
 physical offset (F_LOG2PHYS_EXT), APFS clone id for compressed files
@@ -250,7 +252,8 @@ For the group ratios there are two signals:
    even when the filesystem splits it at different boundaries in each file (an
    APFS clone whose first blocks were rewritten keeps sharing its untouched tail,
    reported as an extent starting mid-way through the original's run).
-   Encoded (compressed) extents fall back to an exact physical-start match.
+   Encoded (compressed) and Opaque (clone-ID) extents fall back to an exact
+   key match, because their identities are not byte ranges.
    It is used where no shared flag exists, and only between members on the same
    device. On macOS it is the device offset from `F_LOG2PHYS_EXT` for
    uncompressed files (partial ratios included) and the APFS clone ID for

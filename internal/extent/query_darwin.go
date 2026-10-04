@@ -171,6 +171,7 @@ func cloneIDExtents(path string) ([]Extent, error) {
 		Logical:  0,
 		Physical: clone, // APFS clone family identity, not a device offset
 		Length:   uint64(info.Size()),
+		Opaque:   true,
 	}}, nil
 }
 
