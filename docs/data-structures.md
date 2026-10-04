@@ -81,7 +81,7 @@ const (
     HashCalc   ExecutionType = iota // Compute the full SHA-256 of Files[0]
     HashComp                         // Compare Files[0] and Files[1] in chunks
     DupeElim                         // Eliminate Files[1:] keeping Files[0]
-    CoWDetect                        // Report whether identical files share extents
+    CoWDetect                        // Report per-file shared bytes for a content group
 )
 
 // Execution represents a concrete unit of work for the executor.
@@ -98,7 +98,7 @@ type Execution struct {
 - `HashCalc`: `Files[0]` is the file to hash fully; it may carry a partial `HashState`/`HashOffset` to resume from.
 - `HashComp`: `Files[0]` and `Files[1]` are the pair to compare.
 - `DupeElim`: `Files[0]` is the keeper (never modified) and `Files[1]` is the victim.
-- `CoWDetect`: `Files[0]` is the keeper/reference file, `Files[1]` is the candidate whose extents are compared against it.
+- `CoWDetect`: `Files` holds every member of one identical-content group (one path per `(Dev, Inode)`; hardlinked aliases collapse to a single representative), and the outcome's `FileShared` slice has one entry per member.
 
 ## `Stats` — Statistics Accumulator
 
@@ -116,8 +116,8 @@ type Stats struct {
     DeletedFiles    atomic.Int64 // Files deleted (dedupe --delete)
     HardlinkedFiles atomic.Int64 // Files replaced with hardlinks (dedupe --hardlink)
     CoWClonedFiles  atomic.Int64 // Files replaced with CoW clones (dedupe --cow)
-    CoWGroups       atomic.Int64 // CoW (shared-extent) groups found by find --cow
-    CoWSharedBytes  atomic.Int64 // Total physically shared bytes found by find --cow
+    CoWGroups       atomic.Int64 // CoW (identical-content) groups found by find --cow
+    CoWSharedBytes  atomic.Int64 // Per-file sum of already-shared bytes (each range once per file)
     SkippedROFiles  atomic.Int64 // Read-only files skipped
     SkippedRefFiles atomic.Int64 // Reference files skipped
 }
@@ -157,7 +157,7 @@ type Config struct {
     Threads         int    // 0 = runtime.NumCPU() * 2 workers
     Verbose         bool
     ListLink        bool   // find --listlink: list hardlink groups and exit
-    CoWDetect       bool   // find --cow: report duplicate files sharing extents
+    CoWDetect       bool   // find --cow: report identical-content groups with per-file shared ratios
     ShowProgress    bool   // default: true
     FollowSymlinks  bool
     IncludeZeroLen  bool
@@ -189,8 +189,9 @@ type Detector struct {
     // scheduled tracks paths already handed to the executor for elimination.
     scheduled map[string]struct{}
 
-    // coWDetect makes matching identical files emit CoWDetect instead of
-    // DupeElim (find --cow).
+    // coWDetect keeps every identical file in its bucket and suppresses
+    // per-pair DupeElim work (find --cow). The final CoWGroups() pass reports
+    // one group per matching SHA-256 bucket.
     coWDetect bool
 
     stats *Stats
@@ -207,6 +208,7 @@ func (d *Detector) OnHashDone(key GroupKey, fi FileInfo) []Execution
 func (d *Detector) OnCompareDone(key GroupKey, a, b FileInfo) []Execution
 func (d *Detector) InsertInode(fi FileInfo)
 func (d *Detector) InodeGroups() [][]FileInfo
+func (d *Detector) CoWGroups() [][]FileInfo
 func (d *Detector) Len() int
 func (d *Detector) Stats() *Stats
 ```
@@ -219,7 +221,7 @@ func (d *Detector) Stats() *Stats
 **Consistency rules**:
 - The first file placed in a SHA-256 bucket is the **keeper** and is never a victim.
 - A file is scheduled as a victim at most once; the `scheduled` set records it and it is never placed in a SHA-256 bucket, so it cannot be selected as a keeper or eliminated twice.
-- With `WithCoWDetect()` (`find --cow`), matching identical files emit `CoWDetect` instead of `DupeElim` and are never scheduled for elimination.
+- With `WithCoWDetect()` (`find --cow`), no per-pair work is emitted and nothing is scheduled for elimination: every identical file stays in its SHA-256 bucket. Once the input is drained, `CoWGroups()` returns one group per bucket that has at least two distinct physical files, keeping one path per `(Dev, Inode)` so hardlinked aliases collapse to a single member.
 - `InsertInode` ignores files with `Inode == 0` or `NumLinks < 2`, and groups by `InodeKey` (Dev + Inode).
 
 ## Action `Outcome` and `Result`
@@ -228,18 +230,17 @@ func (d *Detector) Stats() *Stats
 
 ```go
 type Outcome struct {
-    Kind        dupe.ExecutionType // Mirrors the executed Execution's type
-    Key         dupe.GroupKey      // Composite key the execution belonged to
-    Files       []dupe.FileInfo    // Updated hash progress or participating files
-    Result      Result             // Set for DupeElim outcomes
-    Shared      bool               // CoWDetect: files share physical extents
-    SharedBytes int64              // CoWDetect: number of shared bytes
+    Kind       dupe.ExecutionType // Mirrors the executed Execution's type
+    Key        dupe.GroupKey      // Composite key the execution belonged to
+    Files      []dupe.FileInfo    // Updated hash progress or participating files
+    Result     Result             // Set for DupeElim outcomes
+    FileShared []int64            // CoWDetect: already-shared bytes per Files entry
 }
 
 type Result int
 const (
-    ResultVerifiedDuplicate Result = iota // Confirmed duplicate (find mode)
-    ResultAlreadyHardlinked               // Same-(Dev,Inode) pair skipped (--hardlink)
+    ResultVerifiedDuplicate Result = iota // Confirmed duplicate (report mode)
+    ResultAlreadyHardlinked               // Same-(Dev,Inode) pair; no file touched
     ResultDeleted                         // Duplicate deleted
     ResultHardlinked                      // Duplicate replaced with hardlink
     ResultCoWCloned                       // Duplicate replaced with CoW clone
@@ -248,10 +249,11 @@ const (
     ResultHardlinkLimit                   // NTFS link limit reached
     ResultNotDuplicate                    // Files differ (CRC collision)
     ResultError                           // Action failed
+    ResultAlreadyShared                   // dedupe --cow: pair already shares all storage
 )
 ```
 
-For `HashCalc`/`HashComp` the outcome's `Files` carry the updated `SHA256`/`HashState`/`HashOffset`. For `DupeElim`/`CoWDetect` they carry the participating keeper and victim.
+For `HashCalc`/`HashComp` the outcome's `Files` carry the updated `SHA256`/`HashState`/`HashOffset`. For `DupeElim` they carry the keeper and victim; for `CoWDetect` they carry every member of the group, with `FileShared[i]` giving the already-shared bytes of `Files[i]`. `FileShared` is nil when extent information is unavailable for the whole group (unsupported filesystem), and the group is then reported without ratios.
 
 ## `extent.Extent` — Physical Extent
 
@@ -266,6 +268,20 @@ type Extent struct {
 ```
 
 `Encoded` covers, for example, compressed btrfs extents: their `Physical` offsets and logical lengths are not comparable, so they are excluded from physical comparison and only the shared-logical-range fallback is used.
+
+Helper functions:
+
+```go
+func SharedBytes(a, b []Extent) int64                  // pairwise physical overlap
+func Equal(a, b []Extent) bool                         // identical, trusted layout
+func SharedFlagBytes(e []Extent) int64                 // bytes the FS marked Shared
+func SharedWithOthers(own []Extent, others [][]Extent) int64 // in-group physical identity
+```
+
+- `SharedBytes` is the original pairwise helper: it sums the overlap of non-encoded physical ranges and, when that yields nothing, falls back to the logical ranges of extents marked `Shared` (compressed btrfs).
+- `Equal` is a conservative "already sharing" fast path for `dedupe --cow`: true only when both lists are non-empty, have the same length in the same logical order, and every pair has equal `Logical`/`Physical`/`Length` with none `Encoded` and no `Physical` equal to 0. Anything else returns false, which merely means the clone is attempted.
+- `SharedFlagBytes` sums the lengths of extents the filesystem marked `Shared` (Linux `FIEMAP_EXTENT_SHARED`). It is a per-file signal: it says the extent is shared with someone, not with whom.
+- `SharedWithOthers` sums the bytes of `own` whose `Physical` start also appears in another list, capped to the shorter extent; it is used for in-group ratios on filesystems without a shared flag.
 
 ## Constants
 

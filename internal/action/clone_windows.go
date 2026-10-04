@@ -73,33 +73,37 @@ func clonePlatformFile(src, dst string) error {
 		return truncErr
 	}
 
-	// Block cloning only works on whole clusters; copy the tail normally.
+	// Block cloning only operates on whole clusters. A file smaller than one
+	// cluster has no clonable extent, so reporting it as cloned would be a
+	// lie; reject it instead of silently writing a full copy.
 	aligned := size - size%int64(cluster)
-	if aligned > 0 {
-		data := duplicateExtentsData{
-			FileHandle:       windows.Handle(srcFile.Fd()),
-			SourceFileOffset: 0,
-			TargetFileOffset: 0,
-			ByteCount:        aligned,
-		}
+	if aligned == 0 {
+		return errors.Join(ErrCoWNotSupported, errors.New("file is smaller than one cluster"))
+	}
 
-		var returned uint32
-		ioErr := windows.DeviceIoControl(
-			dstHandle,
-			windows.FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-			(*byte)(unsafe.Pointer(&data)),
-			uint32(unsafe.Sizeof(data)),
-			nil,
-			0,
-			&returned,
-			nil,
-		)
-		if ioErr != nil {
-			if isBlockCloneUnsupported(ioErr) {
-				return errors.Join(ErrCoWNotSupported, ioErr)
-			}
-			return ioErr
+	data := duplicateExtentsData{
+		FileHandle:       windows.Handle(srcFile.Fd()),
+		SourceFileOffset: 0,
+		TargetFileOffset: 0,
+		ByteCount:        aligned,
+	}
+
+	var returned uint32
+	ioErr := windows.DeviceIoControl(
+		dstHandle,
+		windows.FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+		(*byte)(unsafe.Pointer(&data)),
+		uint32(unsafe.Sizeof(data)),
+		nil,
+		0,
+		&returned,
+		nil,
+	)
+	if ioErr != nil {
+		if isBlockCloneUnsupported(ioErr) {
+			return errors.Join(ErrCoWNotSupported, ioErr)
 		}
+		return ioErr
 	}
 
 	if tail := size - aligned; tail > 0 {

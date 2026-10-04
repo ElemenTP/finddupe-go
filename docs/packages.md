@@ -41,7 +41,7 @@ finddupe-go/
 │   │   ├── replace_unix.go    # Unix: atomic os.Rename
 │   │   └── replace_windows.go # Windows: MoveFileEx(REPLACE_EXISTING)
 │   ├── extent/                # Physical extent query for CoW detection
-│   │   ├── extent.go          # Extent, SharedBytes, ErrUnsupported
+│   │   ├── extent.go          # Extent, SharedBytes, Equal, SharedFlagBytes, SharedWithOthers
 │   │   ├── query_linux.go     # Linux: FS_IOC_FIEMAP
 │   │   ├── query_darwin.go    # macOS: fcntl(F_LOG2PHYS_EXT) (undocumented)
 │   │   ├── query_windows.go   # Windows: FSCTL_GET_RETRIEVAL_POINTERS
@@ -55,6 +55,15 @@ finddupe-go/
 ├── test/                      # System integration tests
 │   ├── doc.go                 # Package doc (package test)
 │   └── system_test.go         # System tests (package test_test)
+├── testtools/                 # Manual platform diagnostics (not part of the CLI)
+│   └── extentdump/
+│       └── main.go            # extentdump <file>...: identity + extents + shared flag
+├── testscripts/               # Manual CoW probes for real APFS/ReFS machines
+│   ├── build-bundles.sh       # cross-compile finddupe + extentdump into bin/cow-test/
+│   ├── cow-probe.sh           # macOS/Linux bash probe
+│   ├── cow-probe-windows.ps1  # Windows PowerShell probe
+│   └── README.md              # how to build/run the probes and read the numbers
+├── bin/                       # Build output (gitignored); cow-test bundles land here
 └── docs/                      # Documentation (this directory)
 ```
 
@@ -97,6 +106,7 @@ func (d *Detector) OnHashDone(key GroupKey, fi FileInfo) []Execution
 func (d *Detector) OnCompareDone(key GroupKey, a, b FileInfo) []Execution
 func (d *Detector) InsertInode(fi FileInfo)
 func (d *Detector) InodeGroups() [][]FileInfo
+func (d *Detector) CoWGroups() [][]FileInfo
 func (d *Detector) Len() int
 func (d *Detector) Stats() *Stats
 ```
@@ -104,6 +114,7 @@ func (d *Detector) Stats() *Stats
 - `Insert` — checksum-based insertion; returns the work a new file triggers.
 - `OnHashDone` / `OnCompareDone` — feed executor outcomes back in and return follow-up work.
 - `InsertInode` / `InodeGroups` — `(Dev, Inode)` hardlink index used by `find --listlink`.
+- `CoWGroups` — used only in CoW-detect mode (`find --cow`), after the input is drained: every SHA-256 bucket with at least two distinct physical files becomes one group, keeping one path per `(Dev, Inode)` so hardlinked aliases collapse to a single member. It emits no per-pair work.
 
 **Dependencies**: None (stdlib only)
 
@@ -174,24 +185,23 @@ func New(opts Options) *Executor
 func (e *Executor) DoExecution(ctx context.Context, ex dupe.Execution) (Outcome, error)
 
 type Outcome struct {
-    Kind        dupe.ExecutionType
-    Key         dupe.GroupKey
-    Files       []dupe.FileInfo
-    Result      Result
-    Shared      bool
-    SharedBytes int64
+    Kind       dupe.ExecutionType
+    Key        dupe.GroupKey
+    Files      []dupe.FileInfo
+    Result     Result
+    FileShared []int64 // CoWDetect: already-shared bytes per Files entry
 }
 ```
 
 **Behavior by execution type**:
 - `HashCalc`: full SHA-256 of one file, resuming from `HashState`/`HashOffset`.
 - `HashComp`: chunked comparison of two files with early-stop; partial state is preserved for resume.
-- `DupeElim`: delete / hardlink / CoW-clone the victim, or report it. Checks `SkipHardlinked` with `(Dev, Inode)` and refuses to eliminate reference victims.
-- `CoWDetect`: query both files' extents (same device only) and report `Shared`/`SharedBytes`.
+- `DupeElim`: delete / hardlink / CoW-clone the victim, or report it. Before anything else it refuses to act on the same physical file (`samePhysicalFile`: same non-zero `Dev` + `Inode`): report mode still reports the pair unless `SkipHardlinked` (`--hardlink`), every other action returns `ResultAlreadyHardlinked`. Reference victims are never eliminated.
+- `CoWDetect`: query every member of one identical-content group and report `FileShared`, one already-shared byte count per member. The Linux `FIEMAP_EXTENT_SHARED` flag is used when any group extent carries it, otherwise physical-start identity is compared within the same device; `FileShared` is nil when extents are unavailable for the whole group.
 
-**CoW clone helpers**: `cloneReplace` (shared orchestration), `clonePlatformFile` (per OS), `replaceFile` (per OS), `ErrCoWNotSupported`.
+**CoW clone helpers**: `cloneReplace` (shared orchestration), `alreadyShared` (same physical file or `extent.Equal` fast path → `ResultAlreadyShared`), `clonePlatformFile` (per OS), `replaceFile` (per OS), `ErrCoWNotSupported`.
 
-**Action results**: `ResultVerifiedDuplicate`, `ResultAlreadyHardlinked`, `ResultDeleted`, `ResultHardlinked`, `ResultCoWCloned`, `ResultSkippedRO`, `ResultSkippedRef`, `ResultHardlinkLimit`, `ResultNotDuplicate`, `ResultError`
+**Action results**: `ResultVerifiedDuplicate`, `ResultAlreadyHardlinked`, `ResultDeleted`, `ResultHardlinked`, `ResultCoWCloned`, `ResultSkippedRO`, `ResultSkippedRef`, `ResultHardlinkLimit`, `ResultNotDuplicate`, `ResultError`, `ResultAlreadyShared`
 
 **Dependencies**: `internal/dupe`, `internal/config`, `internal/extent`, `golang.org/x/sys` (CoW ioctls)
 
@@ -213,10 +223,15 @@ type Extent struct {
 
 func Query(path string) ([]Extent, error)
 func SharedBytes(a, b []Extent) int64
+func Equal(a, b []Extent) bool
+func SharedFlagBytes(e []Extent) int64
+func SharedWithOthers(own []Extent, others [][]Extent) int64
 func Supported() bool
 ```
 
-**Platform implementations**: Linux FIEMAP (`FS_IOC_FIEMAP`), macOS `F_LOG2PHYS_EXT` (undocumented), Windows `FSCTL_GET_RETRIEVAL_POINTERS`; other platforms return `ErrUnsupported`. `SharedBytes` prefers physical overlap of non-encoded extents and falls back to shared logical ranges (compressed btrfs).
+**Platform implementations**: Linux FIEMAP (`FS_IOC_FIEMAP`), macOS `F_LOG2PHYS_EXT` (undocumented), Windows `FSCTL_GET_RETRIEVAL_POINTERS`; other platforms return `ErrUnsupported`.
+
+**Helpers**: `SharedBytes` is the pairwise physical-overlap helper (falling back to shared logical ranges for compressed btrfs). `Equal` is the conservative already-sharing fast path for `dedupe --cow`. `SharedFlagBytes` sums extents the filesystem marked `Shared` (a per-file signal). `SharedWithOthers` sums in-group physical-start matches, capped to the shorter extent, for filesystems without a shared flag.
 
 **Dependencies**: `golang.org/x/sys` (Unix/Windows syscalls)
 
@@ -248,9 +263,10 @@ func Run(ctx context.Context, cfg *config.Config) error
 - `walkAll` — walks `RefPaths` first, then `Paths`.
 - `scanChecksums` — feeds checksum tasks to the worker pool; drains the reference phase first.
 - `coordinate` — the coordinator loop that owns the detector, dispatches executions, and decides termination.
+- `cowGroupExecutions` — the one-shot final batch for `find --cow`: `detector.CoWGroups()` → one `CoWDetect` execution per identical-content group, dispatched after the input is drained and all hashing has finished.
 - `runExecutor` — the per-worker executor loop.
-- `reportOutcome` / `reportElimination` / `reportCoW` — user-facing output and stats.
-- `printSummary` — final statistics.
+- `reportOutcome` / `reportElimination` / `reportCoW` — user-facing output and stats. `reportCoW` prints one `CoW candidate group (N files, identical content):` block with a `shared: X% (Y of Z)` line per member, or the members only when `FileShared` is nil.
+- `printSummary` — final statistics, including `N CoW groups found (X of file bytes already shared)`.
 
 **Dependencies**: All other `internal/` packages
 
@@ -259,6 +275,42 @@ func Run(ctx context.Context, cfg *config.Config) error
 **Purpose**: Display live-updating scan progress via ANSI escape codes.
 
 **Dependencies**: `internal/dupe` (for `Stats`)
+
+## Diagnostic Tooling (not part of the binary)
+
+`find --cow` relies on platform extent APIs that cannot be validated on a
+developer's Linux machine alone. Two directories exist for that:
+
+### `testtools/extentdump`
+
+A standalone CLI, built separately from the main binary:
+
+```bash
+go build -o extentdump ./testtools/extentdump
+extentdump file1 file2
+```
+
+It prints `extent query supported=<bool>`, then for each file its
+`dev`/`inode`/`numLinks` (through `checksum.ComputeFileInfo`) and every extent's
+`logical`/`physical`/`length`/`shared`/`encoded`, followed by `sharedFlagBytes`
+and the total logical bytes. This is exactly what finddupe sees on that platform.
+
+### `testscripts/`
+
+- `build-bundles.sh` cross-compiles `finddupe` + `extentdump` for
+  linux-amd64, darwin-amd64/arm64, and windows-amd64/arm64 into
+  `bin/cow-test/<platform>/`, adds the matching probe script and README, and
+  zips or tars each bundle. `make cow-test-bundles` runs it.
+- `cow-probe.sh` (macOS/Linux bash) and `cow-probe-windows.ps1` (Windows
+  PowerShell) exercise independent copies, `dedupe --cow` plus a second run, a
+  pre-existing clone, an existing hardlink (which must stay untouched), and
+  compressible content. Linux uses `cp --reflink=never` for "independent" copies
+  because plain `cp` reflinks on btrfs; macOS uses `cp -c` for a real clone.
+- `README.md` explains how to run the bundles on APFS/ReFS and what the numbers
+  mean.
+
+The bundles themselves are build output under the gitignored `bin/` directory;
+the committed sources are the probe scripts and the `extentdump` command.
 
 ## Dependency Graph
 

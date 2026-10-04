@@ -93,3 +93,6 @@ The whole script output (it is split into `== section ==` markers), plus:
   expected.
 - A hardlink shares the whole inode, so `find --cow` collapses hardlinked
   aliases to one group member; use `find --listlink` to list hardlink groups.
+- Block cloning on Windows works in whole clusters, so a file smaller than one
+  cluster cannot be cloned; finddupe reports it as unsupported rather than
+  silently writing a full copy.

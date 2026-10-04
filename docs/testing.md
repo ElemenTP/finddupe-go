@@ -47,12 +47,12 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDetector_PartialProgressPreserved` | Early-stop state carried into a later `HashCalc` |
 | `TestDetector_PartialProgressKeepsLargerOffset` | The most advanced partial offset wins |
 | `TestDetector_CRCCollisionSeparatesBuckets` | Different SHA-256 buckets → matched against the right keeper |
-| `TestDetector_CoWDetectMode` | `WithCoWDetect()` emits `CoWDetect`, never schedules victims |
+| `TestDetector_CoWDetectMode` | `WithCoWDetect()` emits no per-pair work and never schedules victims; `CoWGroups()` groups by SHA-256 and collapses hardlinked aliases |
 | `TestDetector_InsertInodeGroups` | `InsertInode`/`InodeGroups` group by `(Dev, Inode)` |
 | `TestDetector_Empty` | Zero state: `Len()==0`, no inode groups, non-nil stats |
 | `TestDetector_SamePathInsertedTwice` | Inserting one path twice is ignored (overlapping patterns cannot self-eliminate) |
 
-### `internal/action` (11 tests)
+### `internal/action` (14 tests)
 
 | Test | Description |
 |------|-------------|
@@ -67,6 +67,9 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDoExecution_DupeElim_Hardlink` | Victim replaced with a hardlink to the keeper |
 | `TestDoExecution_DupeElim_ReadOnly` | Read-only victim skipped, then deleted with `IncludeReadonly` |
 | `TestDoExecution_CoWClone` | Victim replaced with a CoW clone; skips when unsupported |
+| `TestDoExecution_SamePhysicalFile_NoAction` | Delete/hardlink/CoW all return `ResultAlreadyHardlinked` for a hardlinked pair and leave the victim intact |
+| `TestDoExecution_CoWClone_SkipsAlreadyShared` | A second clone of an already-shared pair is a no-op (`ResultAlreadyShared`) |
+| `TestDoExecution_CoWDetect_GroupRatios` | `FileShared` for `[original, clone, independent copy]` is `[size, size, 0]` |
 
 ### `internal/fswalker` (11 tests)
 
@@ -94,13 +97,16 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestPool_WaitBlocks` | `Wait()` blocks until completion |
 | `TestPool_ZeroSize` | Size 0 → defaults to `runtime.NumCPU()` |
 
-### `internal/extent` (3 tests)
+### `internal/extent` (6 tests)
 
 | Test | Description |
 |------|-------------|
 | `TestSharedBytes` | Table test: partial/identical/disjoint/multiple overlaps, encoded extents ignored, shared-logical fallback |
 | `TestQuery_HardlinksShareExtents` | Two hardlinked 64KB files share every byte; skips if `ErrUnsupported` |
 | `TestQuery_IndependentCopiesShareNothing` | Two independent copies share nothing; skips if `ErrUnsupported` |
+| `TestEqual` | Equal layouts compare true; length/order/physical differences, empty lists, encoded extents, and zero physical addresses compare false |
+| `TestSharedFlagBytes` | Only extents flagged `Shared` contribute their lengths |
+| `TestSharedWithOthers` | Physical-start identity within a group, capped to the shorter extent; nil others → 0 |
 
 The `Query` tests skip themselves with `t.Skipf` when the filesystem cannot report extents, so they run meaningfully on Linux (FIEMAP/`FICLONE`), macOS (APFS), and Windows (ReFS).
 
@@ -109,8 +115,9 @@ The `Query` tests skip themselves with `t.Skipf` when the filesystem cannot repo
 The CoW and extent tests need a filesystem that supports reflinks / extent
 queries. `t.TempDir()` uses `$TMPDIR`, which on many Linux systems is `tmpfs` and
 therefore reports neither extents nor clones. So `TestQuery_*`,
-`TestDoExecution_CoWClone`, `TestDedupeCoW_CreateAndDetect` and
-`TestFind_CoW_IndependentCopiesNotGrouped` probe the default temp dir first and
+`TestDoExecution_CoWClone`, `TestDoExecution_CoWClone_SkipsAlreadyShared`,
+`TestDoExecution_CoWDetect_GroupRatios`, `TestDedupeCoW_CreateAndDetect` and
+`TestFind_CoW_IndependentCopiesZeroShared` probe the default temp dir first and
 then fall back to a temporary directory inside the package working directory
 (normally the repository, which is often on the developer's real btrfs/XFS/APFS
 volume). They skip only when neither location supports the feature, so a plain
@@ -134,7 +141,7 @@ TMPDIR=/path/on/btrfs go test ./... -count=1
 
 System tests build the `finddupe` binary once in `TestMain` and run it against real temp directories. The package is split: `test/doc.go` declares `package test` while the tests use `package test_test`.
 
-There are **51 test functions** (plus `TestMain`).
+There are **52 test functions** plus the `TestMain` harness — `grep -c '^func Test' test/system_test.go` reports **53** because it also matches `TestMain`.
 
 ### Find Mode (18 tests)
 
@@ -148,9 +155,9 @@ Basic deletion, content preservation, missing action flag error, multiple action
 
 Hardlink creation, content preservation, same-inode verification, read-only handling.
 
-### CoW (3 tests)
+### CoW (4 tests)
 
-`TestDedupeCoW_Unsupported` (graceful failure when cloning is unavailable), `TestDedupeCoW_CreateAndDetect` (clone then detect shared extents; conditionally `t.Skip`s when CoW is unsupported), and `TestFind_CoW_IndependentCopiesNotGrouped` (independent copies must not report a CoW group).
+`TestDedupeCoW_Unsupported` (graceful failure when cloning is unavailable), `TestDedupeCoW_CreateAndDetect` (clone then detect the group; expects `CoW candidate group` and `shared: 100.0%`; conditionally `t.Skip`s when CoW is unsupported), `TestFind_CoW_IndependentCopiesZeroShared` (independent copies are still listed as a group, but at 0% shared), and `TestDedupe_CoW_PreservesHardlink` (an existing hardlink must not be broken by `dedupe --cow`).
 
 ### Reference Paths (1 test)
 
@@ -179,6 +186,30 @@ No paths error, nonexistent path, no subcommand error, zero threads, many thread
 ### Concurrency (1 test)
 
 `TestConcurrentRuns` — three concurrent runs must not corrupt global state.
+
+## Manual Platform Probes (macOS / Windows)
+
+The automated suite covers Linux FIEMAP and `FICLONE` when the workspace volume
+supports them. macOS (`F_LOG2PHYS_EXT`) and Windows
+(`FSCTL_GET_RETRIEVAL_POINTERS`, ReFS block clones) need a real APFS/ReFS
+machine, so two committed tools support hand-run validation:
+
+- `testtools/extentdump` — `extentdump <file>...` prints each file's
+  `dev`/`inode`/`numLinks` and every extent's
+  `logical`/`physical`/`length`/`shared`/`encoded`, plus `sharedFlagBytes`. Use
+  it to confirm what the platform extent API actually reports.
+- `testscripts/build-bundles.sh` (also `make cow-test-bundles`) cross-compiles
+  `finddupe` + `extentdump` for linux-amd64, darwin-amd64/arm64, and
+  windows-amd64/arm64 into `bin/cow-test/<platform>/`, together with the probe
+  script and README. `bin/` is gitignored, so bundles are build output.
+- `testscripts/cow-probe.sh` (macOS/Linux bash) and
+  `testscripts/cow-probe-windows.ps1` (Windows PowerShell) exercise independent
+  copies, `dedupe --cow` then a second run, a pre-existing clone, an existing
+  hardlink (must stay untouched), and compressible content, printing marked
+  sections to send back.
+
+See `testscripts/README.md` for the exact commands and how to interpret the
+numbers.
 
 ## Race Detection
 
@@ -226,7 +257,9 @@ Critical paths requiring high coverage:
 - Detector state machine (`Insert` / `OnHashDone` / `OnCompareDone`, no double elimination)
 - Chunked comparison / early-stop and resume
 - Hardlink creation and deletion logic
-- Extent overlap arithmetic
+- Same-physical-file refusal in every action (`ResultAlreadyHardlinked`)
+- Extent overlap arithmetic, `extent.Equal`, and the per-file sharing signals
+- CoW group construction (`CoWGroups` / inode collapse) and the per-member ratios
 
 ## Running Tests
 

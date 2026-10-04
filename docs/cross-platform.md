@@ -130,7 +130,11 @@ NTFS returns `ERROR_INVALID_FUNCTION`; unsupported errors are joined with `ErrCo
 
 ## 4. Extent Querying (CoW Detection)
 
-`find --cow` uses `internal/extent` to decide whether byte-identical files share physical storage. `Query(path) ([]Extent, error)` is implemented per platform; `Supported()` reports whether the platform has an implementation, and `ErrUnsupported` is returned when the filesystem cannot report extents.
+`find --cow` uses `internal/extent` to measure how much of each member of an
+identical-content group is already shared. `Query(path) ([]Extent, error)` is
+implemented per platform; `Supported()` reports whether the platform has an
+implementation, and `ErrUnsupported` is returned when the filesystem cannot
+report extents.
 
 ### Linux — FIEMAP
 
@@ -150,9 +154,32 @@ NTFS returns `ERROR_INVALID_FUNCTION`; unsupported errors are joined with `ErrCo
 
 ### Comparing Extents
 
-`extent.SharedBytes(a, b)`:
-1. Sums the overlap of **non-encoded physical** ranges (the primary signal).
-2. If that yields nothing, falls back to comparing the **logical** ranges of extents the filesystem marked `Shared` — needed for compressed btrfs, where physical offsets are not comparable.
+`find --cow` runs one `CoWDetect` execution per identical-content group and
+computes, for every member, how many bytes are already shared (`FileShared`).
+
+`extent.Equal(a, b)` is the "already sharing, skip the work" fast path used by
+`dedupe --cow`: it is true only when both lists are non-empty, have the same
+length in the same logical order, and every extent has equal
+`Logical`/`Physical`/`Length` with none `Encoded` and no `Physical` equal to 0.
+It is deliberately conservative — anything uncertain compares unequal and the
+caller clones anyway, which is safe because content equality was already
+established.
+
+For the group ratios there are two signals:
+
+1. `extent.SharedFlagBytes(e)` sums the lengths of extents the filesystem marked
+   `Shared` (Linux `FIEMAP_EXTENT_SHARED`). It is a per-file signal: it says the
+   extent is shared with *someone*, not with whom. It is used for the whole group
+   as soon as any member's extents carry the flag.
+2. `extent.SharedWithOthers(own, others)` sums the bytes of `own` whose physical
+   start also appears in another member's list, capped to the shorter extent. It
+   is used where no shared flag exists, and only between members on the same
+   device.
+
+`extent.SharedBytes(a, b)` (pairwise overlap) is kept as a library helper:
+
+1. It sums the overlap of **non-encoded physical** ranges (the primary signal).
+2. If that yields nothing, it falls back to comparing the **logical** ranges of extents the filesystem marked `Shared` — needed for compressed btrfs, where physical offsets are not comparable.
 
 ### Compressed-btrfs Caveat
 
@@ -160,7 +187,35 @@ On btrfs with compression, extents are reported as `Encoded`: their physical off
 
 ### Same-Device Rule
 
-Physical offsets are only comparable within one device, so the executor skips CoW comparison when the two files have different non-zero `Dev` values.
+Physical offsets are only comparable within one device. `extent.SharedWithOthers`
+is therefore only given the members whose non-zero `Dev` matches the file being
+measured; a member on a different volume contributes nothing. The
+`FIEMAP_EXTENT_SHARED` flag path does not need this check, because the kernel
+already knows whether the extent is shared.
+
+### Validating Extent APIs on Real Machines
+
+Linux is exercised by the automated test suite. macOS (`F_LOG2PHYS_EXT`) and
+Windows (`FSCTL_GET_RETRIEVAL_POINTERS`) need a real APFS/ReFS machine, so two
+diagnostic tools exist:
+
+- `testtools/extentdump` is a small CLI (`extentdump <file>...`) that prints, per
+  file, `dev`/`inode`/`numLinks` (via `checksum.ComputeFileInfo`) and every
+  extent's `logical`/`physical`/`length`/`shared`/`encoded`, plus
+  `sharedFlagBytes`. It shows exactly what finddupe sees on that platform.
+- `testscripts/build-bundles.sh` cross-compiles `finddupe` and `extentdump` for
+  linux-amd64, darwin-amd64/arm64, and windows-amd64/arm64 into
+  `bin/cow-test/<platform>/`, together with a probe script and a README. The same
+  bundles can be produced with `make cow-test-bundles`. `bin/` is gitignored, so
+  the bundles are build output, not source.
+- `testscripts/cow-probe.sh` (macOS/Linux bash) and
+  `testscripts/cow-probe-windows.ps1` (Windows PowerShell) run the end-to-end
+  scenarios on the target machine: independent copies, `dedupe --cow` and a
+  second run, a pre-existing clone, an existing hardlink (which must stay
+  untouched), and compressible content. Each prints clearly marked sections for
+  the user to send back.
+
+See `testscripts/README.md` for instructions and what the numbers mean.
 
 ## 5. Read-Only Files
 
@@ -194,7 +249,7 @@ Reparse points (junctions, symlinks, mount points) are not followed by default. 
 | Long paths | N/A | N/A | N/A | ✓ (\\?\\) | ✓ (\\?\\) |
 | Symlinks | ✓ | ✓ | ✓ | ✓ | ✓ |
 
-Extent querying is best-effort: on a filesystem without support the query returns `ErrUnsupported`, `find --cow` simply reports no CoW groups, and the files are still listed as duplicates.
+Extent querying is best-effort: on a filesystem without support the query returns `ErrUnsupported`, `find --cow` still lists the group members but without per-file ratios, and the files are still counted as duplicates.
 
 ## 8. Path Separators
 

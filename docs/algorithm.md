@@ -127,7 +127,11 @@ func (d *Detector) Insert(fi FileInfo) []Execution {
 - **No concurrent double hashing**: `inflight` tracks paths that already have a hash/compare task queued.
 - **Partial resume**: when a comparison stops early, `OnCompareDone` persists the more advanced `HashState`/`HashOffset` for each file, so a later comparison resumes instead of re-reading from the start.
 - **Complete hash**: `OnHashDone`/`OnCompareDone` move a file from the zero-SHA bucket into its concrete SHA-256 bucket and emit a `DupeElim` when it matches the bucket's keeper.
-- **CoW-detect mode**: with `WithCoWDetect()` (`find --cow`), matching identical files emit `CoWDetect` instead of `DupeElim`, every file stays in the bucket, and nothing is scheduled for elimination.
+- **CoW-detect mode**: with `WithCoWDetect()` (`find --cow`), no per-pair work is
+  emitted, every file stays in its SHA-256 bucket, and nothing is scheduled for
+  elimination. After the input is drained, `CoWGroups()` returns one group per
+  matching SHA-256 bucket with at least two distinct physical files, and the
+  pipeline emits one `CoWDetect` execution per group.
 
 ### Comparison to the C Original
 
@@ -140,25 +144,33 @@ The C version uses a **binary search tree** with root at index 1, `Larger`/`Smal
 | `Same` chain for collisions | `map[[32]byte][]FileInfo` buckets |
 | `CheckDuplicate()` function | `Detector.Insert()` + outcome callbacks |
 
-### Hardlink-Aware Duplicate Detection (`--hardlink` in find mode)
+### Same-Physical-File Refusal (Every Action)
 
-When `--hardlink` is used with `find`, duplicate detection still operates on content, but the elimination step additionally checks physical identity. Inode numbers are only unique per device, so **both** `Dev` and `Inode` are compared:
+Duplicate detection always operates on content, but before taking any action the executor checks physical identity. Inode numbers are only unique per device, so **both** `Dev` and `Inode` are compared (`samePhysicalFile`, with `Inode != 0` guarding against platforms that cannot report an identity):
 
 ```
-Before acting on a DupeElim:
-  if SkipHardlinked && keeper.Inode != 0 &&
-     keeper.Dev == victim.Dev &&
-     keeper.Inode == victim.Inode &&
-     keeper.NumLinks > 1:
-       → ResultAlreadyHardlinked
-       → Don't report, don't count in stats
-
-Otherwise:
-  → execute the configured action
+Before acting on a DupeElim (keeper = Files[0], victim = Files[1]):
+  if samePhysicalFile(keeper, victim):   # Inode != 0, same Dev, same Inode
+      if report mode and not --hardlink:
+          → ResultVerifiedDuplicate      # still reported as a duplicate
+      else:
+          → ResultAlreadyHardlinked      # no file is touched
+  else if victim.IsRef and action != report:
+      → ResultSkippedRef                 # reference files are never eliminated
+  else:
+      → execute the configured action
 ```
+
+This applies to **every** action: delete, hardlink, and CoW clone all refuse to
+touch a path that is already the same physical file as the keeper. Acting on such
+a pair would break the existing hardlink — in particular, cloning one name of a
+hardlinked pair would replace it with an unshared copy.
 
 This means:
-- Files with **same content + same `(Dev, Inode)`** (already hardlinked) → silently skipped in find mode
+- Files with **same content + same `(Dev, Inode)`** (already hardlinked) →
+  `ResultAlreadyHardlinked` (silently skipped; in verbose mode logged as
+  `already hardlinked`), except in report mode without `--hardlink`, where the
+  pair is still reported as a duplicate
 - Files with **same content + different `(Dev, Inode)`** → reported as duplicates
 - Files with **different content** → not duplicates (weak-checksum collision, kept in separate SHA-256 buckets)
 
@@ -215,18 +227,22 @@ switch ex.Type:
   HashCalc  → hash Files[0] fully (resuming from HashState/HashOffset)
   HashComp  → compare Files[0] and Files[1] in chunks (Section 3)
   DupeElim  → act on the victim (Files[1]); Files[0] is the keeper
-  CoWDetect → query extents and report sharing between Files[0] and Files[1]
+  CoWDetect → query the whole group's extents and report per-file shared bytes
 ```
 
 For a `DupeElim` execution:
 
 ```
-1. If SkipHardlinked and keeper/victim share (Dev, Inode) with NumLinks > 1
-      → ResultAlreadyHardlinked
+1. If keeper and victim are the same physical file (`(Dev, Inode)`, Inode != 0)
+      → report mode without --hardlink: ResultVerifiedDuplicate (still reported)
+      → otherwise: ResultAlreadyHardlinked (no file is touched)
 2. If the victim is a reference file and the action is not "report"
       → ResultSkippedRef (reference files are never eliminated)
 3. Otherwise execute the configured action
 ```
+
+The same-physical-file check applies to delete, hardlink, and CoW clone alike; it
+prevents an existing hardlink from being broken.
 
 ### Delete
 
@@ -262,6 +278,8 @@ CoW elimination is implemented per platform. The victim is replaced with a block
 All platforms go through `cloneReplace(src, dst)` in `internal/action/cow.go`:
 
 ```
+0. If keeper and victim are the same physical file, or their extent layouts
+   compare Equal, → ResultAlreadyShared (no clone, no file change)
 1. Create a temporary file next to the victim
 2. Clone the keeper into the temporary path (platform-specific)
 3. Preserve the victim's mode and mtime on the temporary file
@@ -269,21 +287,60 @@ All platforms go through `cloneReplace(src, dst)` in `internal/action/cow.go`:
    MoveFileEx(REPLACE_EXISTING) on Windows)
 ```
 
-Unsupported filesystems return `ErrCoWNotSupported` and the victim is left untouched. → `ResultCoWCloned` on success.
+The extent check is only a "skip the work" fast path: content equality was already
+established by the detector, so cloning anyway is safe and idempotent. It is
+deliberately conservative — `extent.Equal` returns false for empty lists, for
+encoded (compressed) extents, and for unknown (zero) physical addresses, and any
+uncertainty (unsupported filesystem, query failure) simply means "clone".
+
+Unsupported filesystems return `ErrCoWNotSupported` and the victim is left
+untouched. → `ResultCoWCloned` on success, `ResultAlreadyShared` when the pair
+already shares all storage.
 
 ### CoW Detection (`find --cow`)
 
-Detection is opt-in because it costs an extra open + ioctl per file. When the detector is in CoW-detect mode, identical files produce `CoWDetect` executions; the executor:
+Detection is opt-in because it costs an extra open + extent query per file. It is
+a single final pass: after the input is fully drained and every hash/comparison
+has finished, the detector state is complete and the pipeline asks for groups.
+
+1. `dupe.Detector.CoWGroups()` returns every SHA-256 bucket with at least two
+   **distinct physical files**, keeping one path per `(Dev, Inode)`. Hardlinked
+   aliases collapse to a single member; use `find --listlink` to list hardlink
+   groups.
+2. The pipeline turns each group into one `CoWDetect` execution
+   (`cowGroupExecutions`) instead of one execution per pair.
+3. `detectCoW` computes, for every member, how many of its bytes are already
+   shared with another group member:
+   - if any extent in the group carries the filesystem's `Shared` flag
+     (Linux `FIEMAP_EXTENT_SHARED`), `extent.SharedFlagBytes` is used. This is a
+     per-file signal: it says the extent is shared with someone, not with whom;
+   - otherwise the physical start address is used as identity within the same
+     device via `extent.SharedWithOthers`, capped to the shorter extent.
+   `Outcome.FileShared []int64` carries one value per `Outcome.Files` entry; it is
+   nil when extent information is unavailable for the whole group.
+
+`find --cow` therefore reports a group, not a pair:
 
 ```
-1. Skip if the files are on different devices (physical offsets are only
-   comparable within one device)
-2. extent.Query(keeper) and extent.Query(victim)
-3. shared = extent.SharedBytes(keeperExtents, victimExtents)
-4. Outcome{Shared: shared > 0, SharedBytes: shared}
+CoW candidate group (2 files, identical content):
+    '/data/b.bin'  shared: 100.0% (128 kB of 128 kB)
+    '/data/a.bin'  shared:   0.0% (0 B of 128 kB)
+
+Files:     256 kB in      2 files
+Dupes:     128 kB in      1 files
+  1 CoW groups found (128 kB of file bytes already shared)
 ```
 
-Unsupported filesystems simply report no sharing (the query error is ignored). `SharedBytes` first sums overlaps of non-encoded physical extents, then falls back to comparing the logical ranges of extents the filesystem marked as shared (needed for compressed btrfs). See [cross-platform.md](cross-platform.md) for the per-platform ioctls.
+Independent copies are listed too, with 0% shared — they are exactly the members
+that should end up CoW-sharing. `CoWSharedBytes` is a per-file sum: each shared
+range is counted once per member, so it must not be read as physical bytes saved.
+Same-inode (hardlinked) aliases are not separate members.
+
+On filesystems without extent reporting `FileShared` stays nil: the group members
+are still listed, with a note that extent information is unavailable. The
+pairwise `extent.SharedBytes` (physical overlap, with a shared-logical fallback
+for compressed btrfs) remains available as a library helper. See
+[cross-platform.md](cross-platform.md) for the per-platform ioctls.
 
 ## 5. Glob Pattern Matching (`**`)
 

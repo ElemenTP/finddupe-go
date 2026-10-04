@@ -52,7 +52,7 @@ This replaces the older design in which the detector and executor were each a si
                             │
                             ▼ fileInfoCh (buffered, threads*4)
 ┌───────────────────────────────────────────────────────────┐
-│         coordinator (1 goroutine) — owns Detector          │
+│         coordinator (1 goroutine) — owns Detector         │
 │                                                           │
 │ On FileInfo:                                              │
 │   detector.Insert(fi) → []Execution → executionCh         │
@@ -64,19 +64,22 @@ This replaces the older design in which the detector and executor were each a si
 │   DupeElim / CoWDetect → nothing further                  │
 │   → follow-up Executions → executionCh                    │
 │                                                           │
+│ CoW-detect mode: input drained && inFlight == 0           │
+│   → detector.CoWGroups() → one CoWDetect per group        │
+│                                                           │
 │ Termination: input drained && inFlight == 0               │
 │   → close(executionCh)                                    │
 └───────────┬───────────────────────────────────────────────┘
             │
             ▼ executionCh (buffered, threads*4)
 ┌───────────────────────────────────────────────────────────┐
-│      executor workers (N = threads goroutines)             │
+│      executor workers (N = threads goroutines)            │
 │                                                           │
 │ action.Executor.DoExecution(ctx, ex) → Outcome            │
 │   HashCalc: full SHA-256 (resume from HashState/Offset)   │
 │   HashComp: chunked compare with early-stop               │
 │   DupeElim: delete / hardlink / CoW clone / report        │
-│   CoWDetect: query physical extents, report sharing       │
+│   CoWDetect: per-file shared bytes for one content group  │
 │ → outcomeCh                                               │
 └───────────────────────────┬───────────────────────────────┘
                             │
@@ -139,7 +142,8 @@ pipeline.Run(ctx, cfg)                                      │
   │     ├── HashComp: exactly two unhashed files            │
   │     ├── HashCalc: 3+ files, every unhashed file         │
   │     ├── DupeElim: identical hash, keeper + victim       │
-  │     └── CoWDetect: find --cow identical hash            │
+  │     └── CoWDetect: none per pair; emitted as one        │
+  │           execution per group after input drain         │
   │           │                                             │
   │           ▼                                             │
   │   executor workers: action.Executor.DoExecution         │
@@ -153,8 +157,8 @@ pipeline.Run(ctx, cfg)                                      │
   │                 ├── hardlink: os.Remove + os.Link       │
   │                 └── cow:      cloneReplace (FICLONE/…)  │
   │                                                         │
-  │   CoWDetect → extent.Query + extent.SharedBytes →       │
-  │              "CoW group: … share N"                     │
+  │   CoWDetect → extent.Query + SharedFlagBytes/           │
+  │              SharedWithOthers → "shared: N%" per member │
   │                                                         │
   ▼                                                         │
 Final summary (stats + results) printed to stderr           │
@@ -213,8 +217,8 @@ Final summary (stats + results) printed to stderr           │
                             │ internal/    │        ┌────────▼───────┐
                             │ worker       │        │ internal/      │
                             │ Pool         │        │ extent         │
-                            └──────────────┘        │ Query/Shared-  │
-                            ┌──────────────┐        │ Bytes (per OS) │
+                            └──────────────┘        │ Query/Equal/   │
+                            ┌──────────────┐        │ Shared* (OS)   │
                             │ internal/    │        └────────────────┘
                             │ progress     │
                             │ Reporter     │
@@ -265,9 +269,13 @@ The coordinator owns the termination condition:
 
 1. `fileInfoCh` closes when the walker and the checksum workers are done.
 2. The coordinator tracks `inFlight` (dispatched executions not yet completed).
-3. Once the input is drained **and** `inFlight == 0`, it closes `executionCh`.
-4. The executor workers observe the closed channel and exit; a `sync.WaitGroup` then closes `outcomeCh`.
-5. The coordinator drains the remaining outcomes and returns.
+3. Once the input is drained **and** `inFlight == 0`, it runs the one-shot final
+   batch: in CoW-detect mode, `detector.CoWGroups()` produces one `CoWDetect`
+   execution per identical-content group (`cowGroupExecutions`). Only then is the
+   detector state final, so the grouping cannot miss a file that is still hashing.
+4. It closes `executionCh`.
+5. The executor workers observe the closed channel and exit; a `sync.WaitGroup` then closes `outcomeCh`.
+6. The coordinator drains the remaining outcomes and returns.
 
 ## Error Handling Strategy
 

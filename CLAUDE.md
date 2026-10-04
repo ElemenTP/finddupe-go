@@ -14,6 +14,12 @@ make <your-os>-<cpu-arch>
 
 # Build on dev machine
 make linux-amd64
+
+# Cross-compile every supported target (Linux/macOS/Windows)
+make all-arch
+
+# Build the CoW probe bundles for real-machine APFS/ReFS validation
+make cow-test-bundles   # see testscripts/README.md
 ```
 
 ## Architecture

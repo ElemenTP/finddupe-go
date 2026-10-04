@@ -28,7 +28,7 @@ Scans the specified paths/patterns for duplicate files and reports them. No file
 |------|-------|------|---------|-------------|
 | `--hardlink` | `-H` | bool | false | Skip already-hardlinked files when reporting duplicates. Files sharing the same `(Dev, Inode)` (already hardlinked to each other) are not reported or counted. |
 | `--listlink` | `-l` | bool | false | List hardlink groups (files sharing a physical inode) and exit. Skips duplicate detection entirely. |
-| `--cow` | `-c` | bool | false | CoW search mode: report duplicate files that also share physical extents. |
+| `--cow` | `-c` | bool | false | CoW group mode: report every identical-content group with the per-file share of already-shared bytes. |
 | `--verbose` | `-v` | bool | false | Verbose output: show hardlink skip details, file index information |
 | `--zero` | `-z` | bool | false | Include zero-length files (skipped by default) |
 | `--no-progress` | `-p` | bool | false | Hide the progress indicator |
@@ -80,7 +80,7 @@ With:      '/path/to/copy.jpg'
 
 ### Output (With `--hardlink`)
 
-Duplicates with different `(Dev, Inode)` are reported as usual. Pairs that are already hardlinks (same `Dev` and `Inode`, `NumLinks > 1`) are silently skipped and not counted as duplicates; with `-v` each pair is logged as `already hardlinked`.
+Duplicates with different `(Dev, Inode)` are reported as usual. Pairs that are already the same physical file (same non-zero `Dev` and `Inode`) are silently skipped and not counted as duplicates; with `-v` each pair is logged as `already hardlinked`. Without `--hardlink`, such a pair is still reported as a duplicate.
 
 ### Output (`--listlink`)
 
@@ -100,17 +100,33 @@ Note: the summary always prints the generic `Files:`/`Dupes:` lines; each group 
 
 ### Output (`--cow`)
 
-Reports duplicate content whose files also share physical extents. Independent copies of the same content are detected as duplicates but do not produce a `CoW group` line:
+`find --cow` reports **groups**, not pairs. After the input is drained and all
+hashing is finished, every SHA-256 bucket with at least two distinct physical
+files becomes one group (hardlinked aliases collapse to a single member), and one
+`CoW candidate group` block is printed with the already-shared fraction of every
+member. Independent copies are listed too, with 0% shared — they are exactly the
+files that should end up CoW-sharing:
 
 ```
-CoW group: '/data/a.bin' and '/data/b.bin' share 1 MB
+CoW candidate group (2 files, identical content):
+    '/data/b.bin'  shared: 100.0% (128 kB of 128 kB)
+    '/data/a.bin'  shared:   0.0% (0 B of 128 kB)
 
-Files:     128 MB in     2 files
-Dupes:     128 MB in     1 files
-  1 CoW groups found, 1 MB shared
+Files:     256 kB in      2 files
+Dupes:     128 kB in      1 files
+  1 CoW groups found (128 kB of file bytes already shared)
 ```
 
-CoW detection costs an extra open + extent query per file, which is why it is opt-in. On filesystems without extent reporting the files are still reported as duplicates, but no group is printed. See [cross-platform.md](cross-platform.md).
+`CoWSharedBytes` (the `X of file bytes already shared` total) is a per-file sum:
+each shared range is counted once per member, so it must not be read as physical
+bytes saved. When extent information is unavailable for the whole group, the
+members are still listed with a note instead of per-file ratios.
+
+Detection costs an extra open + extent query per file, which is why it is opt-in.
+On Linux the `FIEMAP_EXTENT_SHARED` flag is used when the filesystem sets it;
+otherwise (macOS/Windows, and Linux filesystems without the flag) the physical
+start address is compared within the group and the same device. See
+[cross-platform.md](cross-platform.md).
 
 ## `finddupe dedupe` — Scan and Eliminate
 
@@ -158,7 +174,7 @@ Dupes:     100 MB in   234 files
   1 files replaced with CoW clones
 ```
 
-Read-only victims that are skipped print `Skipping duplicate readonly file '<path>'.` and increment `SkippedROFiles`. Reference victims increment `SkippedRefFiles` and print nothing.
+Read-only victims that are skipped print `Skipping duplicate readonly file '<path>'.` and increment `SkippedROFiles`. Reference victims increment `SkippedRefFiles` and print nothing. Pairs that are already the same physical file (a hardlink) are never touched: `--delete` and `--hardlink` return `ResultAlreadyHardlinked`, and `--cow` returns `ResultAlreadyHardlinked` for the same physical file or `ResultAlreadyShared` when the two extent layouts are provably identical; in verbose mode these are logged (`already hardlinked` / `already shared`) and nothing is printed otherwise.
 
 ## `finddupe version`
 
@@ -221,7 +237,7 @@ On SIGINT/SIGTERM the context is cancelled, `pipeline.Run` returns the context e
 | `-p` | `-p, --no-progress` | `-p, --no-progress` | |
 | `-j` | `-j, --follow-symlinks` | `-j, --follow-symlinks` | |
 | `-listlink` | `-l, --listlink` | N/A | C: list hardlink groups. Implemented for `find` |
-| N/A | `-c, --cow` | N/A | New: detect CoW-shared duplicates |
+| N/A | `-c, --cow` | N/A | New: report identical-content groups with per-file shared ratios |
 | N/A | `-t, --threads <n>` | `-t, --threads <n>` | New (Go multi-threading) |
 
 ### Future Work

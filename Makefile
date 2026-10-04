@@ -110,5 +110,10 @@ all-arch: $(PLATFORM_LIST) $(WINDOWS_ARCH_LIST)
 
 releases: $(gz_releases) $(zip_releases)
 
+# Cross-compile finddupe + extentdump and assemble the per-platform CoW probe
+# bundles under bin/cow-test/ (see testscripts/README.md).
+cow-test-bundles:
+	./testscripts/build-bundles.sh
+
 clean:
-	rm $(BINDIR)/*
+	rm -rf $(BINDIR)/*

@@ -7,7 +7,7 @@ A fast, cross-platform duplicate file finder and eliminator written in Go with m
 - **Multi-threaded scanning**: Uses worker pools to scan files in parallel for improved performance
 - **Cross-platform**: Supports Linux, macOS, and Windows
 - **Hard link detection**: List existing hard link groups with `find --listlink`
-- **CoW detection**: List duplicate files that share physical extents (CoW-generated copies) with `find --cow`
+- **CoW detection**: Report identical-content groups and how much of each file is already CoW-shared with `find --cow`
 - **Duplicate deletion**: Safely delete duplicate files
 - **Duplicate hard link**: Create hard links to eliminate duplicate files and save disk space
 - **Duplicate CoW**: Create CoW clones to eliminate duplicate files and save disk space on filesystems that support reflinks/block clones
@@ -75,7 +75,7 @@ finddupe dedupe --cow /btrfs-volume
 finddupe find --listlink /data
 ```
 
-**List duplicate files that share physical extents (CoW copies):**
+**Report identical-content groups and their CoW sharing:**
 ```bash
 finddupe find --cow /btrfs-volume
 ```
@@ -112,7 +112,7 @@ find mode:
 |--------|-------------|
 | `-H, --hardlink` | Skip already-hardlinked files when reporting duplicates |
 | `-l, --listlink` | List hardlink groups (files sharing a physical inode) and exit |
-| `-c, --cow` | List duplicate files that share physical extents (CoW copies) |
+| `-c, --cow` | Report identical-content groups with the per-file share of already-shared bytes |
 | `-v, --verbose` | Verbose output |
 | `-z, --zero` | Include zero-length files |
 | `-p, --no-progress` | Hide progress indicator |
@@ -167,6 +167,31 @@ finddupe find /drive1 /drive2 /drive3 --verbose
 3. **Comparison strategy**: one file is stored without hashing; exactly two unhashed files are compared in chunks with early-stop; three or more files get a full parallel SHA-256 pass. This guarantees every duplicate of N identical files is reported.
 4. **Execution**: Stateless executor workers hash, compare, and eliminate files as directed by the coordinator, feeding their results back for follow-up work.
 5. **Action**: Either report, delete, replace with hard links, or replace with CoW clones. With `--ref`, reference files are walked first, become keepers, and are never eliminated.
+6. **CoW report**: `find --cow` runs one final pass after all hashing has finished. Every identical-content group (one path per physical file; hardlinked aliases collapse) is reported with the already-shared fraction of each member. Independent copies are listed too, at 0% shared — they are exactly the files that should CoW-share.
+7. **Safe CoW elimination**: `dedupe --cow` never acts on a pair that is the same physical file (an existing hardlink) and skips pairs whose extent layout already proves they share all storage, so re-running it is a no-op.
+
+### CoW Output
+
+`find --cow` prints one block per group, then a summary line:
+
+```
+CoW candidate group (2 files, identical content):
+    '/data/b.bin'  shared: 100.0% (128 kB of 128 kB)
+    '/data/a.bin'  shared:   0.0% (0 B of 128 kB)
+
+  1 CoW groups found (128 kB of file bytes already shared)
+```
+
+The `X of file bytes already shared` total is a per-file sum: a shared range is
+counted once per member, so it is not the amount of physical storage saved.
+
+### CoW Diagnostics
+
+Validating extent reporting on macOS (APFS) and Windows (ReFS) needs a real
+machine. `testtools/extentdump` prints exactly what finddupe sees per file, and
+`testscripts/build-bundles.sh` (`make cow-test-bundles`) builds per-platform
+`finddupe` + `extentdump` bundles with a probe script under the gitignored
+`bin/cow-test/`. See [testscripts/README.md](testscripts/README.md).
 
 ## Performance Tips
 
@@ -185,6 +210,7 @@ finddupe find /drive1 /drive2 /drive3 --verbose
 - **CoW clone** (`dedupe --cow`): Linux uses `FICLONE` on btrfs/XFS; macOS uses `clonefile(2)` on APFS
 - **CoW detection** (`find --cow`): Linux uses FIEMAP; macOS uses the undocumented `F_LOG2PHYS_EXT` fcntl (experimental, may change across OS releases)
 - On unsupported filesystems the CoW clone is refused and the victim is left untouched (`ErrCoWNotSupported`)
+- `dedupe --cow` never touches a pair that is already the same physical file, so an existing hardlink is preserved
 
 ### Windows
 - Hard links require NTFS
