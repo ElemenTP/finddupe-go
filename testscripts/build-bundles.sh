@@ -48,6 +48,9 @@ for arch in amd64 arm64; do
 done
 
 cp testscripts/README.md "$OUT/README.md"
+for dir in "$OUT"/*/; do
+	cp testscripts/README.md "$dir/README.md"
+done
 
 for dir in "$OUT"/*/; do
 	name="$(basename "$dir")"
