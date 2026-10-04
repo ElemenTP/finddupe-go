@@ -273,6 +273,35 @@ For the group ratios there are two signals:
 
 On btrfs with compression, extents are reported as `Encoded`: their physical offsets and logical lengths cannot be compared directly, so the physical-identity path (`SharedWithOthers`) skips them. In-group detection then depends on the filesystem's `FIEMAP_EXTENT_SHARED` hint (`SharedFlagBytes`); if the kernel does not set that hint, two compressed clones may not be reported as sharing. The pairwise `SharedBytes` helper still offers its shared-logical-range fallback.
 
+### Compression State and Clone Sources
+
+A CoW clone inherits the **source's** extent layout, and compression lives in the
+extent layout: on btrfs extents are compressed only if the source's are (encoding
+is decided when the data is written), and an APFS decmpfs-compressed file's data
+lives in a compressed container. Cloning an uncompressed source over a compressed
+member therefore yields a byte-identical but **uncompressed** clone.
+
+`dedupe --cow` clones every member from the group keeper, and the keeper is the
+first file of the group in walk order. When that keeper is uncompressed, a
+compressed member comes out uncompressed: content and sharing are correct, the
+compression saving is lost. Re-compressing afterwards is not a fix — it allocates
+new extents and breaks the sharing dedupe just created.
+
+The tool deliberately does not try to preserve compression by preferring a
+compressed source. Compression state is a per-file property that content equality
+does not capture, and the detector emits eliminations pair-wise as soon as a file
+is hashed, so a compressed member discovered later could only be honoured by
+retroactively re-cloning members that were already processed. Doing that properly
+needs elimination deferred until a whole hash bucket is complete, plus matching
+accounting changes, and it would also change which path survives in
+`dedupe --delete` / `--hardlink`. The practical guidance instead:
+
+- compress the members of a group before running `dedupe --cow`, so that the
+  keeper is compressed too, and verify with `afsctool -v` (APFS) or
+  `filefrag -v` (btrfs);
+- or accept the uncompressed result — `find --cow` reports sharing, not
+  compression.
+
 ### Same-Device Rule
 
 Physical identities are only comparable within one device (an APFS clone ID is

@@ -210,7 +210,7 @@ machine. `testtools/extentdump` prints exactly what finddupe sees per file, and
 - **CoW clone** (`dedupe --cow`): Linux uses `FICLONE` on btrfs/XFS; macOS uses `clonefile(2)` on APFS
 - **CoW detection** (`find --cow`): Linux uses FIEMAP; macOS uses `fcntl(F_LOG2PHYS_EXT)` through the libSystem wrapper, with the APFS clone ID (`getattrlist` `ATTR_CMNEXT_CLONEID`) as the fallback for decmpfs-compressed files, which the kernel refuses to map
 - Verified on macOS 27 / APFS: uncompressed files report real per-extent sharing (including partial percentages), compressed files report family-level 100%/0%, and a re-run of `dedupe --cow` is a no-op
-- `clonefile(2)` keeps the *source's* compression: `dedupe --cow` clones from the group keeper, so a compressed member cloned from an uncompressed keeper loses its compression (content is unchanged)
+- A CoW clone keeps the *source's* compression: `dedupe --cow` clones from the group keeper, so a compressed member cloned from an uncompressed keeper loses its compression (content is unchanged). The tool does not manage compression; see [docs/cross-platform.md](docs/cross-platform.md)
 - On unsupported filesystems the CoW clone is refused and the victim is left untouched (`ErrCoWNotSupported`)
 - `dedupe --cow` never touches a pair that is already the same physical file, so an existing hardlink is preserved
 
