@@ -183,7 +183,7 @@ For the group ratios there are two signals:
 
 ### Compressed-btrfs Caveat
 
-On btrfs with compression, extents are reported as `Encoded`: their physical offsets and logical lengths cannot be compared directly, so the physical pass is skipped. Detection then depends on the filesystem's `FIEMAP_EXTENT_SHARED` hint and the logical-range fallback; if the kernel does not set that hint, two compressed clones may not be detected as sharing.
+On btrfs with compression, extents are reported as `Encoded`: their physical offsets and logical lengths cannot be compared directly, so the physical-identity path (`SharedWithOthers`) skips them. In-group detection then depends on the filesystem's `FIEMAP_EXTENT_SHARED` hint (`SharedFlagBytes`); if the kernel does not set that hint, two compressed clones may not be reported as sharing. The pairwise `SharedBytes` helper still offers its shared-logical-range fallback.
 
 ### Same-Device Rule
 

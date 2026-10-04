@@ -263,6 +263,17 @@ Reading 32KB + CRC + `(Dev, Inode, NumLinks)` retrieval is the most I/O-intensiv
 
 The pipeline listens for SIGINT and SIGTERM via `signal.NotifyContext`. On signal the context is cancelled, which propagates through all goroutines via `ctx.Done()`. Each stage checks the context before processing the next item, and the coordinator closes `executionCh`, which lets the executor workers exit and close `outcomeCh`.
 
+### 8. CoW Detection as One Final Group Pass
+
+`find --cow` does not emit per-pair work while files stream in. Instead the detector
+keeps every identical file in its SHA-256 bucket, and only after the input is drained
+and `inFlight == 0` does the coordinator call `detector.CoWGroups()` and dispatch one
+`CoWDetect` execution per group (`cowGroupExecutions`). Grouping at the end means a
+file cannot be grouped before its hash was compared, and it reports the whole
+identical-content set at once: one path per `(Dev, Inode)` (hardlinked aliases
+collapse) with a per-member already-shared byte count. Independent copies are
+members too, at 0% shared, because they are precisely the files that should CoW-share.
+
 ## Termination
 
 The coordinator owns the termination condition:
