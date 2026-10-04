@@ -40,7 +40,9 @@ The script exercises:
 1. independent copies, `dedupe --cow`, then `find --cow` before/after;
 2. a pre-existing `cp -c` clone;
 3. an existing hardlink (must never be replaced by a clone);
-4. compressed files (APFS decmpfs) and their clones.
+4. compressed files (APFS decmpfs) and their clones;
+5. a `darwinfiemap` investigation of whether `fcntl(F_LOG2PHYS_EXT)` can
+   enumerate physical extents (four input conventions, plus file comparison).
 
 APFS does not compress files automatically, so step 4 needs a compressor. If
 `afsctool` is installed (`brew install afsctool`) the script runs

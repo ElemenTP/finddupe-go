@@ -37,6 +37,7 @@ install -m 0755 testscripts/cow-probe.sh "$OUT/linux-amd64/cow-probe.sh"
 for arch in amd64 arm64; do
 	dir="$OUT/darwin-$arch"
 	build darwin "$arch" "$dir" finddupe extentdump
+	GOOS=darwin GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -o "$dir/darwinfiemap" ./testtools/darwinfiemap
 	install -m 0755 testscripts/cow-probe.sh "$dir/cow-probe.sh"
 done
 

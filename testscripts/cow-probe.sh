@@ -37,9 +37,10 @@ find_bin() {
 	return 1
 }
 
+FIEMAP=""
 case "$OS-$ARCH" in
-Darwin-arm64) FD="$(find_bin finddupe finddupe-darwin-arm64)"; ED="$(find_bin extentdump extentdump-darwin-arm64)" ;;
-Darwin-x86_64) FD="$(find_bin finddupe finddupe-darwin-amd64)"; ED="$(find_bin extentdump extentdump-darwin-amd64)" ;;
+Darwin-arm64) FD="$(find_bin finddupe finddupe-darwin-arm64)"; ED="$(find_bin extentdump extentdump-darwin-arm64)"; FIEMAP="$(find_bin darwinfiemap darwinfiemap-darwin-arm64 || true)" ;;
+Darwin-x86_64) FD="$(find_bin finddupe finddupe-darwin-amd64)"; ED="$(find_bin extentdump extentdump-darwin-amd64)"; FIEMAP="$(find_bin darwinfiemap darwinfiemap-darwin-amd64 || true)" ;;
 Linux-x86_64) FD="$(find_bin finddupe finddupe-linux-amd64)"; ED="$(find_bin extentdump extentdump-linux-amd64)" ;;
 *)
 	echo "unsupported platform $OS-$ARCH" >&2
@@ -269,6 +270,27 @@ fi
 if [ "$OS" = "Darwin" ] && command -v afsctool >/dev/null 2>&1; then
 	echo "--- afsctool -v after cloning ---"
 	afsctool -v "$CMP" 2>&1 | head -12
+fi
+
+# ---------------------------------------------------------------------------
+# 5. FIEMAP-equivalent investigation (macOS only)
+# ---------------------------------------------------------------------------
+if [ "$OS" = "Darwin" ] && [ -n "${FIEMAP:-}" ] && [ -x "${FIEMAP:-}" ]; then
+	FI="$DIR/fiemap"
+	rm -rf "$FI"
+	mkdir -p "$FI"
+	random_file "$FI/plain.bin" 1048576
+	independent_copy "$FI/plain.bin" "$FI/copy.bin"
+	clone_one "$FI/plain.bin" "$FI/clone.bin" 2>/dev/null || true
+	yes "finddupe fiemap probe line" 2>/dev/null | head -c 2097152 >"$FI/text.bin" || true
+	compress_file "$FI/text.bin" >/dev/null 2>&1 || true
+	clone_one "$FI/text.bin" "$FI/text-clone.bin" 2>/dev/null || true
+
+	section "darwinfiemap: plain vs independent copy vs clone"
+	show "$FIEMAP" "$FI/plain.bin" "$FI/copy.bin" "$FI/clone.bin"
+
+	section "darwinfiemap: compressed file vs its clone"
+	show "$FIEMAP" "$FI/text.bin" "$FI/text-clone.bin"
 fi
 
 echo

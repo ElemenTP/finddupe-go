@@ -199,6 +199,12 @@ machine, so two committed tools support hand-run validation:
   `dev`/`inode`/`numLinks` and every extent's
   `logical`/`physical`/`length`/`shared`/`encoded`, plus `sharedFlagBytes`. Use
   it to confirm what the platform extent API actually reports.
+- `testtools/darwinfiemap` (darwin only) — probes whether macOS can enumerate a
+  file's logical→physical mapping with `fcntl(F_LOG2PHYS_EXT)` / `F_LOG2PHYS`
+  through the libSystem wrapper (`unix.FcntlInt`, no raw syscall). It prints the
+  raw per-step results for four input conventions and compares files block by
+  block, so we can tell whether an APFS clone is detectable from physical
+  offsets without `getattrlist`.
 - `testscripts/build-bundles.sh` (also `make cow-test-bundles`) cross-compiles
   `finddupe` + `extentdump` for linux-amd64, darwin-amd64/arm64, and
   windows-amd64/arm64 into `bin/cow-test/<platform>/`, together with the probe
