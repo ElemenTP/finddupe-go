@@ -10,6 +10,9 @@ import (
 	"finddupe/internal/dupe"
 )
 
+// defaultInterval is how often the progress line is refreshed.
+const defaultInterval = 500 * time.Millisecond
+
 // Reporter displays a live-updating progress indicator.
 type Reporter struct {
 	stats    *dupe.Stats
@@ -20,7 +23,7 @@ type Reporter struct {
 func New(stats *dupe.Stats) *Reporter {
 	return &Reporter{
 		stats:    stats,
-		interval: 500 * time.Millisecond,
+		interval: defaultInterval,
 	}
 }
 

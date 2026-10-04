@@ -35,6 +35,12 @@ type Stats struct {
 	// CoWClonedFiles is the number of duplicate files replaced with CoW clones.
 	CoWClonedFiles atomic.Int64
 
+	// CoWGroups is the number of CoW (shared-extent) groups found by find --cow.
+	CoWGroups atomic.Int64
+
+	// CoWSharedBytes is the total number of physically shared bytes found.
+	CoWSharedBytes atomic.Int64
+
 	// SkippedROFiles is the number of read-only files skipped.
 	SkippedROFiles atomic.Int64
 

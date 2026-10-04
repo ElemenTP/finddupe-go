@@ -6,14 +6,17 @@ import (
 	"finddupe/internal/dupe"
 )
 
-// createHardlink replaces the duplicate file with a hardlink to the original.
+// createHardlink replaces the duplicate file (Files[1]) with a hardlink to the
+// original (Files[0]).
 // Strategy: delete the duplicate, then create a hardlink at its path pointing to the original.
-func (e *Executor) createHardlink(group dupe.Execution) (Result, error) {
-	candidatePath := group.Candidate.Path
-	originalPath := group.Original.Path
+func (e *Executor) createHardlink(ex dupe.Execution) (Result, error) {
+	keeper := ex.Files[0]
+	victim := ex.Files[1]
+	candidatePath := victim.Path
+	originalPath := keeper.Path
 
 	// Check NTFS hardlink limit (1023 links per file on Windows).
-	if group.Original.NumLinks >= MaxHardlinks {
+	if keeper.NumLinks >= MaxHardlinks {
 		return ResultHardlinkLimit, nil
 	}
 

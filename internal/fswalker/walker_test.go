@@ -13,8 +13,14 @@ import (
 )
 
 // collectResults reads all results from the channel and returns paths and errors.
-func collectResults(t *testing.T, ch <-chan fswalker.Result) (paths []string, errs []error) {
+func collectResults(t *testing.T, ch <-chan fswalker.Result) ([]string, []error) {
 	t.Helper()
+
+	var (
+		paths []string
+		errs  []error
+	)
+
 	for r := range ch {
 		if r.Err != nil {
 			errs = append(errs, r.Err)
@@ -23,7 +29,7 @@ func collectResults(t *testing.T, ch <-chan fswalker.Result) (paths []string, er
 		}
 	}
 	sort.Strings(paths)
-	return
+	return paths, errs
 }
 
 func TestWalk_EmptyDir(t *testing.T) {

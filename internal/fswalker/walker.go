@@ -112,7 +112,7 @@ func (w *Walker) walkPattern(
 // splitPattern splits a path+pattern into a base directory and a match component.
 // For example, "/data/**/*.txt" → ("/data", "**/*.txt")
 // For "/data" (no wildcard) → ("/data", "**").
-func splitPattern(pattern string) (baseDir, match string) {
+func splitPattern(pattern string) (string, string) {
 	// Find the first wildcard character.
 	wildIdx := strings.IndexAny(pattern, "*?[")
 	if wildIdx < 0 {
@@ -131,6 +131,8 @@ func splitPattern(pattern string) (baseDir, match string) {
 }
 
 // createWalkFn creates a [fs.WalkDirFunc] that filters by the match pattern.
+//
+//nolint:gocognit // the walk callback handles many filesystem edge cases in one place
 func (w *Walker) createWalkFn(
 	ctx context.Context, baseDir, matchPattern string, opts WalkOptions, ch chan<- Result, seen map[string]bool,
 ) fs.WalkDirFunc {
@@ -183,7 +185,7 @@ func (w *Walker) createWalkFn(
 		info, err := d.Info()
 		if err != nil {
 			ch <- Result{Err: err}
-			return nil
+			return nil //nolint:nilerr // per-file errors are reported on the channel
 		}
 
 		// Match against the pattern.
@@ -225,16 +227,22 @@ func (w *Walker) walkSymlinkTarget(
 
 	// Walk the resolved target directory.
 	walkFn := w.createWalkFn(ctx, target, matchPattern, opts, ch, seen)
-	if err := filepath.WalkDir(target, walkFn); err != nil {
+	if walkErr := filepath.WalkDir(target, walkFn); walkErr != nil {
 		select {
 		case <-ctx.Done():
-		case ch <- Result{Err: err}:
+		case ch <- Result{Err: walkErr}:
 		}
 	}
 }
 
 // processFileEntry creates a FileInfo and sends it on the channel.
-func (w *Walker) processFileEntry(ctx context.Context, path string, info os.FileInfo, ch chan<- Result, seen map[string]bool) {
+func (w *Walker) processFileEntry(
+	ctx context.Context,
+	path string,
+	info os.FileInfo,
+	ch chan<- Result,
+	_ map[string]bool,
+) {
 	select {
 	case <-ctx.Done():
 		return
@@ -246,8 +254,8 @@ func (w *Walker) processFileEntry(ctx context.Context, path string, info os.File
 		Size: info.Size(),
 	}
 
-	// Get inode and link count (platform-specific).
-	fi.Inode, fi.NumLinks = getInode(path, info)
+	// Get device/inode identity and link count (platform-specific).
+	fi.Dev, fi.Inode, fi.NumLinks = getFileIdentity(path, info)
 
 	// Send the result.
 	select {
@@ -257,7 +265,13 @@ func (w *Walker) processFileEntry(ctx context.Context, path string, info os.File
 }
 
 // processFile handles a single file (non-directory) pattern.
-func (w *Walker) processFile(ctx context.Context, path string, opts WalkOptions, ch chan<- Result, seen map[string]bool) {
+func (w *Walker) processFile(
+	ctx context.Context,
+	path string,
+	opts WalkOptions,
+	ch chan<- Result,
+	seen map[string]bool,
+) {
 	info, err := os.Stat(path)
 	if err != nil {
 		ch <- Result{Err: err}

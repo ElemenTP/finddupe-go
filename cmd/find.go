@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"finddupe/internal/config"
 	"finddupe/internal/pipeline"
 
@@ -18,7 +19,8 @@ Examples:
   finddupe find /home/user/photos
   finddupe find /data/**/*.jpg
   finddupe find --hardlink /backup
-  finddupe find --sigs /path/to/files
+  finddupe find --listlink /data
+  finddupe find --cow /btrfs-volume
   finddupe find --threads 8 /large/dataset`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runFind,
@@ -26,8 +28,8 @@ Examples:
 
 var findFlags struct {
 	hardlink       bool
+	listlink       bool
 	cow            bool
-	sigs           bool
 	verbose        bool
 	zero           bool
 	noProgress     bool
@@ -41,10 +43,10 @@ func init() {
 
 	findCmd.Flags().BoolVarP(&findFlags.hardlink, "hardlink", "H", false,
 		"Skip already-hardlinked files when reporting duplicates")
+	findCmd.Flags().BoolVarP(&findFlags.listlink, "listlink", "l", false,
+		"List hardlink groups (files sharing a physical inode) and exit")
 	findCmd.Flags().BoolVarP(&findFlags.cow, "cow", "c", false,
-		"CoW search mode: find groups of CoW-cloned files")
-	findCmd.Flags().BoolVarP(&findFlags.sigs, "sigs", "s", false,
-		"Print file signatures only (no duplicate detection)")
+		"CoW search mode: list duplicate files that share physical extents")
 	findCmd.Flags().BoolVarP(&findFlags.verbose, "verbose", "v", false,
 		"Verbose output: show hardlink counts, file index details")
 	findCmd.Flags().BoolVarP(&findFlags.zero, "zero", "z", false,
@@ -61,6 +63,20 @@ func init() {
 
 // runFind builds the config and runs the pipeline in find mode.
 func runFind(cmd *cobra.Command, args []string) error {
+	modes := 0
+	if findFlags.hardlink {
+		modes++
+	}
+	if findFlags.listlink {
+		modes++
+	}
+	if findFlags.cow {
+		modes++
+	}
+	if modes > 1 {
+		return errors.New("only one of --hardlink, --listlink, or --cow may be used")
+	}
+
 	cfg := &config.Config{
 		Mode:           config.ModeFind,
 		Action:         config.ActionReport,
@@ -68,7 +84,8 @@ func runFind(cmd *cobra.Command, args []string) error {
 		RefPaths:       findFlags.refPaths,
 		Threads:        findFlags.threads,
 		Verbose:        findFlags.verbose,
-		PrintSigs:      findFlags.sigs,
+		ListLink:       findFlags.listlink,
+		CoWDetect:      findFlags.cow,
 		ShowProgress:   !findFlags.noProgress,
 		FollowSymlinks: findFlags.followSymlinks,
 		IncludeZeroLen: findFlags.zero,

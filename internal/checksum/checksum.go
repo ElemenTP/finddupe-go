@@ -12,40 +12,74 @@ import (
 // This matches the C version's BYTES_DO_CHECKSUM_OF constant.
 const BytesToChecksum = 32768
 
+// Bit widths and shifts of the composite checksum algorithm. They are part of
+// the on-disk-compatible signature format and must not be changed.
+const (
+	crcShiftA     = 8
+	crcShiftB     = 24
+	crcShiftC     = 9
+	byteMask      = 0xff
+	sumShift      = 1
+	sumRotate     = 31
+	checksumWidth = 32
+)
+
+// Info holds the results of a single file open: the weak signature, the
+// physical file identity, and (for files <= BytesToChecksum) the full SHA-256.
+type Info struct {
+	// Signature is the 64-bit composite checksum of the first 32KB.
+	Signature uint64
+
+	// Dev is the filesystem/volume identifier (st_dev / volume serial).
+	Dev uint64
+
+	// Inode is the filesystem object identifier (inode / NTFS file index).
+	Inode uint64
+
+	// NumLinks is the number of hardlinks to the file (0 if unavailable).
+	NumLinks uint64
+
+	// SHA256 is the full-content hash when it was computed at no extra cost
+	// (files <= BytesToChecksum); the zero value means "not yet computed".
+	SHA256 [32]byte
+}
+
 // Compute opens the file at path and returns its 64-bit composite checksum.
 // The signature is (crc << 32) | sum, where crc and sum are computed from
 // the first BytesToChecksum bytes, and fileSize is added to sum.
 func Compute(path string, size int64) (uint64, error) {
-	sig, _, _, _, err := ComputeFileInfo(path, size)
-	return sig, err
+	info, err := ComputeFileInfo(path, size)
+	return info.Signature, err
 }
 
 // ComputeFileInfo opens the file once and returns the checksum signature,
-// filesystem inode, hardlink count, and SHA-256 hash. On Windows, this uses
+// filesystem identity, hardlink count, and SHA-256 hash. On Windows, this uses
 // GetFileInformationByHandle on the already-open handle — avoiding a
 // second CreateFile call in the single-threaded walker.
 //
 // When size <= BytesToChecksum (32KB), the entire file is read for CRC so
 // SHA-256 is also computed at zero additional cost. For larger files,
 // SHA-256 is returned as zero (not yet computed).
-func ComputeFileInfo(path string, size int64) (sig uint64, inode uint64, numLinks uint64, sha256sum [32]byte, err error) {
+func ComputeFileInfo(path string, size int64) (Info, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0, 0, [32]byte{}, err
+		return Info{}, err
 	}
 	defer f.Close()
 
-	// Get inode from the open file handle (platform-specific).
-	inode, numLinks = fileInode(f)
+	var out Info
+
+	// Get the physical identity from the open file handle (platform-specific).
+	out.Dev, out.Inode, out.NumLinks = fileIdentity(f)
 
 	if size <= BytesToChecksum {
 		// File fits entirely in the CRC buffer — compute SHA-256 alongside CRC
 		// at zero additional I/O cost.
-		sig, sha256sum, err = computeBoth(f, size)
+		out.Signature, out.SHA256, err = computeBoth(f, size)
 	} else {
-		sig, err = ComputeFromReader(f, size)
+		out.Signature, err = ComputeFromReader(f, size)
 	}
-	return sig, inode, numLinks, sha256sum, err
+	return out, err
 }
 
 // computeBoth reads the entire file (up to BytesToChecksum) and computes
@@ -66,11 +100,11 @@ func computeBoth(r io.Reader, size int64) (uint64, [32]byte, error) {
 	for _, b := range buf {
 		crc ^= uint32(b)
 		sum += uint32(b)
-		crc = (crc >> 8) ^ ((crc & 0xff) << 24) ^ ((crc & 0xff) << 9)
-		sum = (sum << 1) + (sum >> 31)
+		crc = (crc >> crcShiftA) ^ ((crc & byteMask) << crcShiftB) ^ ((crc & byteMask) << crcShiftC)
+		sum = (sum << sumShift) + (sum >> sumRotate)
 	}
-	sum += uint32(size)
-	sig := (uint64(crc) << 32) | uint64(sum)
+	sum += uint32(size) //nolint:gosec // size is folded into a 32-bit sum by design
+	sig := (uint64(crc) << checksumWidth) | uint64(sum)
 
 	// SHA-256 of the complete file content.
 	sha256sum := sha256.Sum256(buf)
@@ -101,13 +135,13 @@ func ComputeFromReader(r io.Reader, size int64) (uint64, error) {
 		sum += uint32(b)
 
 		// These operations must use uint32 to match C's unsigned int overflow behavior.
-		crc = (crc >> 8) ^ ((crc & 0xff) << 24) ^ ((crc & 0xff) << 9)
-		sum = (sum << 1) + (sum >> 31)
+		crc = (crc >> crcShiftA) ^ ((crc & byteMask) << crcShiftB) ^ ((crc & byteMask) << crcShiftC)
+		sum = (sum << sumShift) + (sum >> sumRotate)
 	}
 
 	// Add file size to sum, matching C: CheckSum.Sum += (unsigned int)FileSize.
-	sum += uint32(size)
+	sum += uint32(size) //nolint:gosec // size is folded into a 32-bit sum by design
 
 	// Pack into 64-bit result, matching C's Checksum_t memory layout.
-	return (uint64(crc) << 32) | uint64(sum), nil
+	return (uint64(crc) << checksumWidth) | uint64(sum), nil
 }

@@ -1,9 +1,10 @@
 // Package test contains system-level integration tests for finddupe.
 // These tests compile the binary and run it against real filesystems.
-package test
+package test_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -31,8 +32,8 @@ func TestMain(m *testing.M) {
 	cmd.Dir = ".." // build from project root
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to build finddupe: %v\n", err)
+	if runErr := cmd.Run(); runErr != nil {
+		fmt.Fprintf(os.Stderr, "failed to build finddupe: %v\n", runErr)
 		os.RemoveAll(tmpDir)
 		os.Exit(1)
 	}
@@ -52,16 +53,18 @@ func buildBinary(t *testing.T) string {
 }
 
 // run runs finddupe with the given arguments and returns stdout, stderr, and exit code.
-func run(t *testing.T, args ...string) (stdout, stderr string, exitCode int) {
+func run(t *testing.T, args ...string) (string, string, int) {
 	t.Helper()
 	bin := buildBinary(t)
 	cmd := exec.Command(bin, args...)
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
+	exitCode := 0
 	err := cmd.Run()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		exitErr := &exec.ExitError{}
+		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		} else {
 			t.Fatalf("failed to run finddupe: %v", err)
@@ -91,13 +94,12 @@ func makeDir(t *testing.T, dir, name string) string {
 }
 
 // makeReadOnly creates a read-only file.
-func makeReadOnly(t *testing.T, dir, name, content string) string {
+func makeReadOnly(t *testing.T, dir, name, content string) {
 	t.Helper()
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(content), 0444); err != nil {
 		t.Fatal(err)
 	}
-	return path
 }
 
 // filesInDir returns sorted list of filenames in a directory.
@@ -134,6 +136,7 @@ func sameInode(t *testing.T, a, b string) bool {
 // =============================================================================
 
 func TestFind_BasicDuplicates(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "a.txt", "hello world")
 	makeFile(t, dir, "b.txt", "hello world")
@@ -161,6 +164,7 @@ func TestFind_BasicDuplicates(t *testing.T) {
 }
 
 func TestFind_NoDuplicates(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "a.txt", "aaa")
 	makeFile(t, dir, "b.txt", "bbb")
@@ -177,6 +181,7 @@ func TestFind_NoDuplicates(t *testing.T) {
 }
 
 func TestFind_EmptyDirectory(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 
 	_, stderr, code := run(t, "find", dir, "--no-progress")
@@ -194,6 +199,7 @@ func TestFind_EmptyDirectory(t *testing.T) {
 }
 
 func TestFind_ZeroLengthFiles_Skipped(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "empty.txt", "")
 	makeFile(t, dir, "full.txt", "content")
@@ -210,6 +216,7 @@ func TestFind_ZeroLengthFiles_Skipped(t *testing.T) {
 }
 
 func TestFind_ZeroLengthFiles_Included(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "empty1.txt", "")
 	makeFile(t, dir, "empty2.txt", "")
@@ -230,6 +237,7 @@ func TestFind_ZeroLengthFiles_Included(t *testing.T) {
 }
 
 func TestFind_Verbose(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "a.txt", "hello")
 	makeFile(t, dir, "b.txt", "hello")
@@ -245,6 +253,7 @@ func TestFind_Verbose(t *testing.T) {
 }
 
 func TestFind_ThreadsFlag(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	for i := range 20 {
 		makeFile(t, dir, fmt.Sprintf("file%d.txt", i), "data")
@@ -261,6 +270,7 @@ func TestFind_ThreadsFlag(t *testing.T) {
 }
 
 func TestFind_MultiplePaths(t *testing.T) {
+	t.Parallel()
 	dir1 := t.TempDir()
 	dir2 := t.TempDir()
 	makeFile(t, dir1, "a.txt", "same content")
@@ -278,6 +288,7 @@ func TestFind_MultiplePaths(t *testing.T) {
 }
 
 func TestFind_GlobPattern(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "a.txt", "same")
 	makeFile(t, dir, "b.txt", "same")
@@ -297,6 +308,7 @@ func TestFind_GlobPattern(t *testing.T) {
 }
 
 func TestFind_RecursiveGlob(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	sub := makeDir(t, dir, "sub")
 	deep := makeDir(t, dir, "sub/deep")
@@ -317,6 +329,7 @@ func TestFind_RecursiveGlob(t *testing.T) {
 }
 
 func TestFind_LargeFiles(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Create files larger than the 32KB checksum threshold.
 	size := 100000
@@ -344,6 +357,7 @@ func TestFind_LargeFiles(t *testing.T) {
 }
 
 func TestFind_SameFirstChunkDifferentAfter(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// These files share the same first 32KB but differ afterward.
 	// This is a CRC collision that requires full comparison to resolve.
@@ -372,6 +386,7 @@ func TestFind_SameFirstChunkDifferentAfter(t *testing.T) {
 }
 
 func TestFind_BinaryFiles(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	data := []byte{0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD, 0x7F, 0x80}
 	makeFile(t, dir, "a.bin", string(data))
@@ -389,6 +404,7 @@ func TestFind_BinaryFiles(t *testing.T) {
 }
 
 func TestFind_ManyDuplicates(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	content := "duplicate content for many files test"
 	// Create 10 identical files.
@@ -412,6 +428,7 @@ func TestFind_ManyDuplicates(t *testing.T) {
 }
 
 func TestFind_SingleFile(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "only.txt", "just one file")
 
@@ -426,6 +443,7 @@ func TestFind_SingleFile(t *testing.T) {
 }
 
 func TestFind_MultipleDuplicateGroups(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Group 1: "content A"
 	makeFile(t, dir, "a1.txt", "content AAAA")
@@ -455,6 +473,7 @@ func TestFind_MultipleDuplicateGroups(t *testing.T) {
 // =============================================================================
 
 func TestDedupeDelete_Basic(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "original.txt", "delete test content")
 	makeFile(t, dir, "copy.txt", "delete test content")
@@ -479,6 +498,7 @@ func TestDedupeDelete_Basic(t *testing.T) {
 }
 
 func TestDedupeDelete_KeepsOriginalContent(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	content := "precious data that must be preserved"
 	makeFile(t, dir, "original.txt", content)
@@ -503,6 +523,7 @@ func TestDedupeDelete_KeepsOriginalContent(t *testing.T) {
 }
 
 func TestDedupeDelete_NoActionFlag_Error(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "a.txt", "test")
 
@@ -517,6 +538,7 @@ func TestDedupeDelete_NoActionFlag_Error(t *testing.T) {
 }
 
 func TestDedupeDelete_MultipleActions_Error(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 
 	_, stderr, code := run(t, "dedupe", "--delete", "--hardlink", dir, "--no-progress")
@@ -530,6 +552,7 @@ func TestDedupeDelete_MultipleActions_Error(t *testing.T) {
 }
 
 func TestDedupeDelete_ReadonlyFile_Skipped(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Create two duplicate files, one readonly. Use a third file to ensure
 	// we know which is which regardless of walk order.
@@ -560,6 +583,7 @@ func TestDedupeDelete_ReadonlyFile_Skipped(t *testing.T) {
 }
 
 func TestDedupeDelete_ReadonlyFile_Forced(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// With -r, both files are treated equally. One should be deleted,
 	// leaving exactly one copy plus the unique file.
@@ -586,6 +610,7 @@ func TestDedupeDelete_ReadonlyFile_Forced(t *testing.T) {
 }
 
 func TestDedupeDelete_ManyDuplicates(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	content := "many duplicate files test"
 	for i := range 10 {
@@ -612,6 +637,7 @@ func TestDedupeDelete_ManyDuplicates(t *testing.T) {
 // =============================================================================
 
 func TestDedupeHardlink_Basic(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	content := "hardlink test content here"
 	makeFile(t, dir, "original.txt", content)
@@ -650,6 +676,7 @@ func TestDedupeHardlink_Basic(t *testing.T) {
 }
 
 func TestDedupeHardlink_ContentPreserved(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	content := "precious content for hardlink preservation test"
 	makeFile(t, dir, "a.txt", content)
@@ -672,6 +699,7 @@ func TestDedupeHardlink_ContentPreserved(t *testing.T) {
 }
 
 func TestDedupeHardlink_SameInode(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	content := "inode verification test content"
 	path1 := makeFile(t, dir, "a.txt", content)
@@ -690,6 +718,7 @@ func TestDedupeHardlink_SameInode(t *testing.T) {
 }
 
 func TestDedupeHardlink_WithReadonly(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "a.txt", "hardlink readonly test content")
 	makeReadOnly(t, dir, "b.txt", "hardlink readonly test content")
@@ -716,6 +745,7 @@ func TestDedupeHardlink_WithReadonly(t *testing.T) {
 // =============================================================================
 
 func TestDedupeCoW_Unsupported(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "a.txt", "cow test")
 	makeFile(t, dir, "b.txt", "cow test")
@@ -736,6 +766,7 @@ func TestDedupeCoW_Unsupported(t *testing.T) {
 // =============================================================================
 
 func TestError_NoPaths(t *testing.T) {
+	t.Parallel()
 	_, stderr, code := run(t, "find", "--no-progress")
 
 	if code == 0 {
@@ -747,6 +778,7 @@ func TestError_NoPaths(t *testing.T) {
 }
 
 func TestError_NonexistentPath(t *testing.T) {
+	t.Parallel()
 	_, _, code := run(t, "find", "/nonexistent/path/that/does/not/exist", "--no-progress")
 
 	// The walker should handle non-existent paths gracefully.
@@ -756,6 +788,7 @@ func TestError_NonexistentPath(t *testing.T) {
 }
 
 func TestError_NoSubcommand(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	_, stderr, code := run(t, dir)
 
@@ -767,6 +800,7 @@ func TestError_NoSubcommand(t *testing.T) {
 }
 
 func TestFind_ThreadsZero(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "a.txt", "data")
 
@@ -779,6 +813,7 @@ func TestFind_ThreadsZero(t *testing.T) {
 }
 
 func TestFind_ManyThreads(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	for i := range 50 {
 		makeFile(t, dir, fmt.Sprintf("f%d.txt", i), "data")
@@ -793,6 +828,7 @@ func TestFind_ManyThreads(t *testing.T) {
 }
 
 func TestFind_Version(t *testing.T) {
+	t.Parallel()
 	stdout, _, code := run(t, "version")
 
 	if code != 0 {
@@ -804,6 +840,7 @@ func TestFind_Version(t *testing.T) {
 }
 
 func TestFind_Help(t *testing.T) {
+	t.Parallel()
 	stdout, _, code := run(t, "--help")
 
 	if code != 0 {
@@ -815,6 +852,7 @@ func TestFind_Help(t *testing.T) {
 }
 
 func TestFind_SubcommandHelp(t *testing.T) {
+	t.Parallel()
 	stdout, _, code := run(t, "find", "--help")
 
 	if code != 0 {
@@ -830,6 +868,7 @@ func TestFind_SubcommandHelp(t *testing.T) {
 // =============================================================================
 
 func TestNestedDirectories(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	subA := makeDir(t, dir, "subA")
 	subB := makeDir(t, dir, "subB")
@@ -852,6 +891,7 @@ func TestNestedDirectories(t *testing.T) {
 }
 
 func TestDedupe_NestedDirectories(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	subA := makeDir(t, dir, "subA")
 	subB := makeDir(t, dir, "subB")
@@ -872,7 +912,7 @@ func TestDedupe_NestedDirectories(t *testing.T) {
 
 	// Count remaining files by walking the tree.
 	var remaining int
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -892,6 +932,7 @@ func TestDedupe_NestedDirectories(t *testing.T) {
 // =============================================================================
 
 func TestGlob_StarExtension(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "a.txt", "glob test")
 	makeFile(t, dir, "b.txt", "glob test")
@@ -908,6 +949,7 @@ func TestGlob_StarExtension(t *testing.T) {
 }
 
 func TestGlob_CurrentDirPattern(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "test.jpg", "current dir glob test")
 
@@ -927,6 +969,7 @@ func TestGlob_CurrentDirPattern(t *testing.T) {
 // =============================================================================
 
 func TestStats_Find(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	makeFile(t, dir, "a.txt", "stats test content")
 	makeFile(t, dir, "b.txt", "stats test content")
@@ -949,6 +992,7 @@ func TestStats_Find(t *testing.T) {
 }
 
 func TestStats_FileSizes(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	content := "this string is thirty two bytes!" // exactly 32 bytes
 	if len(content) != 32 {
@@ -973,6 +1017,7 @@ func TestStats_FileSizes(t *testing.T) {
 // =============================================================================
 
 func TestConcurrentRuns(t *testing.T) {
+	t.Parallel()
 	// Run finddupe concurrently to ensure no global state corruption.
 	dir := t.TempDir()
 	for i := range 10 {
@@ -982,14 +1027,12 @@ func TestConcurrentRuns(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, 3)
 	for range 3 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, _, code := run(t, "find", dir, "--no-progress")
 			if code != 0 {
 				errs <- fmt.Errorf("concurrent run failed with exit %d", code)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -999,12 +1042,235 @@ func TestConcurrentRuns(t *testing.T) {
 }
 
 // =============================================================================
+// Regression: three or more identical files must all be reported
+// =============================================================================
+
+func TestFind_ThreeOrMoreIdenticalFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := strings.Repeat("identical-content", 5000) // >32KB, needs full hashing
+	for _, name := range []string{"a.txt", "b.txt", "c.txt", "d.txt"} {
+		makeFile(t, dir, name, content)
+	}
+	makeFile(t, dir, "other.txt", "something else")
+
+	_, stderr, code := run(t, "find", dir, "--no-progress")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
+	}
+
+	if got := countLinesContaining(stderr, "Duplicate:"); got != 3 {
+		t.Errorf("expected 3 duplicate reports for 4 identical files, got %d:\n%s", got, stderr)
+	}
+	if !strings.Contains(stderr, "Dupes:") {
+		t.Errorf("expected summary, got:\n%s", stderr)
+	}
+}
+
+func TestDedupeDelete_ThreeIdenticalFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := strings.Repeat("delete-me-content", 3000) // >32KB
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		makeFile(t, dir, name, content)
+	}
+
+	_, stderr, code := run(t, "dedupe", "--delete", dir, "--no-progress")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
+	}
+
+	remaining := filesInDir(t, dir)
+	if len(remaining) != 1 {
+		t.Errorf("expected 1 file remaining, got %d: %v", len(remaining), remaining)
+	}
+	if got := countLinesContaining(stderr, "Deleted:"); got != 2 {
+		t.Errorf("expected 2 deletes, got %d:\n%s", got, stderr)
+	}
+}
+
+// =============================================================================
+// Reference paths
+// =============================================================================
+
+func TestDedupe_RefKeptAndDuplicateRemoved(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	refDir := makeDir(t, dir, "ref")
+	workDir := makeDir(t, dir, "work")
+
+	refFile := makeFile(t, refDir, "orig.txt", "reference content")
+	workFile := makeFile(t, workDir, "copy.txt", "reference content")
+
+	_, stderr, code := run(t, "dedupe", "--delete", "--no-progress", "--ref", refDir, workDir)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
+	}
+
+	if _, err := os.Stat(refFile); err != nil {
+		t.Errorf("reference file must be kept: %v", err)
+	}
+	if _, err := os.Stat(workFile); !os.IsNotExist(err) {
+		t.Errorf("non-reference duplicate must be removed, stat err = %v", err)
+	}
+}
+
+// =============================================================================
+// Hardlink group listing (--listlink)
+// =============================================================================
+
+func TestFind_ListLink(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := "hardlink listing content"
+	orig := makeFile(t, dir, "a.txt", content)
+	link := filepath.Join(dir, "b.txt")
+	if err := os.Link(orig, link); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	makeFile(t, dir, "other.txt", "unrelated content")
+
+	_, stderr, code := run(t, "find", "--listlink", dir, "--no-progress")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
+	}
+
+	if !strings.Contains(stderr, "Hardlink group") {
+		t.Errorf("expected a hardlink group, got:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "a.txt") || !strings.Contains(stderr, "b.txt") {
+		t.Errorf("expected both hardlinked paths, got:\n%s", stderr)
+	}
+	if countLinesContaining(stderr, "Duplicate:") != 0 {
+		t.Errorf("--listlink must not run duplicate detection:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "1 hardlink groups found") {
+		t.Errorf("expected hardlink group summary, got:\n%s", stderr)
+	}
+}
+
+// =============================================================================
+// CoW clone detection (find --cow)
+// =============================================================================
+
+func TestDedupeCoW_CreateAndDetect(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := strings.Repeat("cow-clone-content", 4000)
+	a := makeFile(t, dir, "a.bin", content)
+	b := makeFile(t, dir, "b.bin", content)
+
+	_, stderr, code := run(t, "dedupe", "--cow", dir, "--no-progress")
+	if code != 0 {
+		t.Fatalf("dedupe --cow exited %d\n%s", code, stderr)
+	}
+	if strings.Contains(stderr, "CoW clone not supported") || !strings.Contains(stderr, "CoW cloned:") {
+		t.Skipf("CoW cloning not available on this filesystem:\n%s", stderr)
+	}
+
+	// The clone must be a real clone: same content, distinct inode.
+	if sameInode(t, a, b) {
+		t.Fatal("CoW clone must be a distinct inode, not a hardlink")
+	}
+	dataA, err := os.ReadFile(a)
+	if err != nil {
+		t.Fatalf("read a: %v", err)
+	}
+	dataB, err := os.ReadFile(b)
+	if err != nil {
+		t.Fatalf("read b: %v", err)
+	}
+	if string(dataA) != string(dataB) || string(dataA) != content {
+		t.Fatal("cloned file content differs from the original")
+	}
+
+	// find --cow must now detect the shared extents.
+	_, stderr, code = run(t, "find", "--cow", dir, "--no-progress")
+	if code != 0 {
+		t.Fatalf("find --cow exited %d\n%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "CoW group") {
+		t.Errorf("expected a CoW group after cloning, got:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "1 CoW groups found") {
+		t.Errorf("expected CoW group summary, got:\n%s", stderr)
+	}
+}
+
+func TestFind_CoW_IndependentCopiesNotGrouped(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := strings.Repeat("independent-copy-content", 4000)
+	makeFile(t, dir, "a.bin", content)
+	makeFile(t, dir, "b.bin", content)
+
+	_, stderr, code := run(t, "find", "--cow", dir, "--no-progress")
+	if code != 0 {
+		t.Fatalf("find --cow exited %d\n%s", code, stderr)
+	}
+
+	if strings.Contains(stderr, "CoW group") {
+		t.Errorf("independent copies must not be reported as a CoW group:\n%s", stderr)
+	}
+}
+
+// =============================================================================
+// Overlapping path arguments must never cause self-elimination
+// =============================================================================
+
+func TestDedupeDelete_DuplicatePathArgs_NoDataLoss(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	makeFile(t, dir, "a.txt", "precious content")
+	makeFile(t, dir, "b.txt", "precious content")
+
+	_, stderr, code := run(t, "dedupe", "--delete", "--no-progress", dir, dir)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
+	}
+
+	// Exactly one of the two files must survive: a file must never be treated
+	// as a duplicate of itself.
+	remaining := filesInDir(t, dir)
+	if len(remaining) != 1 {
+		t.Fatalf("expected exactly 1 file to remain, got %d: %v\n%s", len(remaining), remaining, stderr)
+	}
+	if got := countLinesContaining(stderr, "Deleted:"); got != 1 {
+		t.Errorf("expected exactly 1 delete, got %d:\n%s", got, stderr)
+	}
+}
+
+func TestFind_DuplicatePathArgs_NoSelfDuplicate(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	makeFile(t, dir, "a.txt", "content")
+	makeFile(t, dir, "b.txt", "content")
+
+	_, stderr, code := run(t, "find", "--no-progress", dir, dir)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
+	}
+
+	if got := countLinesContaining(stderr, "Duplicate:"); got != 1 {
+		t.Errorf("expected 1 duplicate report, got %d:\n%s", got, stderr)
+	}
+}
+
+// =============================================================================
 // Helper: count files matching predicate
 // =============================================================================
 
 func countLinesContaining(text, substr string) int {
 	count := 0
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		if strings.Contains(line, substr) {
 			count++
 		}

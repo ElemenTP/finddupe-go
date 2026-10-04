@@ -2,7 +2,11 @@ package dupe
 
 import "sync"
 
-// Detector finds duplicate files using a two-level grouping strategy:
+// Detector owns all duplicate-detection state and turns file insertions and
+// executor completions into the next batch of work to perform. The executor is
+// stateless: it only runs the Executions the detector hands out.
+//
+// Two-level grouping strategy:
 //  1. Primary key: (weak CRC signature, file size) — composite key eliminates
 //     false collisions from file-size wrapping at 4 GB.
 //  2. Secondary key: SHA-256 of full file content — zero means "not yet computed".
@@ -10,30 +14,86 @@ import "sync"
 // Strategy by group size:
 //   - 1 file: store without computing SHA-256 (avoids unnecessary I/O).
 //   - 2 files: chunked SHA-256 comparison with early-stop; partial hash state
-//     saved on mismatch.
-//   - 3+ files: mass concurrent SHA-256 computation for all unhashed files;
-//     instant matching against files with known SHA-256.
+//     saved on mismatch so a later comparison can resume.
+//   - 3+ files: mass concurrent SHA-256 computation for all unhashed files,
+//     then instant matching against files with a known SHA-256.
+//
+// Consistency rules:
+//   - The first file placed in a SHA-256 bucket is the keeper and is never a
+//     victim.
+//   - A file is scheduled as a victim at most once; scheduled files are removed
+//     from the buckets so they can never be selected as a keeper later.
+//   - Reference (--ref) files are still scheduled, but the action layer refuses
+//     to eliminate them.
 type Detector struct {
-	mu     sync.Mutex
+	mu sync.Mutex
+
+	// groups maps the composite key to its SHA-256 sub-buckets. The zeroSHA
+	// bucket holds files whose full hash is still unknown (possibly partial).
 	groups map[GroupKey]map[[32]byte][]FileInfo
-	stats  *Stats
+
+	// inodes groups files by physical identity for --listlink.
+	inodes map[InodeKey][]FileInfo
+
+	// inflight tracks paths that already have a hash/compare task queued, so
+	// the same file is never hashed twice concurrently.
+	inflight map[GroupKey]map[string]struct{}
+
+	// scheduled tracks paths that have already been handed to the executor for
+	// elimination.
+	scheduled map[string]struct{}
+
+	// seenPaths tracks every path already inserted, so overlapping patterns
+	// (for example passing the same directory twice) can never make a file a
+	// duplicate of itself.
+	seenPaths map[string]struct{}
+
+	// coWDetect makes matching identical files emit CoWDetect instead of
+	// DupeElim (find --cow).
+	coWDetect bool
+
+	stats *Stats
+}
+
+// Option customizes a Detector.
+type Option func(*Detector)
+
+// WithCoWDetect makes the detector emit CoWDetect executions for matching
+// identical files instead of elimination tasks.
+func WithCoWDetect() Option {
+	return func(d *Detector) { d.coWDetect = true }
 }
 
 // zeroSHA is the sentinel key for files whose SHA-256 has not been computed.
 var zeroSHA [32]byte
 
 // NewDetector creates a new Detector with the given stats.
-func NewDetector(stats *Stats) *Detector {
-	return &Detector{
-		groups: make(map[GroupKey]map[[32]byte][]FileInfo),
-		stats:  stats,
+func NewDetector(stats *Stats, opts ...Option) *Detector {
+	d := &Detector{
+		groups:    make(map[GroupKey]map[[32]byte][]FileInfo),
+		inodes:    make(map[InodeKey][]FileInfo),
+		inflight:  make(map[GroupKey]map[string]struct{}),
+		scheduled: make(map[string]struct{}),
+		seenPaths: make(map[string]struct{}),
+		stats:     stats,
 	}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
 }
 
-// Insert adds a FileInfo and returns potential duplicate groups.
+// Insert adds a FileInfo and returns the executions it triggers.
+// A path is only ever inserted once: overlapping patterns (or a file reached
+// through several links) must never make a file a duplicate of itself.
 func (d *Detector) Insert(fi FileInfo) []Execution {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	if _, ok := d.seenPaths[fi.Path]; ok {
+		return nil
+	}
+	d.seenPaths[fi.Path] = struct{}{}
 
 	d.stats.TotalFiles.Add(1)
 	d.stats.TotalBytes.Add(fi.Size)
@@ -42,115 +102,211 @@ func (d *Detector) Insert(fi FileInfo) []Execution {
 	shaGroups, exists := d.groups[key]
 
 	if !exists {
-		// Strategy 2: first file — no SHA-256 computation.
+		// First file with this key — no hashing needed yet.
 		d.groups[key] = map[[32]byte][]FileInfo{fi.SHA256: {fi}}
 		return nil
 	}
 
-	// Instant match: candidate has a known SHA-256 that matches an existing bucket.
+	// Instant match: the candidate already has a complete SHA-256 (small files).
 	if fi.SHA256 != zeroSHA {
-		if files, ok := shaGroups[fi.SHA256]; ok && len(files) > 0 {
-			shaGroups[fi.SHA256] = append(files, fi)
-			return []Execution{{Key: key, Original: files[0], Candidate: fi}}
-		}
-		// SHA-256 differs from all known buckets → CRC collision, store separately.
-		shaGroups[fi.SHA256] = append(shaGroups[fi.SHA256], fi)
-		return nil
+		return d.placeShaLocked(key, shaGroups, fi)
 	}
 
-	// Candidate has no SHA-256. Count existing files.
 	totalExisting := d.countLocked(shaGroups)
 	zeroFiles := shaGroups[zeroSHA]
 
 	// Store the new file in the zero-SHA bucket.
 	shaGroups[zeroSHA] = append(zeroFiles, fi)
 
-	if totalExisting == 1 {
-		// Strategy 3: exactly 2 files → chunked SHA-256 comparison with early-stop.
-		return []Execution{{Key: key, Original: zeroFiles[0], Candidate: fi}}
+	if totalExisting == 1 && len(zeroFiles) == 1 {
+		// Exactly two files, both unhashed: compare them directly with
+		// early-stop instead of hashing each one completely.
+		d.markInflightLocked(key, zeroFiles[0].Path, fi.Path)
+		return []Execution{{Key: key, Type: HashComp, Files: []FileInfo{zeroFiles[0], fi}}}
 	}
 
-	// Strategy 4: 3+ files.
-	// Emit pre-verified matches against known-SHA sub-groups, plus one
-	// chunked-comparison group against the first zero-SHA file.
-	var groups []Execution
-	for sha, files := range shaGroups {
-		if sha == zeroSHA || len(files) == 0 {
-			continue
-		}
-		groups = append(groups, Execution{Key: key, Original: files[0], Candidate: fi})
-	}
-	// Also emit one group for chunked comparison against the first zero-SHA file
-	// (the original file that started this group).
-	if len(zeroFiles) > 0 {
-		groups = append(groups, Execution{Key: key, Original: zeroFiles[0], Candidate: fi})
-	}
-
-	return groups
+	// 3+ files: hash every unhashed file that has no task in flight.
+	return d.emitHashCalcLocked(key, shaGroups)
 }
 
-// UnhashedFiles returns files in the zero-SHA bucket for the given key.
-// The caller should submit these for full SHA-256 computation when the group
-// has 3+ files (mass concurrent computation).
-func (d *Detector) UnhashedFiles(key GroupKey) []FileInfo {
+// OnHashDone feeds a completed HashCalc back into the detector.
+// The execution returns the file with either a complete SHA-256 or, if the read
+// was interrupted, an updated resume state.
+func (d *Detector) OnHashDone(key GroupKey, fi FileInfo) []Execution {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	d.clearInflightLocked(key, fi.Path)
 
 	shaGroups := d.groups[key]
 	if shaGroups == nil {
 		return nil
 	}
-	files := shaGroups[zeroSHA]
-	if len(files) == 0 {
+	return d.applyHashLocked(key, shaGroups, fi)
+}
+
+// OnCompareDone feeds a completed HashComp back into the detector. When both
+// files are fully hashed and equal it emits DupeElim; when the comparison
+// stopped early it persists the partial progress for a later resume.
+func (d *Detector) OnCompareDone(key GroupKey, a, b FileInfo) []Execution {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.clearInflightLocked(key, a.Path, b.Path)
+
+	shaGroups := d.groups[key]
+	if shaGroups == nil {
 		return nil
 	}
-	// Return a copy to avoid races with concurrent updates.
-	out := make([]FileInfo, len(files))
-	copy(out, files)
+
+	execs := d.applyHashLocked(key, shaGroups, a)
+	return append(execs, d.applyHashLocked(key, shaGroups, b)...)
+}
+
+// InsertInode records a file in the hardlink-group index (used by --listlink).
+// Files with fewer than two links cannot form a group and are ignored.
+func (d *Detector) InsertInode(fi FileInfo) {
+	if fi.Inode == 0 || fi.NumLinks < 2 {
+		return
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, ok := d.seenPaths[fi.Path]; ok {
+		return
+	}
+	d.seenPaths[fi.Path] = struct{}{}
+
+	k := InodeKey{Dev: fi.Dev, Inode: fi.Inode}
+	d.inodes[k] = append(d.inodes[k], fi)
+}
+
+// InodeGroups returns every hardlink group (two or more files sharing a
+// physical inode).
+func (d *Detector) InodeGroups() [][]FileInfo {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	out := make([][]FileInfo, 0, len(d.inodes))
+	for _, files := range d.inodes {
+		if len(files) > 1 {
+			out = append(out, append([]FileInfo(nil), files...))
+		}
+	}
 	return out
 }
 
-// GroupSize returns the total number of files for a given key.
-func (d *Detector) GroupSize(key GroupKey) int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.countLocked(d.groups[key])
+// placeShaLocked records a file with a complete SHA-256 and emits DupeElim when
+// it collides with the keeper of that SHA-256 bucket.
+func (d *Detector) placeShaLocked(key GroupKey, shaGroups map[[32]byte][]FileInfo, fi FileInfo) []Execution {
+	bucket := shaGroups[fi.SHA256]
+	if len(bucket) == 0 {
+		shaGroups[fi.SHA256] = []FileInfo{fi}
+		return nil
+	}
+
+	if _, done := d.scheduled[fi.Path]; done {
+		return nil
+	}
+
+	keeper := bucket[0]
+
+	// Detection mode never eliminates: keep every file in the bucket and let
+	// the executor compare extents against the keeper.
+	if d.coWDetect {
+		shaGroups[fi.SHA256] = append(bucket, fi)
+		return []Execution{{Key: key, Type: CoWDetect, Files: []FileInfo{keeper, fi}}}
+	}
+
+	d.scheduled[fi.Path] = struct{}{}
+	return []Execution{{Key: key, Type: DupeElim, Files: []FileInfo{keeper, fi}}}
 }
 
-// UpdateFileState updates a file's hash progress. Keeps the state with the
-// largest HashOffset. Moves the file from the zero-SHA bucket to the correct
-// SHA bucket when SHA-256 is complete.
-func (d *Detector) UpdateFileState(key GroupKey, path string, hashState []byte, hashOffset int64, sha256 [32]byte) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+// applyHashLocked moves a file between the zero-SHA bucket and a concrete
+// SHA-256 bucket, keeping the most advanced resume state.
+func (d *Detector) applyHashLocked(key GroupKey, shaGroups map[[32]byte][]FileInfo, fi FileInfo) []Execution {
+	zeroFiles := shaGroups[zeroSHA]
 
-	shaGroups := d.groups[key]
-	if shaGroups == nil {
-		return
+	idx := -1
+	for i, f := range zeroFiles {
+		if f.Path == fi.Path {
+			idx = i
+			break
+		}
 	}
 
-	// Find and update the file in the zero-SHA bucket.
+	if fi.SHA256 == zeroSHA {
+		// Still incomplete: keep the most advanced partial progress.
+		if idx >= 0 {
+			if fi.HashOffset > zeroFiles[idx].HashOffset {
+				zeroFiles[idx].HashState = fi.HashState
+				zeroFiles[idx].HashOffset = fi.HashOffset
+			}
+		} else {
+			shaGroups[zeroSHA] = append(zeroFiles, fi)
+		}
+		return nil
+	}
+
+	// Complete: detach from the zero bucket and place in the SHA bucket.
+	if idx >= 0 {
+		shaGroups[zeroSHA] = append(zeroFiles[:idx], zeroFiles[idx+1:]...)
+	}
+	return d.placeShaLocked(key, shaGroups, fi)
+}
+
+// emitHashCalcLocked queues a HashCalc for every unhashed file in the key that
+// does not already have a task in flight.
+func (d *Detector) emitHashCalcLocked(key GroupKey, shaGroups map[[32]byte][]FileInfo) []Execution {
 	zeroFiles := shaGroups[zeroSHA]
-	for i, f := range zeroFiles {
-		if f.Path != path {
+
+	var execs []Execution
+	for _, f := range zeroFiles {
+		if d.isInflightLocked(key, f.Path) {
 			continue
 		}
-		// Keep the more advanced state (larger HashOffset wins).
-		if hashOffset > f.HashOffset {
-			zeroFiles[i].HashState = hashState
-			zeroFiles[i].HashOffset = hashOffset
-		}
+		d.setInflightLocked(key, f.Path)
+		execs = append(execs, Execution{Key: key, Type: HashCalc, Files: []FileInfo{f}})
+	}
+	return execs
+}
 
-		// If SHA-256 is now complete, move to the correct bucket.
-		if sha256 != zeroSHA {
-			f = zeroFiles[i]
-			f.SHA256 = sha256
-			// Move from zero bucket to SHA bucket.
-			shaGroups[sha256] = append(shaGroups[sha256], f)
-			shaGroups[zeroSHA] = append(zeroFiles[:i], zeroFiles[i+1:]...)
-		}
+// markInflightLocked flags the given paths as having a task in flight.
+func (d *Detector) markInflightLocked(key GroupKey, paths ...string) {
+	for _, p := range paths {
+		d.setInflightLocked(key, p)
+	}
+}
+
+// setInflightLocked flags a single path as having a task in flight.
+func (d *Detector) setInflightLocked(key GroupKey, path string) {
+	m := d.inflight[key]
+	if m == nil {
+		m = make(map[string]struct{})
+		d.inflight[key] = m
+	}
+	m[path] = struct{}{}
+}
+
+// clearInflightLocked removes the in-flight flags for the given paths.
+func (d *Detector) clearInflightLocked(key GroupKey, paths ...string) {
+	m := d.inflight[key]
+	if m == nil {
 		return
 	}
+	for _, p := range paths {
+		delete(m, p)
+	}
+	if len(m) == 0 {
+		delete(d.inflight, key)
+	}
+}
+
+// isInflightLocked reports whether a path already has a task in flight.
+func (d *Detector) isInflightLocked(key GroupKey, path string) bool {
+	_, ok := d.inflight[key][path]
+	return ok
 }
 
 // countLocked returns the total number of files across all SHA buckets.

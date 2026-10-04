@@ -47,8 +47,13 @@ type Config struct {
 	// Verbose enables detailed output.
 	Verbose bool
 
-	// PrintSigs prints file signatures only, skipping duplicate detection.
-	PrintSigs bool
+	// ListLink enables hardlink-group listing mode (find --listlink): skip
+	// duplicate detection and list files that share a physical inode.
+	ListLink bool
+
+	// CoWDetect enables CoW-group listing (find --cow): report duplicate files
+	// that also share physical extents.
+	CoWDetect bool
 
 	// ShowProgress enables the progress indicator (default: true).
 	ShowProgress bool

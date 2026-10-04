@@ -7,6 +7,10 @@ import (
 	"sync"
 )
 
+// defaultThreadMultiplier scales the CPU count for the default pool size
+// (mixed I/O and CPU workload).
+const defaultThreadMultiplier = 2
+
 // Pool manages a fixed set of goroutines.
 // Submit blocks when all workers are busy, providing natural back-pressure.
 type Pool struct {
@@ -18,7 +22,7 @@ type Pool struct {
 // If size is <= 0, [runtime.NumCPU]*2 is used (mixed I/O+CPU workload).
 func New(size int) *Pool {
 	if size <= 0 {
-		size = runtime.NumCPU() * 2
+		size = runtime.NumCPU() * defaultThreadMultiplier
 	}
 	return &Pool{
 		sem: make(chan struct{}, size),
@@ -43,12 +47,10 @@ func (p *Pool) Submit(ctx context.Context, fn func(context.Context)) bool {
 		return false
 	}
 
-	p.wg.Add(1)
-	go func() {
-		defer p.wg.Done()
+	p.wg.Go(func() {
 		defer func() { <-p.sem }()
 		fn(ctx)
-	}()
+	})
 	return true
 }
 

@@ -3,7 +3,10 @@ package action_test
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
+	"encoding"
+	"errors"
+	"hash"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,241 +16,375 @@ import (
 	"finddupe/internal/dupe"
 )
 
-func TestVerifyChunked_Identical(t *testing.T) {
+var testKey = dupe.GroupKey{Signature: 7, Size: 0}
+
+// writeFile creates a file with the given content and returns its path.
+func writeFile(t *testing.T, dir, name string, data []byte) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	return path
+}
+
+// fileInfo builds a FileInfo for an existing file.
+func fileInfo(t *testing.T, path string) dupe.FileInfo {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return dupe.FileInfo{Path: path, Size: info.Size()}
+}
+
+// partialHasher returns a marshaled SHA-256 state after hashing prefix bytes.
+func partialHasher(t *testing.T, prefix []byte) ([]byte, hash.Hash) {
+	t.Helper()
+	h := sha256.New()
+	h.Write(prefix)
+	m, ok := h.(encoding.BinaryMarshaler)
+	if !ok {
+		t.Fatal("sha256 hasher is not a BinaryMarshaler")
+	}
+	state, err := m.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal hasher: %v", err)
+	}
+	return state, h
+}
+
+func TestDoExecution_HashCalc_Complete(t *testing.T) {
 	t.Parallel()
+
 	dir := t.TempDir()
-	data := make([]byte, 200000)
-	rand.Read(data)
-	a := filepath.Join(dir, "a.bin")
-	b := filepath.Join(dir, "b.bin")
-	os.WriteFile(a, data, 0644)
-	os.WriteFile(b, data, 0644)
+	data := bytes.Repeat([]byte("finddupe"), 40*1024) // 320 KB, multi-chunk
+	path := writeFile(t, dir, "a.bin", data)
 
 	exec := action.New(action.Options{Action: config.ActionReport})
-	result, upOrig, upCand, err := exec.VerifyChunked(context.Background(), dupe.Execution{
-		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
-		Candidate: dupe.FileInfo{Path: b, Size: int64(len(data))},
-		Original:  dupe.FileInfo{Path: a, Size: int64(len(data))},
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.HashCalc,
+		Files: []dupe.FileInfo{{Path: path, Size: int64(len(data))}},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("HashCalc: %v", err)
 	}
-	if result != action.ResultVerifiedDuplicate {
-		t.Errorf("expected ResultVerifiedDuplicate, got %d", result)
+
+	if got, want := out.Files[0].SHA256, sha256.Sum256(data); got != want {
+		t.Fatalf("SHA256 = %x, want %x", got, want)
 	}
-	if upCand.SHA256 == ([32]byte{}) {
-		t.Error("expected complete SHA-256 on candidate")
-	}
-	if upCand.SHA256 != upOrig.SHA256 {
-		t.Error("expected matching SHA-256 for identical files")
+	if out.Files[0].HashOffset != int64(len(data)) {
+		t.Fatalf("HashOffset = %d, want %d", out.Files[0].HashOffset, len(data))
 	}
 }
 
-func TestVerifyChunked_Different(t *testing.T) {
+func TestDoExecution_HashCalc_Resumes(t *testing.T) {
 	t.Parallel()
+
 	dir := t.TempDir()
-	a := filepath.Join(dir, "a.bin")
-	b := filepath.Join(dir, "b.bin")
-	os.WriteFile(a, []byte("aaaa"), 0644)
-	os.WriteFile(b, []byte("bbbb"), 0644)
+	data := bytes.Repeat([]byte("resume-me"), 50*1024)
+	path := writeFile(t, dir, "a.bin", data)
+
+	prefix := data[:100*1024]
+	state, _ := partialHasher(t, prefix)
 
 	exec := action.New(action.Options{Action: config.ActionReport})
-	result, _, upCand, err := exec.VerifyChunked(context.Background(), dupe.Execution{
-		Key:       dupe.GroupKey{Signature: 1, Size: 4},
-		Candidate: dupe.FileInfo{Path: b, Size: 4},
-		Original:  dupe.FileInfo{Path: a, Size: 4},
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:  testKey,
+		Type: dupe.HashCalc,
+		Files: []dupe.FileInfo{{
+			Path:       path,
+			Size:       int64(len(data)),
+			HashState:  state,
+			HashOffset: int64(len(prefix)),
+		}},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("HashCalc resume: %v", err)
 	}
-	if result != action.ResultNotDuplicate {
-		t.Errorf("expected ResultNotDuplicate, got %d", result)
-	}
-	// Early-stop: SHA-256 should be incomplete, hash state saved.
-	if upCand.SHA256 != ([32]byte{}) {
-		t.Error("expected incomplete SHA-256 after early-stop")
-	}
-	if len(upCand.HashState) == 0 {
-		t.Error("expected hash state saved after early-stop")
-	}
-	if upCand.HashOffset == 0 {
-		t.Error("expected non-zero hash offset after early-stop")
+
+	if got, want := out.Files[0].SHA256, sha256.Sum256(data); got != want {
+		t.Fatalf("resumed SHA256 = %x, want %x", got, want)
 	}
 }
 
-func TestVerifyChunked_DifferentSizes(t *testing.T) {
+func TestDoExecution_HashComp_Identical(t *testing.T) {
 	t.Parallel()
+
 	dir := t.TempDir()
-	a := filepath.Join(dir, "a.bin")
-	b := filepath.Join(dir, "b.bin")
-	os.WriteFile(a, []byte("short"), 0644)
-	os.WriteFile(b, []byte("longer_file"), 0644)
+	data := bytes.Repeat([]byte("same"), 10*1024)
+	a := writeFile(t, dir, "a.bin", data)
+	b := writeFile(t, dir, "b.bin", data)
 
 	exec := action.New(action.Options{Action: config.ActionReport})
-	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
-		Key:       dupe.GroupKey{Signature: 1, Size: 5},
-		Candidate: dupe.FileInfo{Path: b, Size: 11},
-		Original:  dupe.FileInfo{Path: a, Size: 5},
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.HashComp,
+		Files: []dupe.FileInfo{fileInfo(t, a), fileInfo(t, b)},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("HashComp: %v", err)
 	}
-	if result != action.ResultNotDuplicate {
-		t.Errorf("expected ResultNotDuplicate for different sizes, got %d", result)
+
+	want := sha256.Sum256(data)
+	if out.Files[0].SHA256 != want || out.Files[1].SHA256 != want {
+		t.Fatalf("both hashes must complete and match: %x / %x",
+			out.Files[0].SHA256, out.Files[1].SHA256)
 	}
 }
 
-func TestVerifyChunked_PartialStateResume(t *testing.T) {
+func TestDoExecution_HashComp_EarlyStop(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	data := make([]byte, 200000)
-	rand.Read(data)
-	a := filepath.Join(dir, "a.bin")
-	os.WriteFile(a, data, 0644)
 
-	// b has same first 64KB, different after.
-	dataB := make([]byte, 200000)
-	copy(dataB, data)
-	dataB[100000] ^= 0xFF
-	b := filepath.Join(dir, "b.bin")
-	os.WriteFile(b, dataB, 0644)
+	dir := t.TempDir()
+
+	// 200 KB sharing the first 64 KB, then diverging.
+	shared := bytes.Repeat([]byte("A"), 64*1024)
+	restA := bytes.Repeat([]byte("B"), 200*1024-64*1024)
+	restB := bytes.Repeat([]byte("C"), 200*1024-64*1024)
+	a := writeFile(t, dir, "a.bin", append(append([]byte{}, shared...), restA...))
+	b := writeFile(t, dir, "b.bin", append(append([]byte{}, shared...), restB...))
 
 	exec := action.New(action.Options{Action: config.ActionReport})
-
-	// First comparison: should early-stop, saving partial state.
-	_, upOrig, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
-		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
-		Candidate: dupe.FileInfo{Path: b, Size: int64(len(dataB))},
-		Original:  dupe.FileInfo{Path: a, Size: int64(len(data))},
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.HashComp,
+		Files: []dupe.FileInfo{fileInfo(t, a), fileInfo(t, b)},
 	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if upOrig.HashOffset == 0 {
-		t.Error("expected partial hash state after early-stop")
+		t.Fatalf("HashComp: %v", err)
 	}
 
-	// Second comparison: resume from partial state.
-	// c matches b exactly.
-	c := filepath.Join(dir, "c.bin")
-	os.WriteFile(c, dataB, 0644)
-
-	_, upOrig2, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
-		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(dataB))},
-		Candidate: dupe.FileInfo{Path: c, Size: int64(len(dataB))},
-		Original:  upOrig, // has partial state from first comparison
-	})
-	if err != nil {
-		t.Fatal(err)
+	// Early-stop must avoid reading the whole file.
+	if out.Files[0].HashOffset >= 200*1024 {
+		t.Fatalf("HashOffset = %d, expected an early stop", out.Files[0].HashOffset)
 	}
-	if upOrig2.HashOffset <= upOrig.HashOffset {
-		t.Error("expected hash offset to increase after resume")
+	if out.Files[0].SHA256 != ([32]byte{}) || out.Files[1].SHA256 != ([32]byte{}) {
+		t.Fatal("hashes must be incomplete after an early stop")
+	}
+	if len(out.Files[0].HashState) == 0 {
+		t.Fatal("partial hash state must be saved for a later resume")
 	}
 }
 
-func TestDelete_Success(t *testing.T) {
+func TestDoExecution_DupeElim_Delete(t *testing.T) {
 	t.Parallel()
+
 	dir := t.TempDir()
-	origPath := filepath.Join(dir, "original.bin")
-	dupPath := filepath.Join(dir, "todelete.bin")
-	data := []byte("data")
-	os.WriteFile(origPath, data, 0644)
-	os.WriteFile(dupPath, data, 0644)
+	data := []byte("duplicate content")
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
 
 	exec := action.New(action.Options{Action: config.ActionDelete})
-	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
-		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
-		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
-		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, keeper), fileInfo(t, victim)},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Delete: %v", err)
 	}
-	if result != action.ResultDeleted {
-		t.Errorf("expected ResultDeleted, got %d", result)
+	if out.Result != action.ResultDeleted {
+		t.Fatalf("Result = %v, want ResultDeleted", out.Result)
 	}
-	if _, statErr := os.Stat(dupPath); !os.IsNotExist(statErr) {
-		t.Error("expected file to be deleted")
+	if _, statErr := os.Stat(victim); !os.IsNotExist(statErr) {
+		t.Fatalf("victim still exists: %v", statErr)
+	}
+	if _, statErr := os.Stat(keeper); statErr != nil {
+		t.Fatalf("keeper missing: %v", statErr)
 	}
 }
 
-func TestHardlink_Created(t *testing.T) {
+func TestDoExecution_DupeElim_RefVictimSkipped(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	origPath := filepath.Join(dir, "original.bin")
-	dupPath := filepath.Join(dir, "duplicate.bin")
-	data := make([]byte, 1000)
-	rand.Read(data)
-	os.WriteFile(origPath, data, 0644)
-	os.WriteFile(dupPath, data, 0644)
 
-	exec := action.New(action.Options{Action: config.ActionHardlink})
-	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
-		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
-		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
-		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
+	dir := t.TempDir()
+	data := []byte("reference content")
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
+
+	exec := action.New(action.Options{Action: config.ActionDelete})
+	refVictim := fileInfo(t, victim)
+	refVictim.IsRef = true
+
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, keeper), refVictim},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Delete ref: %v", err)
 	}
-	if result != action.ResultHardlinked {
-		t.Errorf("expected ResultHardlinked, got %d", result)
+	if out.Result != action.ResultSkippedRef {
+		t.Fatalf("Result = %v, want ResultSkippedRef", out.Result)
 	}
-
-	origInfo, _ := os.Stat(origPath)
-	dupInfo, _ := os.Stat(dupPath)
-	if !os.SameFile(origInfo, dupInfo) {
-		t.Error("expected files to be hardlinked (same file)")
-	}
-
-	dupData, _ := os.ReadFile(dupPath)
-	if !bytes.Equal(data, dupData) {
-		t.Error("expected content to be preserved after hardlink")
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Fatalf("reference victim must be preserved: %v", statErr)
 	}
 }
 
-func TestReport_NoAction(t *testing.T) {
+func TestDoExecution_DupeElim_SkipHardlinked(t *testing.T) {
 	t.Parallel()
+
 	dir := t.TempDir()
-	origPath := filepath.Join(dir, "original.bin")
-	dupPath := filepath.Join(dir, "duplicate.bin")
-	data := []byte("same content")
-	os.WriteFile(origPath, data, 0644)
-	os.WriteFile(dupPath, data, 0644)
+	data := []byte("hardlinked pair")
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
+
+	kp := fileInfo(t, keeper)
+	vp := fileInfo(t, victim)
+	kp.Dev, kp.Inode, kp.NumLinks = 1, 42, 2
+	vp.Dev, vp.Inode, vp.NumLinks = 1, 42, 2
+
+	exec := action.New(action.Options{Action: config.ActionReport, SkipHardlinked: true})
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{kp, vp},
+	})
+	if err != nil {
+		t.Fatalf("skip hardlinked: %v", err)
+	}
+	if out.Result != action.ResultAlreadyHardlinked {
+		t.Fatalf("Result = %v, want ResultAlreadyHardlinked", out.Result)
+	}
+}
+
+func TestDoExecution_DupeElim_Report(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	data := []byte("report me")
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
 
 	exec := action.New(action.Options{Action: config.ActionReport})
-	result, _, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
-		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
-		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
-		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, keeper), fileInfo(t, victim)},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("report: %v", err)
 	}
-	if result != action.ResultVerifiedDuplicate {
-		t.Errorf("expected ResultVerifiedDuplicate, got %d", result)
-	}
-	if _, statErr := os.Stat(dupPath); statErr != nil {
-		t.Error("expected duplicate file to still exist in report mode")
+	if out.Result != action.ResultVerifiedDuplicate {
+		t.Fatalf("Result = %v, want ResultVerifiedDuplicate", out.Result)
 	}
 }
 
-func TestCoW_Unsupported(t *testing.T) {
+func TestDoExecution_DupeElim_Hardlink(t *testing.T) {
 	t.Parallel()
+
 	dir := t.TempDir()
-	origPath := filepath.Join(dir, "original.bin")
-	dupPath := filepath.Join(dir, "duplicate.bin")
-	data := []byte("test data for cow")
-	os.WriteFile(origPath, data, 0644)
-	os.WriteFile(dupPath, data, 0644)
+	data := []byte("hardlink me")
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
+
+	exec := action.New(action.Options{Action: config.ActionHardlink})
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, keeper), fileInfo(t, victim)},
+	})
+	if err != nil {
+		t.Fatalf("hardlink: %v", err)
+	}
+	if out.Result != action.ResultHardlinked {
+		t.Fatalf("Result = %v, want ResultHardlinked", out.Result)
+	}
+
+	ki, err := os.Stat(keeper)
+	if err != nil {
+		t.Fatalf("stat keeper: %v", err)
+	}
+	vi, err := os.Stat(victim)
+	if err != nil {
+		t.Fatalf("stat victim: %v", err)
+	}
+	if !os.SameFile(ki, vi) {
+		t.Fatal("victim is not hardlinked to the keeper")
+	}
+}
+
+func TestDoExecution_DupeElim_ReadOnly(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	data := []byte("readonly victim")
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
+
+	if err := os.Chmod(victim, 0o444); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	exec := action.New(action.Options{Action: config.ActionDelete})
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, keeper), fileInfo(t, victim)},
+	})
+	if err != nil {
+		t.Fatalf("readonly delete: %v", err)
+	}
+	if out.Result != action.ResultSkippedRO {
+		t.Fatalf("Result = %v, want ResultSkippedRO", out.Result)
+	}
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Fatalf("read-only victim must be preserved: %v", statErr)
+	}
+
+	// With IncludeReadonly the delete must succeed.
+	exec = action.New(action.Options{Action: config.ActionDelete, IncludeReadonly: true})
+	out, err = exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, keeper), fileInfo(t, victim)},
+	})
+	if err != nil {
+		t.Fatalf("forced readonly delete: %v", err)
+	}
+	if out.Result != action.ResultDeleted {
+		t.Fatalf("Result = %v, want ResultDeleted", out.Result)
+	}
+}
+
+func TestDoExecution_CoWClone(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	data := bytes.Repeat([]byte("cow"), 8*1024)
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
 
 	exec := action.New(action.Options{Action: config.ActionCoWClone})
-	_, _, _, err := exec.VerifyChunked(context.Background(), dupe.Execution{
-		Key:       dupe.GroupKey{Signature: 1, Size: int64(len(data))},
-		Candidate: dupe.FileInfo{Path: dupPath, Size: int64(len(data))},
-		Original:  dupe.FileInfo{Path: origPath, Size: int64(len(data))},
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, keeper), fileInfo(t, victim)},
 	})
-	if err == nil {
-		t.Error("expected CoW to return error (not implemented)")
+	if err != nil {
+		if errors.Is(err, action.ErrCoWNotSupported) {
+			t.Skipf("CoW not supported on this filesystem: %v", err)
+		}
+		t.Fatalf("CoW clone: %v", err)
+	}
+	if out.Result != action.ResultCoWCloned {
+		t.Fatalf("Result = %v, want ResultCoWCloned", out.Result)
+	}
+
+	got, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatalf("read victim: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("cloned victim content differs")
+	}
+
+	ki, _ := os.Stat(keeper)
+	vi, _ := os.Stat(victim)
+	if os.SameFile(ki, vi) {
+		t.Fatal("CoW clone must be a distinct inode, not a hardlink")
 	}
 }

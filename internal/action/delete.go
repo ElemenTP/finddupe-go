@@ -6,26 +6,28 @@ import (
 	"finddupe/internal/dupe"
 )
 
-// deleteFile removes the duplicate file.
-func (e *Executor) deleteFile(group dupe.Execution) (Result, error) {
+// deleteFile removes the duplicate (victim) file, keeping Files[0].
+func (e *Executor) deleteFile(ex dupe.Execution) (Result, error) {
+	victimPath := ex.Files[1].Path
+
 	// Check if the file is read-only.
-	if isReadOnly(group.Files[0].Path) {
+	if isReadOnly(victimPath) {
 		if !e.opts.IncludeReadonly {
 			return ResultSkippedRO, nil
 		}
 		// Make writable before deleting.
 		// Only add user-write permission (mode | 0200) rather than 0666 to
 		// avoid a TOCTOU window where the file is temporarily world-writable.
-		info, statErr := os.Stat(group.Files[0].Path)
+		info, statErr := os.Stat(victimPath)
 		if statErr != nil {
 			return ResultError, statErr
 		}
-		if chmodErr := os.Chmod(group.Files[0].Path, info.Mode()|0200); chmodErr != nil {
+		if chmodErr := os.Chmod(victimPath, info.Mode()|0200); chmodErr != nil {
 			return ResultError, chmodErr
 		}
 	}
 
-	if err := os.Remove(group.Files[0].Path); err != nil {
+	if err := os.Remove(victimPath); err != nil {
 		return ResultError, err
 	}
 

@@ -1,8 +1,7 @@
 package cmd
 
 import (
-	"fmt"
-
+	"errors"
 	"finddupe/internal/config"
 	"finddupe/internal/pipeline"
 
@@ -29,7 +28,6 @@ var dedupeFlags struct {
 	delete         bool
 	hardlink       bool
 	cow            bool
-	sigs           bool
 	verbose        bool
 	zero           bool
 	noProgress     bool
@@ -48,8 +46,6 @@ func init() {
 		"Replace duplicates with hardlinks to the original")
 	dedupeCmd.Flags().BoolVarP(&dedupeFlags.cow, "cow", "c", false,
 		"Replace duplicates with CoW (Copy-on-Write) clones")
-	dedupeCmd.Flags().BoolVarP(&dedupeFlags.sigs, "sigs", "s", false,
-		"Print file signatures only (no actions taken)")
 	dedupeCmd.Flags().BoolVarP(&dedupeFlags.verbose, "verbose", "v", false,
 		"Verbose output")
 	dedupeCmd.Flags().BoolVarP(&dedupeFlags.zero, "zero", "z", false,
@@ -81,7 +77,6 @@ func runDedupe(cmd *cobra.Command, args []string) error {
 		RefPaths:        dedupeFlags.refPaths,
 		Threads:         dedupeFlags.threads,
 		Verbose:         dedupeFlags.verbose,
-		PrintSigs:       dedupeFlags.sigs,
 		ShowProgress:    !dedupeFlags.noProgress,
 		FollowSymlinks:  dedupeFlags.followSymlinks,
 		IncludeZeroLen:  dedupeFlags.zero,
@@ -109,10 +104,10 @@ func validateDedupeFlags() (config.Action, error) {
 	}
 
 	if count == 0 {
-		return config.ActionReport, fmt.Errorf("no action specified: use --delete, --hardlink, or --cow")
+		return config.ActionReport, errors.New("no action specified: use --delete, --hardlink, or --cow")
 	}
 	if count > 1 {
-		return config.ActionReport, fmt.Errorf("only one action flag allowed: --delete, --hardlink, or --cow")
+		return config.ActionReport, errors.New("only one action flag allowed: --delete, --hardlink, or --cow")
 	}
 
 	return action, nil

@@ -25,7 +25,12 @@ type FileInfo struct {
 	// Used with HashState to resume incremental hashing.
 	HashOffset int64
 
-	// Inode is the filesystem object identifier (inode on Unix, file index on Windows).
+	// Dev is the filesystem/volume identifier (st_dev on Unix, volume serial
+	// number on Windows). Together with Inode it identifies a physical file.
+	Dev uint64
+
+	// Inode is the filesystem object identifier (inode on Unix, file index
+	// on Windows). Only unique in combination with Dev.
 	Inode uint64
 
 	// NumLinks is the number of hardlinks to this file (0 if unavailable).
@@ -35,28 +40,59 @@ type FileInfo struct {
 	IsRef bool
 }
 
+// InodeKey identifies a physical file across the whole scan.
+// Inode numbers are only unique per device, so Dev must be part of the key.
+type InodeKey struct {
+	Dev   uint64
+	Inode uint64
+}
+
 // GroupKey is the composite key for grouping files by weak checksum and size.
 type GroupKey struct {
 	Signature uint64
 	Size      int64
 }
-type ExecutionType int
+
+// ExecutionType identifies the kind of work an Execution carries.
+type ExecutionType uint8
 
 const (
+	// HashCalc computes the full SHA-256 of Files[0].
 	HashCalc ExecutionType = iota
+	// HashComp compares Files[0] and Files[1] in chunks with early-stop.
 	HashComp
+	// DupeElim eliminates Files[1:] keeping Files[0] as the original.
 	DupeElim
+	// CoWDetect reports whether the identical Files share physical extents.
+	CoWDetect
 )
 
-// Execution represents specific opeartion for executor to execute.
-// SHA-256 calculation, comparison, and dupe file elimination.
+// String implements [fmt.Stringer] for logging and tests.
+func (t ExecutionType) String() string {
+	switch t {
+	case HashCalc:
+		return "HashCalc"
+	case HashComp:
+		return "HashComp"
+	case DupeElim:
+		return "DupeElim"
+	case CoWDetect:
+		return "CoWDetect"
+	default:
+		return "Unknown"
+	}
+}
+
+// Execution represents a concrete unit of work for the executor:
+// a hash computation, a chunked comparison, or a duplicate elimination.
 type Execution struct {
-	// Key is the composite (signature, size) key that matched.
+	// Key is the composite (signature, size) key the files belong to.
 	Key GroupKey
 
-	// Type of this exection.
+	// Type is the kind of work to perform.
 	Type ExecutionType
 
-	// List of files to execute on.
+	// Files are the files this execution operates on.
+	// For DupeElim, Files[0] is the keeper and Files[1:] are the victims.
 	Files []FileInfo
 }
