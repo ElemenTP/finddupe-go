@@ -131,6 +131,7 @@ dedupe mode (exactly one action is required):
 | `-c, --cow` | Create CoW clones to eliminate duplicates (conflicts with `-d` and `-H`) |
 | `-r, --rdonly` | Also operate on read-only files (skipped by default) |
 | `-C, --prefer-compressed` | Keep a compressed member as the CoW clone source (`--cow` only) |
+| `-i, --interactive` | Ask which file to keep for every identical-content group (needs a terminal) |
 | `-v, --verbose` | Verbose output |
 | `-z, --zero` | Include zero length files |
 | `-p, --no-progress` | Hide progress indicator |

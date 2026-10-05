@@ -54,6 +54,9 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDetector_CustomKeeperPolicy` | `WithKeeperPolicy` replaces the built-in order |
 | `TestDetector_CompressionPreference` | `WithCompressionPreference` keeps the compressed member ahead of the path order |
 | `TestDetector_CompressionPreferenceIsNotProbedPerComparison` | The probe runs once per member, not once per comparison |
+| `TestDetector_KeeperChooser` | The chooser decides the keeper; declining (or naming a non-member) leaves the group alone |
+| `TestDetector_KeeperChooserDeclines` | A chooser that refuses every group produces no eliminations |
+| `TestDetector_KeeperChooserCoWDetect` | The chosen keeper leads the CoW group, so it is the clone source |
 | `TestDetector_FinalBatchesAreBounded` | A large group is emitted over several bounded `NextFinal` calls |
 | `TestDetector_PartialProgressKeepsLargerOffset` | The most advanced partial offset wins |
 | `TestDetector_CRCCollisionSeparatesBuckets` | Different sizes stay separate groups |
@@ -193,7 +196,13 @@ hardware by the CoW probe scripts.
 |------|-------------|
 | `TestIsTerminal` | A regular file is not a terminal, so redirected output never gets escape sequences |
 
-### `internal/pipeline` (6 tests)
+### `internal/pipeline` (12 tests)
+
+`interactive_test.go` covers the prompt loop: keeping a member by number, `a`
+applying the default choice to every later group without asking again, `s` skipping
+one group, `q` stopping, the three-attempt bound on unusable answers, and end of
+input. `progress.IsTerminal` is a real `isatty` (termios ioctl / GetConsoleMode),
+so `/dev/null` is no longer mistaken for a terminal.
 
 | Test | Description |
 |------|-------------|
@@ -242,6 +251,16 @@ Hardlink creation, content preservation, same-inode verification, read-only hand
 validation test (`--prefer-compressed` without `--cow` fails); producing a mixed
 compressed/uncompressed group needs a filesystem that compresses, so it is not
 part of the portable system suite.
+
+### Interactive Keeper (1 test)
+
+`TestDedupe_InteractiveNeedsTerminal` — `--interactive` without a terminal on stdin
+fails with a clear error instead of leaving every group untouched. The prompt
+behaviour itself is covered by the pipeline unit tests (`interactive_test.go`):
+keeping by number, `a` applying the default to every later group, `s` skipping one
+group, `q` stopping, the retry bound for unusable answers, and end of input. The
+full flow was exercised on a real pty during development (answers `2`, `a`, `s`,
+`q`, garbage) and behaved as documented.
 
 ### Keeper Determinism (1 test)
 

@@ -442,6 +442,95 @@ func TestDetector_CompressionPreferenceIsNotProbedPerComparison(t *testing.T) {
 	}
 }
 
+// fixedChooser keeps a named path when it is a member of the group.
+type fixedChooser struct {
+	keep string
+}
+
+func (c fixedChooser) Choose(members []dupe.FileInfo) (dupe.FileInfo, bool) {
+	for _, member := range members {
+		if member.Path == c.keep {
+			return member, true
+		}
+	}
+	return dupe.FileInfo{}, false
+}
+
+// TestDetector_KeeperChooser verifies that the chooser decides the keeper instead
+// of the policy, that declining a group leaves it alone, and that an answer which
+// is not one of the members is refused.
+func TestDetector_KeeperChooser(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats(), dupe.WithKeeperChooser(fixedChooser{keep: "/c"}))
+	for _, path := range []string{"/a", "/b", "/c"} {
+		d.Insert(fiSha(path, 100, 5))
+	}
+
+	chosen := finalAll(t, d)
+	victims, keepers := victimsOf(chosen)
+	if len(victims) != 2 || !keepers["/c"] {
+		t.Fatalf("victims=%v keepers=%v, want /c kept", victims, keepers)
+	}
+	if victims[0] == "/c" || victims[1] == "/c" {
+		t.Fatalf("the chosen keeper was eliminated: %v", victims)
+	}
+
+	// Declining leaves the group untouched.
+	declined := dupe.NewDetector(dupe.NewStats(), dupe.WithKeeperChooser(fixedChooser{keep: "/not-there"}))
+	declined.Insert(fiSha("/a", 100, 5))
+	declined.Insert(fiSha("/b", 100, 5))
+	if declinedExecs := finalAll(t, declined); len(declinedExecs) != 0 {
+		t.Fatalf("a declined group produced %v, want nothing", execTypes(declinedExecs))
+	}
+}
+
+// declineChooser refuses every group.
+type declineChooser struct{}
+
+func (declineChooser) Choose([]dupe.FileInfo) (dupe.FileInfo, bool) {
+	return dupe.FileInfo{}, false
+}
+
+// TestDetector_KeeperChooserDeclines verifies the explicit "leave it alone" answer.
+func TestDetector_KeeperChooserDeclines(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats(), dupe.WithKeeperChooser(declineChooser{}))
+	d.Insert(fiSha("/a", 100, 5))
+	d.Insert(fiSha("/b", 100, 5))
+
+	if execs := finalAll(t, d); len(execs) != 0 {
+		t.Fatalf("declined group produced %v, want nothing", execTypes(execs))
+	}
+}
+
+// TestDetector_KeeperChooserCoWDetect verifies that the CoW group is handed over
+// with the chosen keeper first, which is the clone source.
+func TestDetector_KeeperChooserCoWDetect(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(
+		dupe.NewStats(),
+		dupe.WithCoWDetect(),
+		dupe.WithKeeperChooser(fixedChooser{keep: "/c"}),
+	)
+	for _, path := range []string{"/a", "/b", "/c"} {
+		d.Insert(fiSha(path, 100, 5))
+	}
+
+	execs := finalAll(t, d)
+	if len(execs) != 1 || execs[0].Type != dupe.CoWDetect {
+		t.Fatalf("final work = %v, want one CoWDetect", execTypes(execs))
+	}
+	if got := execs[0].Files[0].Path; got != "/c" {
+		t.Fatalf("clone source = %q, want the chosen /c", got)
+	}
+	if len(execs[0].Files) != 3 {
+		t.Fatalf("CoWDetect carries %d members, want 3", len(execs[0].Files))
+	}
+}
+
 // TestDetector_FinalBatchesAreBounded verifies that a large group is emitted in
 // bounded batches instead of materializing every elimination task at once.
 func TestDetector_FinalBatchesAreBounded(t *testing.T) {

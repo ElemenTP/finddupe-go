@@ -1592,3 +1592,22 @@ func TestDedupe_PreferCompressedRequiresCoW(t *testing.T) {
 		t.Fatalf("unexpected error: %s", stderr)
 	}
 }
+
+// TestDedupe_InteractiveNeedsTerminal verifies that the interactive keeper mode
+// refuses to run without a terminal: a prompt that nobody can answer would leave
+// every group untouched while the run appears to succeed.
+func TestDedupe_InteractiveNeedsTerminal(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	makeFile(t, dir, "a.bin", "interactive test")
+	makeFile(t, dir, "b.bin", "interactive test")
+
+	_, stderr, code := run(t, "dedupe", "--delete", "--interactive", dir)
+	if code == 0 {
+		t.Fatal("expected --interactive without a terminal to fail")
+	}
+	if !strings.Contains(stderr, "terminal") {
+		t.Fatalf("unexpected error: %s", stderr)
+	}
+}

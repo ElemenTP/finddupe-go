@@ -101,6 +101,7 @@ finddupe-go/
 func NewDetector(stats *Stats, opts ...Option) *Detector
 func WithCoWDetect() Option
 func WithKeeperPolicy(policy KeeperPolicy) Option
+func WithKeeperChooser(chooser KeeperChooser) Option
 
 func (d *Detector) Insert(fi FileInfo) []Execution
 func (d *Detector) OnHashDone(key GroupKey, fi FileInfo, incomplete bool)
@@ -121,6 +122,7 @@ type DefaultKeeperPolicy struct{}
 - `OnHashDone` / `OnCompareDone` — feed executor outcomes back in. `incomplete` marks an attempt that reached no verdict (I/O error or a changed file), so a failed comparison is never mistaken for "the files differ".
 - `NextFinal` — end-of-scan work, at most `limit` executions per call, plus whether the detector has nothing left. It completes the hashes an early-stopped comparison left behind, then decides each content bucket with the keeper policy. The caller must have nothing in flight and must call it again until it reports completion.
 - `KeeperPolicy` — orders the members of one content bucket; the first is kept. `DefaultKeeperPolicy` prefers references, then more hardlinks, then the smallest path.
+- `KeeperChooser` — picks the keeper of one content bucket instead of the policy (`Choose(members) (keeper, ok)`); `dedupe --interactive` implements it by asking the user, and declining (or naming a non-member) leaves the bucket alone.
 - `InsertInode` / `InodeGroups` — `(Dev, Inode)` hardlink index used by `find --listlink`.
 
 **Dependencies**: None (stdlib only)

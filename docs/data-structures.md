@@ -191,6 +191,9 @@ type Detector struct {
     // policy orders the members of a content bucket; the first is kept.
     policy KeeperPolicy
 
+    // chooser, when set, decides the keeper instead of the policy.
+    chooser KeeperChooser
+
     // finalKeys / finalIdx walk the groups once the scan is over.
     finalKeys []GroupKey
     finalIdx  int
@@ -207,6 +210,7 @@ type Detector struct {
 func NewDetector(stats *Stats, opts ...Option) *Detector
 func WithCoWDetect() Option
 func WithKeeperPolicy(policy KeeperPolicy) Option
+func WithKeeperChooser(chooser KeeperChooser) Option
 
 func (d *Detector) Insert(fi FileInfo) []Execution
 func (d *Detector) OnHashDone(key GroupKey, fi FileInfo, incomplete bool)

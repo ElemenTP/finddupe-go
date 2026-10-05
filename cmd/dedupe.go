@@ -46,6 +46,7 @@ var dedupeFlags struct {
 	followSymlinks   bool
 	rdonly           bool
 	preferCompressed bool
+	interactive      bool
 	threads          int
 	refPaths         []string
 }
@@ -71,6 +72,8 @@ func init() {
 		"Also operate on read-only files (skipped by default on every platform)")
 	dedupeCmd.Flags().BoolVarP(&dedupeFlags.preferCompressed, "prefer-compressed", "C", false,
 		"Keep a compressed member as the CoW clone source (--cow only)")
+	dedupeCmd.Flags().BoolVarP(&dedupeFlags.interactive, "interactive", "i", false,
+		"Ask which file to keep for every identical-content group (needs a terminal)")
 	dedupeCmd.Flags().IntVarP(&dedupeFlags.threads, "threads", "t", 0,
 		"Number of scanner workers (default: 2 x CPUs, max 1024)")
 	dedupeCmd.Flags().StringArrayVar(&dedupeFlags.refPaths, "ref", nil,
@@ -96,6 +99,7 @@ func runDedupe(cmd *cobra.Command, args []string) error {
 		IncludeZeroLen:   dedupeFlags.zero,
 		IncludeReadonly:  dedupeFlags.rdonly,
 		PreferCompressed: dedupeFlags.preferCompressed,
+		Interactive:      dedupeFlags.interactive,
 	}
 
 	return pipeline.Run(cmd.Context(), cfg)

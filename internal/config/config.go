@@ -63,6 +63,10 @@ type Config struct {
 	// applies to --cow.
 	PreferCompressed bool
 
+	// Interactive asks the user which file to keep for every identical-content
+	// group instead of choosing automatically. It needs a terminal on stdin.
+	Interactive bool
+
 	// SkipHardlinked skips already-hardlinked duplicate pairs in find mode (--hardlink).
 	// When set, files that share the same inode (already hardlinked) are not reported
 	// or counted as duplicates. Only content-duplicates with different inodes are shown.

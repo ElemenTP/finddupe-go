@@ -91,7 +91,16 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	pool := worker.New(threads)
 	defer pool.Wait()
 
-	detector := dupe.NewDetector(stats, detectorOptions(cfg)...)
+	detectorOpts := detectorOptions(cfg)
+	if cfg.Interactive {
+		if !progress.IsTerminal(os.Stdin) {
+			return errInteractiveNeedsTerminal
+		}
+		detectorOpts = append(detectorOpts, dupe.WithKeeperChooser(
+			newInteractiveChooser(cfg.Action, report, os.Stdin),
+		))
+	}
+	detector := dupe.NewDetector(stats, detectorOpts...)
 	executor := action.New(action.Options{
 		Action:          cfg.Action,
 		IncludeReadonly: cfg.IncludeReadonly,

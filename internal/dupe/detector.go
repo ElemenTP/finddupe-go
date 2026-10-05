@@ -57,6 +57,10 @@ type Detector struct {
 	// disables the preference.
 	compressionProbe func(FileInfo) bool
 
+	// chooser, when set, picks the keeper of a content group instead of the
+	// policy — the interactive mode. See [KeeperChooser].
+	chooser KeeperChooser
+
 	// finalKeys is the materialized, ordered list of groups NextFinal walks;
 	// finalIdx is the group it is working on.
 	finalKeys []GroupKey
@@ -112,6 +116,20 @@ type KeeperPolicy interface {
 	Less(a, b FileInfo) bool
 }
 
+// KeeperChooser picks the keeper of one content group, replacing the policy for
+// that group. It is how an interactive mode asks the user: the detector has just
+// finished hashing, every member of the group is known, and nothing is in flight,
+// so the choice can be made with full information and applied to the whole group.
+type KeeperChooser interface {
+	// Choose returns the member of members to keep. ok=false leaves the group
+	// alone. The returned FileInfo must be one of the members (matched by path);
+	// anything else skips the group rather than acting on an unknown file.
+	//
+	// Choose is called from NextFinal with the detector's lock held and must not
+	// call back into the Detector.
+	Choose(members []FileInfo) (keeper FileInfo, ok bool)
+}
+
 // DefaultKeeperPolicy is the built-in keeper order:
 //  1. reference files (--ref) first, so the original a user pointed at is kept;
 //  2. then the file with the most hardlinks, because deleting or replacing a file
@@ -150,6 +168,12 @@ func WithKeeperPolicy(policy KeeperPolicy) Option {
 // member of a content group.
 func WithCompressionPreference(probe func(FileInfo) bool) Option {
 	return func(d *Detector) { d.compressionProbe = probe }
+}
+
+// WithKeeperChooser replaces the keeper policy: the chooser decides the keeper of
+// every content group it is asked about, and may decline a group.
+func WithKeeperChooser(chooser KeeperChooser) Option {
+	return func(d *Detector) { d.chooser = chooser }
 }
 
 // zeroSHA is the sentinel key for files whose SHA-256 has not been computed.
@@ -379,6 +403,40 @@ func (d *Detector) orderMembersLocked(members []FileInfo) {
 	})
 }
 
+// chooseKeeperLocked returns the member to keep: the chooser's answer when one is
+// configured, the policy's first member otherwise. An answer that is not one of
+// the members skips the group — acting on an unknown file would eliminate the
+// wrong duplicates.
+func (d *Detector) chooseKeeperLocked(members []FileInfo) (FileInfo, bool) {
+	if d.chooser == nil {
+		return members[0], true
+	}
+
+	keeper, ok := d.chooser.Choose(members)
+	if !ok {
+		return FileInfo{}, false
+	}
+	for _, member := range members {
+		if member.Path == keeper.Path {
+			return member, true
+		}
+	}
+	return FileInfo{}, false
+}
+
+// keeperFirst returns the members with keeper moved to the front, keeping the
+// relative order of the rest.
+func keeperFirst(members []FileInfo, keeper FileInfo) []FileInfo {
+	out := make([]FileInfo, 0, len(members))
+	out = append(out, keeper)
+	for _, member := range members {
+		if member.Path != keeper.Path {
+			out = append(out, member)
+		}
+	}
+	return out
+}
+
 // decideLocked emits the end-of-scan work of one group in bounded batches. done
 // reports that every task of the group has been emitted.
 //
@@ -437,13 +495,22 @@ func (d *Detector) buildPlanLocked(st *keyState) []Execution {
 			continue
 		}
 
-		if d.coWDetect {
-			plan = append(plan, Execution{Type: CoWDetect, Files: members})
+		keeper, keep := d.chooseKeeperLocked(members)
+		if !keep {
 			continue
 		}
 
-		keeper := members[0]
-		for _, victim := range members[1:] {
+		if d.coWDetect {
+			// The action layer needs the whole group; the keeper leads it so the
+			// report and the clone source agree on which member is the original.
+			plan = append(plan, Execution{Type: CoWDetect, Files: keeperFirst(members, keeper)})
+			continue
+		}
+
+		for _, victim := range members {
+			if victim.Path == keeper.Path {
+				continue
+			}
 			plan = append(plan, Execution{Type: DupeElim, Files: []FileInfo{keeper, victim}})
 		}
 	}

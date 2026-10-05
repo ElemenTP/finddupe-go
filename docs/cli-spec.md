@@ -176,11 +176,34 @@ Exactly one action flag must be specified for `dedupe` mode:
 | `--threads` | `-t` | int | `0` (→ `runtime.NumCPU() × 2`, capped at 1024) | Number of scanner workers |
 | `--rdonly` | `-r` | bool | false | Also operate on read-only files (skipped by default on every platform) |
 | `--prefer-compressed` | `-C` | bool | false | `--cow` only: keep a compressed member as the clone source (see below) |
+| `--interactive` | `-i` | bool | false | Ask which file to keep for every identical-content group (needs a terminal on stdin) |
 | `--ref` | — | string (repeatable) | — | Consume the following path/pattern as a reference (compare against, but never act on) |
+
+**Interactive keeper (`-i, --interactive`)**
+
+Duplicates are decided after the whole scan, when every member of a content group
+is known, so `-i` simply asks instead of applying the order above:
+
+- the group is listed with size, modification time, hardlink count and compression
+  state (and whether the file is a reference);
+- a number keeps that file and eliminates the others;
+- `a` keeps the default (policy) choice for this and every later group, so a scan
+  with thousands of groups does not have to be answered one by one;
+- `s` leaves this group alone; `q` leaves this group and every later group alone;
+- an unusable answer is re-asked at most three times, then the group is left alone,
+  and end of input stops the questions.
+
+The listing goes to stdout with the rest of the report; the prompt goes to stderr so
+the stdout stream stays parseable. A terminal on stdin is required — without one the
+run fails with `--interactive needs a terminal on stdin to ask about each group`
+rather than pretending every group was handled. A run driven by answers is, by
+definition, not reproducible; the default keeper order is used for everything the
+user does not answer.
 
 **Keeper order** (which of several identical files is kept): reference files first,
 then `--prefer-compressed` (when given), then the file with more hardlinks, then the
-smallest path. A CoW clone inherits the **source's** extent layout, so keeping a
+smallest path. With `--interactive` the choice is asked per group instead (see
+below). A CoW clone inherits the **source's** extent layout, so keeping a
 compressed member keeps the whole group compressed, while keeping an uncompressed
 member spreads its uncompressed layout to every victim. `--hardlink` and `--delete`
 do not change the data layout, which is why the flag is limited to `--cow`.
