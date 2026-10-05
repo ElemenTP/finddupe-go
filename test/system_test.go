@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"finddupe/internal/fsprobe"
 )
 
 // finddupeBin is the path to the compiled finddupe binary.
@@ -1349,41 +1351,6 @@ func randomContent(t *testing.T) string {
 	return string(buf)
 }
 
-// repoTestDir creates a temp dir in the package working directory, which is
-// often on the developer's real btrfs/XFS/APFS volume when /tmp is tmpfs.
-func repoTestDir(t *testing.T) string {
-	t.Helper()
-	//nolint:usetesting // the default temp dir may be on a filesystem without CoW
-	dir, err := os.MkdirTemp(".", "finddupe-fs-test-")
-	if err != nil {
-		return ""
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	return dir
-}
-
-// fsTestDir returns a temporary directory whose filesystem passes probe, or
-// skips the test. It first tries the default temp dir (t.TempDir(), i.e.
-// $TMPDIR) and then a directory inside the package working directory, which is
-// often on the developer's real btrfs/XFS/APFS volume when /tmp is tmpfs.
-func fsTestDir(t *testing.T, probe func(dir string) bool) string {
-	t.Helper()
-
-	candidates := []string{t.TempDir()}
-	if dir := repoTestDir(t); dir != "" {
-		candidates = append(candidates, dir)
-	}
-
-	for _, dir := range candidates {
-		if probe(dir) {
-			return dir
-		}
-	}
-
-	t.Skip("feature is not supported by the default temp dir or the repository filesystem")
-	return ""
-}
-
 // extentsProbe reports whether find --cow detects a hardlink pair sharing
 // physical extents inside dir.
 func extentsProbe(t *testing.T, dir string) bool {
@@ -1432,7 +1399,7 @@ func cloneProbe(t *testing.T, dir string) bool {
 func TestDedupeCoW_CreateAndDetect(t *testing.T) {
 	t.Parallel()
 
-	dir := fsTestDir(t, func(d string) bool { return cloneProbe(t, d) })
+	dir := fsprobe.CapableDir(t, "CoW cloning", func(d string) bool { return cloneProbe(t, d) })
 	content := randomContent(t) // incompressible so extents stay physical
 	a := makeFile(t, dir, "a.bin", content)
 	b := makeFile(t, dir, "b.bin", content)
@@ -1482,7 +1449,7 @@ func TestDedupeCoW_CreateAndDetect(t *testing.T) {
 func TestFind_CoW_IndependentCopiesZeroShared(t *testing.T) {
 	t.Parallel()
 
-	dir := fsTestDir(t, func(d string) bool { return extentsProbe(t, d) })
+	dir := fsprobe.CapableDir(t, "extent queries", func(d string) bool { return extentsProbe(t, d) })
 	content := randomContent(t) // incompressible so extents stay physical
 	makeFile(t, dir, "a.bin", content)
 	makeFile(t, dir, "b.bin", content)

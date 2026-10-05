@@ -24,6 +24,7 @@ finddupe-go/
 │   ├── fileid/                # Dev/Inode/NumLinks from a stat result
 │   │   ├── fileid_unix.go     # Unix: read from the stat struct already in hand
 │   │   └── fileid_other.go    # Other platforms: no identity in os.FileInfo
+│   ├── fsprobe/               # Test helper: a temp dir whose filesystem supports a feature
 │   ├── log2phys/              # macOS: struct log2phys layout (shared with the probe)
 │   ├── checksum/              # File signature + identity computation
 │   │   ├── checksum.go        # Compute, ComputeFileInfo (returns Info), ComputeFromReader
@@ -111,8 +112,7 @@ func (d *Detector) OnCompareDone(key GroupKey, a, b FileInfo, incomplete bool)
 func (d *Detector) NextFinal(limit int) ([]Execution, bool)
 func (d *Detector) InsertInode(fi FileInfo)
 func (d *Detector) InodeGroups() [][]FileInfo
-func (d *Detector) Len() int
-func (d *Detector) Stats() *Stats
+func (d *Detector) InodeGroups() map[InodeKey][]FileInfo
 
 type KeeperPolicy interface {
     Less(a, b FileInfo) bool
@@ -175,7 +175,7 @@ type Info struct {
     ModTime   time.Time
 }
 
-func Compute(path string, size int64) (uint64, error)
+func ComputeFileInfo(path string, size int64) (Info, error)
 func ComputeFileInfo(path string, size int64) (Info, error)
 func ComputeFromReader(r io.Reader, size int64) (uint64, error)
 ```

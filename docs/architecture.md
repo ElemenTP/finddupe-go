@@ -205,7 +205,7 @@ Results + final summary printed to stdout                    │
   │ internal/       │ │ internal/    │ │ internal/  │ │ internal/    │
   │ fswalker        │ │ checksum     │ │ dupe       │ │ action       │
   │                 │ │              │ │            │ │              │
-  │ - Walk()        │ │ - Compute()  │ │ - Detector │ │ - Executor   │
+  │ - Walk()        │ │ - ComputeFI()│ │ - Detector │ │ - Executor   │
   │ - ** matcher    │ │ - ComputeFile│ │ - Execution│ │ - Outcome    │
   │ - fileid.From   │ │   Info()    │ │ - FileInfo │ │ - Delete     │
   │   (per OS)      │ │ - statFile│ │ - Stats    │ │ - Hardlink   │

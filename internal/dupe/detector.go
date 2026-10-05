@@ -179,12 +179,17 @@ func WithKeeperChooser(chooser KeeperChooser) Option {
 // zeroSHA is the sentinel key for files whose SHA-256 has not been computed.
 var zeroSHA [32]byte
 
-// minGroupSize is the smallest number of files that can be duplicates: one file
-// cannot have a duplicate. It is 2 because grouping needs two members, which is a
-// different question from how many files one comparison execution carries
-// (action.minFilesPerExecution) or the pipeline's compare threshold; the three
-// values are deliberately independent rather than one shared constant.
-const minGroupSize = 2
+// FilesPerExecution is the number of files one comparison or elimination execution
+// carries: a duplicate is decided between two files.
+//
+// The detector's group minimum is the same pair seen from the group's side, and the
+// pipeline's threshold checks the same arity, so all three derive from this one
+// value instead of three separate 2s.
+const FilesPerExecution = 2
+
+// MinGroupSize is the smallest number of files that can be duplicates: one file
+// cannot have a duplicate.
+const MinGroupSize = FilesPerExecution
 
 // maxFailedHashRetries is how often finalization re-schedules a file whose hash
 // did not complete. After that the file is left alone: a file whose content
@@ -250,7 +255,7 @@ func (d *Detector) Insert(fi FileInfo) []Execution {
 		return nil
 	}
 
-	if st.count == minGroupSize {
+	if st.count == MinGroupSize {
 		// Exactly two files, both unhashed: compare them directly with
 		// early-stop instead of hashing each one completely.
 		return []Execution{{Key: key, Type: HashComp, Files: st.pendingPairLocked()}}
@@ -302,7 +307,7 @@ func (d *Detector) OnCompareDone(key GroupKey, a, b FileInfo, incomplete bool) {
 	st.applyHashLocked(a)
 	st.applyHashLocked(b)
 
-	if !incomplete && st.count == minGroupSize && len(st.pending) == minGroupSize && len(st.buckets) == 0 {
+	if !incomplete && st.count == MinGroupSize && len(st.pending) == MinGroupSize && len(st.buckets) == 0 {
 		st.settled = true
 	}
 }
@@ -326,7 +331,7 @@ func (d *Detector) NextFinal(limit int) ([]Execution, bool) {
 	if d.finalKeys == nil {
 		d.finalKeys = make([]GroupKey, 0, len(d.groups))
 		for key, st := range d.groups {
-			if st.count >= minGroupSize {
+			if st.count >= MinGroupSize {
 				d.finalKeys = append(d.finalKeys, key)
 			}
 		}
@@ -486,7 +491,7 @@ func (d *Detector) buildPlanLocked(st *keyState) []Execution {
 	var plan []Execution
 	for _, sha := range shas {
 		files := st.buckets[sha]
-		if len(files) < minGroupSize {
+		if len(files) < MinGroupSize {
 			continue
 		}
 
@@ -495,7 +500,7 @@ func (d *Detector) buildPlanLocked(st *keyState) []Execution {
 		members := append([]FileInfo(nil), files...)
 		d.orderMembersLocked(members)
 		members = dedupeByInode(members)
-		if len(members) < minGroupSize {
+		if len(members) < MinGroupSize {
 			continue
 		}
 
@@ -557,11 +562,11 @@ func (st *keyState) applyHashLocked(fi FileInfo) {
 // pendingPairLocked returns the two unhashed files of a two-file group in a
 // deterministic order.
 func (st *keyState) pendingPairLocked() []FileInfo {
-	pair := make([]FileInfo, 0, minGroupSize)
+	pair := make([]FileInfo, 0, MinGroupSize)
 	for _, fi := range st.pending {
 		pair = append(pair, fi)
 	}
-	if len(pair) == minGroupSize && pair[0].Path > pair[1].Path {
+	if len(pair) == MinGroupSize && pair[0].Path > pair[1].Path {
 		pair[0], pair[1] = pair[1], pair[0]
 	}
 	return pair
@@ -625,13 +630,4 @@ func dedupeByInode(files []FileInfo) []FileInfo {
 		out = append(out, fi)
 	}
 	return out
-}
-
-// Len returns the number of unique GroupKeys stored. It is a diagnostic (used by
-// the detector tests): the pipeline never asks, because the detector's own counters
-// are the scan's statistics.
-func (d *Detector) Len() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return len(d.groups)
 }

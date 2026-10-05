@@ -45,13 +45,6 @@ const (
 	// kill before any work happened.
 	maxThreads = 1024
 
-	// minCompareFiles is the number of files a comparison/elimination execution needs.
-	// It is 2 because a comparison is between two files, which is a different
-	// question from the smallest duplicate group (dupe.minGroupSize) or the files one
-	// execution carries (action.minFilesPerExecution); the three are deliberately
-	// independent rather than one shared constant.
-	minCompareFiles = 2
-
 	// Byte units used when formatting sizes.
 	bytesPerKB = 1024
 	bytesPerMB = 1024 * 1024
@@ -608,7 +601,7 @@ func completeExecution(detector *dupe.Detector, out action.Outcome) {
 		}
 		detector.OnHashDone(out.Key, out.Files[0], out.Err != nil)
 	case dupe.HashComp:
-		if len(out.Files) < minCompareFiles {
+		if len(out.Files) < dupe.FilesPerExecution {
 			return
 		}
 		detector.OnCompareDone(out.Key, out.Files[0], out.Files[1], out.Err != nil)
@@ -669,7 +662,7 @@ func reportOutcome(
 func reportElimination(
 	ctx context.Context, out action.Outcome, stats *dupe.Stats, logger *slog.Logger, report *reportWriter,
 ) {
-	if len(out.Files) < minCompareFiles {
+	if len(out.Files) < dupe.FilesPerExecution {
 		return
 	}
 
@@ -746,7 +739,7 @@ func countsAsDuplicateStorage(result action.Result) bool {
 // of it is already shared with the rest of the group. The group is what should
 // end up sharing storage (CoW); the ratios show what still needs to be done.
 func reportCoW(out action.Outcome, stats *dupe.Stats, report *reportWriter) {
-	if len(out.Files) < minCompareFiles {
+	if len(out.Files) < dupe.FilesPerExecution {
 		return
 	}
 

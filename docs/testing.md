@@ -63,7 +63,8 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDetector_HardlinkedAliasesCollapse` | Aliases of one inode never eliminate each other, and the preferred path survives |
 | `TestDetector_CoWDetectMode` | One `CoWDetect` per content bucket, members in keeper order |
 | `TestDetector_InsertInodeGroups` | `InsertInode`/`InodeGroups` group by `(Dev, Inode)` |
-| `TestDetector_Empty` | Zero state: `Len()==0`, no inode groups, non-nil stats |
+| `TestDetector_Empty` | Zero state: no executions, no inode groups, non-nil stats |
+| `fsprobe.CapableDir` | Shared by the action, extent and system suites: tries the default temp dir, then the working directory, and skips the test when neither filesystem supports the feature (one copy instead of three) |
 | `TestDetector_SamePathInsertedTwice` | Inserting one path twice is ignored (overlapping patterns cannot self-eliminate) |
 
 ### `internal/action` (27 tests)

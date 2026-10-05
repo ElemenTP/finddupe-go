@@ -16,6 +16,8 @@ import (
 	"finddupe/internal/action"
 	"finddupe/internal/config"
 	"finddupe/internal/dupe"
+
+	"finddupe/internal/fsprobe"
 )
 
 var testKey = dupe.GroupKey{Signature: 7, Size: 0}
@@ -612,13 +614,21 @@ func randomBytes(t *testing.T) []byte {
 	return buf
 }
 
-// tryCoWClone reports whether a CoW clone succeeds inside dir.
-func tryCoWClone(t *testing.T, dir string) bool {
+// cowProbe reports whether a CoW clone succeeds inside dir. It exercises the action
+// layer itself, so the capability it reports is the one the tests below rely on.
+func cowProbe(t *testing.T, dir string) bool {
 	t.Helper()
 
+	//nolint:usetesting // the probe must live on the filesystem being tested
+	probe, mkErr := os.MkdirTemp(dir, "cowprobe-")
+	if mkErr != nil {
+		return false
+	}
+	defer os.RemoveAll(probe)
+
 	data := randomBytes(t)
-	a := filepath.Join(dir, "probe-a.bin")
-	b := filepath.Join(dir, "probe-b.bin")
+	a := filepath.Join(probe, "probe-a.bin")
+	b := filepath.Join(probe, "probe-b.bin")
 	if err := os.WriteFile(a, data, 0o644); err != nil {
 		return false
 	}
@@ -635,45 +645,13 @@ func tryCoWClone(t *testing.T, dir string) bool {
 	return err == nil && out.Result == action.ResultCoWCloned
 }
 
-// repoTestDir creates a temp dir in the package working directory, which is
-// often on the developer's real btrfs/XFS/APFS volume when /tmp is tmpfs.
-func repoTestDir(t *testing.T) string {
-	t.Helper()
-	//nolint:usetesting // the default temp dir may be on a filesystem without CoW
-	dir, err := os.MkdirTemp(".", "cow-fs-test-")
-	if err != nil {
-		return ""
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	return dir
-}
-
-// cloneCapableDir returns a temp directory where CoW cloning works, falling
-// back to the package working directory (often the developer's real
-// btrfs/XFS/APFS volume) when the default temp dir is tmpfs.
+// cloneCapableDir returns a temp directory where CoW cloning works, skipping the test
+// when neither the default temp dir (often tmpfs) nor the repository filesystem
+// supports it.
 func cloneCapableDir(t *testing.T) string {
 	t.Helper()
 
-	candidates := []string{t.TempDir()}
-	if dir := repoTestDir(t); dir != "" {
-		candidates = append(candidates, dir)
-	}
-
-	for _, dir := range candidates {
-		//nolint:usetesting // the probe must live on the chosen filesystem
-		probe, err := os.MkdirTemp(dir, "cowprobe-")
-		if err != nil {
-			continue
-		}
-		ok := tryCoWClone(t, probe)
-		_ = os.RemoveAll(probe)
-		if ok {
-			return dir
-		}
-	}
-
-	t.Skip("CoW cloning not supported by the default temp dir or the repository filesystem")
-	return ""
+	return fsprobe.CapableDir(t, "CoW cloning", func(dir string) bool { return cowProbe(t, dir) })
 }
 
 func TestDoExecution_CoWClone(t *testing.T) {

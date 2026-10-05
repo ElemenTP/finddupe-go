@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"finddupe/internal/extent"
+	"finddupe/internal/fsprobe"
 )
 
 // TestSharedWithGroupOverlap covers the physical-range arithmetic of the group
@@ -100,46 +101,30 @@ func queryOrSkip(t *testing.T, path string) []extent.Extent {
 	return extents
 }
 
-// repoTestDir creates a temp dir in the package working directory, which is
-// often on the developer's real btrfs/XFS/APFS volume when /tmp is tmpfs.
-func repoTestDir(t *testing.T) string {
+// extentProbe reports whether extent queries work on dir's filesystem by querying a
+// real file: the answer is what the tests below depend on, not the filesystem type.
+func extentProbe(t *testing.T, dir string, data []byte) bool {
 	t.Helper()
-	//nolint:usetesting // the default temp dir may be on a filesystem without CoW
-	dir, err := os.MkdirTemp(".", "extent-fs-test-")
-	if err != nil {
-		return ""
+
+	probe := filepath.Join(dir, "extent-probe.bin")
+	if err := os.WriteFile(probe, data, 0o644); err != nil {
+		return false
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	return dir
+	defer os.Remove(probe)
+
+	_, err := extent.Query(probe, int64(len(data)))
+	return err == nil
 }
 
-// extentCapableDir returns a temporary directory whose filesystem supports
-// extent queries, skipping the test when none is available. It first tries the
-// default temp dir (t.TempDir(), i.e. $TMPDIR, often tmpfs) and then a directory
-// inside the package working directory, which is often on the developer's real
-// btrfs/XFS/APFS volume.
+// extentCapableDir returns a temporary directory whose filesystem supports extent
+// queries, skipping the test when none is available (the default temp dir is often
+// tmpfs, which cannot answer them).
 func extentCapableDir(t *testing.T, probeData []byte) string {
 	t.Helper()
 
-	candidates := []string{t.TempDir()}
-	if dir := repoTestDir(t); dir != "" {
-		candidates = append(candidates, dir)
-	}
-
-	for _, dir := range candidates {
-		probe := filepath.Join(dir, "probe.bin")
-		if err := os.WriteFile(probe, probeData, 0o644); err != nil {
-			continue
-		}
-		_, err := extent.Query(probe, int64(len(probeData)))
-		_ = os.Remove(probe)
-		if err == nil {
-			return dir
-		}
-	}
-
-	t.Skip("extent queries unsupported by the default temp dir and the repository filesystem")
-	return ""
+	return fsprobe.CapableDir(t, "extent queries", func(dir string) bool {
+		return extentProbe(t, dir, probeData)
+	})
 }
 
 // TestQuery_SparseFileIsNotUnsupported verifies that a file with nothing

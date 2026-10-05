@@ -64,18 +64,6 @@ type Info struct {
 	ModTime time.Time
 }
 
-// Compute opens the file at path and returns its 64-bit composite checksum.
-// The signature is (crc << 32) | sum, where crc and sum are computed from
-// the first BytesToChecksum bytes, and fileSize is added to sum.
-//
-// Production reads a file's signature through [ComputeFileInfo], which returns the
-// identity and the modification time in the same pass; this wrapper exists for
-// tests and diagnostic tools that only want the number.
-func Compute(path string, size int64) (uint64, error) {
-	info, err := ComputeFileInfo(path, size)
-	return info.Signature, err
-}
-
 // ComputeFileInfo opens the file once and returns the checksum signature,
 // filesystem identity, hardlink count, and SHA-256 hash. On Windows, this uses
 // GetFileInformationByHandle on the already-open handle — avoiding a

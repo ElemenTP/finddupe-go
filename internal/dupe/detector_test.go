@@ -79,9 +79,8 @@ func TestDetector_FirstInsert(t *testing.T) {
 	if execs := d.Insert(fi("/a", 4096)); len(execs) != 0 {
 		t.Fatalf("first insert returned %v, want no executions", execTypes(execs))
 	}
-	if d.Len() != 1 {
-		t.Fatalf("Len() = %d, want 1", d.Len())
-	}
+	// The group the insert registered is observed through the stats and the
+	// executions it produces; there is no accessor for the detector's own map.
 	if stats.TotalFiles.Load() != 1 || stats.TotalBytes.Load() != 4096 {
 		t.Fatalf("stats = (%d files, %d bytes), want (1, 4096)",
 			stats.TotalFiles.Load(), stats.TotalBytes.Load())
@@ -696,9 +695,6 @@ func TestDetector_Empty(t *testing.T) {
 	t.Parallel()
 
 	d := dupe.NewDetector(dupe.NewStats())
-	if d.Len() != 0 {
-		t.Fatalf("Len() = %d, want 0", d.Len())
-	}
 	if execs, done := d.NextFinal(8); len(execs) != 0 || !done {
 		t.Fatalf("NextFinal = (%v, %v), want nothing and completion", execTypes(execs), done)
 	}
@@ -710,14 +706,17 @@ func TestDetector_Empty(t *testing.T) {
 func TestDetector_SamePathInsertedTwice(t *testing.T) {
 	t.Parallel()
 
-	d := dupe.NewDetector(dupe.NewStats())
+	stats := dupe.NewStats()
+	d := dupe.NewDetector(stats)
 	d.Insert(fiSha("/a", 100, 5))
 	d.Insert(fiSha("/a", 100, 5))
 
 	if execs := finalAll(t, d); len(execs) != 0 {
 		t.Fatalf("a path inserted twice produced %v, want no executions", execTypes(execs))
 	}
-	if d.Len() != 1 {
-		t.Fatalf("Len() = %d, want 1", d.Len())
+	// The second insert must be rejected before it is counted, otherwise the same
+	// file would be part of two decisions.
+	if stats.TotalFiles.Load() != 1 {
+		t.Fatalf("TotalFiles = %d after inserting one path twice, want 1", stats.TotalFiles.Load())
 	}
 }

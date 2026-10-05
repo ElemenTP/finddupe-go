@@ -155,7 +155,7 @@ func (c *keeperLayoutCache) put(fi dupe.FileInfo, extents []extent.Extent) {
 // FileShared is nil when extent information is unavailable for the whole group.
 func (e *Executor) detectCoW(ctx context.Context, ex dupe.Execution) (Outcome, error) {
 	out := Outcome{Kind: ex.Type, Key: ex.Key, Files: ex.Files}
-	if len(ex.Files) < minFilesPerExecution {
+	if len(ex.Files) < dupe.FilesPerExecution {
 		return out, nil
 	}
 

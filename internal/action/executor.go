@@ -26,13 +26,6 @@ const (
 
 	// chunkSizeMediumLimit is the largest file that uses chunkSizeSmall.
 	chunkSizeMediumLimit = 16 * 1024 * 1024
-
-	// minFilesPerExecution is the number of files a comparison or elimination
-	// execution requires. It is 2 because an execution compares or eliminates a pair,
-	// which is a different question from the smallest duplicate group
-	// (dupe.minGroupSize) or the pipeline's compare threshold; the three are
-	// deliberately independent rather than one shared constant.
-	minFilesPerExecution = 2
 )
 
 // Result describes the outcome of processing a duplicate file.
@@ -212,7 +205,7 @@ func (e *Executor) DoExecution(ctx context.Context, ex dupe.Execution) (Outcome,
 		fi, err := e.hashCalc(ctx, ex.Files[0])
 		return Outcome{Kind: ex.Type, Key: ex.Key, Files: []dupe.FileInfo{fi}}, err
 	case dupe.HashComp:
-		if len(ex.Files) < minFilesPerExecution {
+		if len(ex.Files) < dupe.FilesPerExecution {
 			return Outcome{Kind: ex.Type, Key: ex.Key}, errors.New("HashComp requires two files")
 		}
 		a, b, err := hashCompare(ctx, ex.Files[0], ex.Files[1], chunkSizeFor(ex.Files[0].Size))
@@ -404,7 +397,7 @@ func (e *Executor) execute(ctx context.Context, ex dupe.Execution) (Result, erro
 	default:
 	}
 
-	if len(ex.Files) < minFilesPerExecution {
+	if len(ex.Files) < dupe.FilesPerExecution {
 		return ResultError, errors.New("elimination requires a keeper and a victim")
 	}
 

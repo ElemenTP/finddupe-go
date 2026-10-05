@@ -219,8 +219,7 @@ func (d *Detector) OnCompareDone(key GroupKey, a, b FileInfo, incomplete bool)
 func (d *Detector) NextFinal(limit int) ([]Execution, bool)
 func (d *Detector) InsertInode(fi FileInfo)
 func (d *Detector) InodeGroups() [][]FileInfo
-func (d *Detector) Len() int
-func (d *Detector) Stats() *Stats
+func (d *Detector) InodeGroups() map[InodeKey][]FileInfo
 ```
 
 **Strategy by group size** (files sharing one `GroupKey`):

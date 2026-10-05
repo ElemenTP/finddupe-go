@@ -49,7 +49,7 @@ The physical identity comes from the platform helper `statFile(f)`:
 
 When `size <= BytesToChecksum (32768)`, the whole file is already read for the CRC, so `computeBoth` also returns its SHA-256 at zero additional I/O cost. For larger files `SHA256` is left as the zero value ("not yet computed").
 
-`Compute(path, size)` delegates to `ComputeFileInfo` and returns only the signature.
+`ComputeFileInfo(path, size)` is the only entry point: it returns the signature, the filesystem identity and the modification time from one open, so the decision and the freshness check reference the same read.
 
 ### Properties
 
