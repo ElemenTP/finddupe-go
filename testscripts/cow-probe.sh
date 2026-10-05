@@ -226,9 +226,11 @@ compress_file() {
 # APFS native compression is exposed through the SF_COMPRESSED flag (`ls -lO`
 # prints "compressed"), not as a readable com.apple.decmpfs xattr.
 is_compressed() {
-	# Only the flags column is inspected: a file whose *name* contains
-	# "compressed" must not be mistaken for a compressed file.
-	ls -lO "$1" 2>/dev/null | awk 'NR == 1 { next } { for (i = 5; i <= NF; i++) if ($i == "compressed") exit 0 } exit 1'
+	# `stat -f %Sf` prints the file flags as a comma-separated list (`compressed`
+	# is one of them). The ls -lO output is not parsed: a file whose *name*
+	# contains "compressed" would be misread, and the system awk rejects the
+	# inline loop that scanning its columns needed.
+	stat -f %Sf "$1" 2>/dev/null | tr ',' '\n' | grep -qx compressed
 }
 
 independent_copy "$CMP/src.bin" "$CMP/compA.bin"
@@ -336,7 +338,8 @@ if command -v cmp >/dev/null 2>&1; then
 	if cmp -s "$CMP/src.bin" "$CMP/compClone.bin"; then
 		echo "cmp src.bin compClone.bin: identical"
 	else
-		echo "cmp src.bin compClone.bin: DIFFERENT"
+		echo "cmp src.bin compClone.bin: DIFFERENT *** content mismatch: a clone no"
+		echo "    longer holds its source's bytes; report this log ***"
 	fi
 fi
 if [ "$OS" = "Darwin" ] && command -v afsctool >/dev/null 2>&1; then

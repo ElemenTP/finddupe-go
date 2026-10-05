@@ -97,6 +97,8 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDoExecution_SamePhysicalFile_UnknownIdentity` | Without a file index from the scan, two names for one file are still recognized (via `os.SameFile`) and left alone |
 | `TestDoExecution_DupeElim_SymlinkVictimSkipped` | A path that became a symlink after hashing is never acted on, even when its target still matches |
 | `TestDoExecution_CoWClone_PreservesReadOnlyVictimMetadata` | Regression: a read-only victim keeps its extended attributes (the final mode is applied after them) |
+| `TestDataLayoutXattr` | The attributes that carry a file's data layout (macOS decmpfs/resource fork) are exempt from the victim-metadata sync; user metadata is not |
+| `TestDoExecution_CoWClone_KeepsCompressedLayout` (darwin) | Regression: cloning a decmpfs-compressed keeper over an uncompressed victim kept the content and the compression attributes (it used to leave a zero-length file) |
 
 ### `internal/fswalker` (33 tests)
 

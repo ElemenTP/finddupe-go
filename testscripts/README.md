@@ -93,6 +93,21 @@ The whole script output (it is split into `== section ==` markers), plus:
   implement NTFS per-file compression (`compact /c` reports "The request is not
   supported"), which also means `--prefer-compressed` never changes anything there.
 
+### What a healthy macOS/APFS run looks like
+
+Verified on Darwin 27 / macOS 27 ARM64:
+
+- `extentdump` prints real extents (a 4 KiB run plus a 1044480-byte run for a
+  1 MiB file); a `cp -c` clone shows the same device offsets, an independent copy
+  different ones;
+- `dedupe --cow` prints `CoW cloned: …`, `find --cow` then reports `100.0%`, and a
+  second `dedupe --cow` prints nothing (`Dupes: 0 B in 0 files`);
+- a clone whose first 256 KiB were rewritten reports a **partial** ratio (75.0%);
+- compressed files (`afsctool -c`) fall back to the APFS clone ID; `extentdump`
+  shows `opaque=true`, and a `cp -c` clone of one reports 100% shared;
+- `cmp src.bin compClone.bin: identical` — a mismatch here means a clone no longer
+  holds its source's bytes; report the log, it is a data-loss bug.
+
 ### What a healthy Windows/ReFS run looks like
 
 Verified on Windows 11 with a ReFS 3.14 Dev Drive (4096-byte clusters):

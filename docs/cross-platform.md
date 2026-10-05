@@ -231,9 +231,22 @@ Verified on a Darwin 27.0.0 / macOS 27 ARM64 APFS data volume:
   victim from the group keeper, so when the keeper is uncompressed (which file is
   first depends on directory order) compressed members become uncompressed clones
   of equal content. The dedupe result is correct either way, but the compression
-  saving is lost in that case;
-- APFS native compression is exposed through the `SF_COMPRESSED` flag
-  (`ls -lO` prints `compressed`), not as a readable `com.apple.decmpfs` xattr.
+  saving is lost in that case — `--prefer-compressed` is the answer;
+- APFS native compression is exposed through the `SF_COMPRESSED` flag (`ls -lO`
+  prints `compressed`, `stat -f %Sf` lists it as a flag), not as a readable
+  `com.apple.decmpfs` xattr;
+- a clone whose first 256 KiB were rewritten reports **75.0% (768 KiB of 1 MiB)**,
+  and `dedupe --cow` brings it back to 100%: the partial-ratio path is exercised
+  on real APFS, not just in the unit tests;
+- **A clone must keep the data layout it inherited.** Cloning a compressed keeper
+  over an uncompressed victim used to end in data loss: the metadata sync removed
+  every attribute the victim did not have, which stripped `com.apple.decmpfs` and
+  `com.apple.ResourceFork` (where the payload lives) and left a **zero-length**
+  file in place of a 2 MiB duplicate — the probe's `cmp` check and the
+  `1 files of zero length were skipped` line caught it. Attributes that describe
+  where the bytes live are now exempt from the victim-metadata sync in both
+  directions (`internal/action/xattr_layout_darwin.go`), because the clone's data
+  comes from the keeper.
 
 `getattrlist` itself is still invoked through the raw syscall trap because
 `golang.org/x/sys/unix` (through v0.48.0) exports no libSystem wrapper for it —

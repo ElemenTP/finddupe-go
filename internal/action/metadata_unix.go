@@ -71,6 +71,14 @@ func preserveMetadata(dst, src string) error {
 // clonefile(2) copies the source's attributes) is removed. Every step is
 // best-effort — reading system.* or trusted.* namespaces needs privileges.
 //
+// Attributes that describe where the file's bytes live are the exception: a CoW
+// clone inherited them from the cloned data (macOS keeps a compressed file's
+// payload in com.apple.ResourceFork and its header in com.apple.decmpfs), so they
+// must follow the keeper, not the victim's metadata. Removing them left a clone
+// whose data fork was empty — a zero-length file — and copying them from a
+// compressed victim onto an uncompressed clone would attach a payload the file
+// does not have.
+//
 // The removal loop only runs when src's own attributes could be listed: treating
 // "could not read" as "no attributes" would strip everything the clone has.
 func copyXattrs(dst, src string) {
@@ -82,7 +90,9 @@ func copyXattrs(dst, src string) {
 	wanted := make(map[string]bool, len(srcNames))
 	for _, name := range srcNames {
 		wanted[name] = true
-		copyXattr(dst, src, name)
+		if !dataLayoutXattr(name) {
+			copyXattr(dst, src, name)
+		}
 	}
 
 	dstNames, dstOK := listXattrs(dst)
@@ -90,7 +100,7 @@ func copyXattrs(dst, src string) {
 		return
 	}
 	for _, name := range dstNames {
-		if !wanted[name] {
+		if !wanted[name] && !dataLayoutXattr(name) {
 			_ = unix.Removexattr(dst, name)
 		}
 	}
