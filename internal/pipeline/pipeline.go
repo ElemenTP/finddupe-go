@@ -173,12 +173,23 @@ func startProgress(ctx context.Context, cfg *config.Config, stats *dupe.Stats) f
 type patternMisses struct {
 	mu       sync.Mutex
 	patterns []string
+	seen     map[string]struct{}
 }
 
-// add records a pattern that matched nothing.
+// add records a pattern that matched nothing. The same pattern can reach the
+// walker more than once (a repeated argument), and naming it twice in the error
+// makes the message look like two different patterns failed.
 func (p *patternMisses) add(pattern string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if _, ok := p.seen[pattern]; ok {
+		return
+	}
+	if p.seen == nil {
+		p.seen = make(map[string]struct{})
+	}
+	p.seen[pattern] = struct{}{}
 	p.patterns = append(p.patterns, pattern)
 }
 

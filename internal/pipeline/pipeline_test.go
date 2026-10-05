@@ -73,6 +73,28 @@ func TestRun_NoMatchFails(t *testing.T) {
 	}
 }
 
+// TestRun_RepeatedNoMatchPatternIsNamedOnce verifies that a pattern given twice
+// is reported once: the message is read to find out which argument was wrong, and
+// seeing the same path twice suggests two different patterns failed.
+func TestRun_RepeatedNoMatchPatternIsNamedOnce(t *testing.T) {
+	t.Parallel()
+
+	empty := t.TempDir()
+	cfg := &config.Config{
+		Action:       config.ActionReport,
+		Paths:        []string{empty, empty},
+		ShowProgress: false,
+	}
+
+	err := pipeline.Run(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("Run() = nil, want a no-match error")
+	}
+	if got := strings.Count(err.Error(), empty); got != 1 {
+		t.Fatalf("Run() = %v, want the pattern named once, got %d times", err, got)
+	}
+}
+
 // TestRun_ListLink smoke-tests the hardlink listing mode.
 func TestRun_ListLink(t *testing.T) {
 	t.Parallel()
