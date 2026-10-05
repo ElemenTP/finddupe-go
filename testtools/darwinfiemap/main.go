@@ -12,7 +12,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 	"runtime"
@@ -20,38 +19,26 @@ import (
 	"unsafe"
 
 	"finddupe/internal/extent"
+	l2p "finddupe/internal/log2phys"
 	"golang.org/x/sys/unix"
 )
 
-// log2physSize is sizeof(struct log2phys) from <sys/fcntl.h>:
-//
-//	#pragma pack(4)
-//	struct log2phys {
-//	    unsigned int l2p_flags;        /* offset 0  */
-//	    off_t        l2p_contigbytes;  /* offset 4  */
-//	    off_t        l2p_devoffset;    /* offset 12 */
-//	};                                 /* sizeof 20 */
-//
-// The 4-byte packing is essential: with Go's natural alignment the fields land
-// at 8 and 16, so the kernel's output would be read from the wrong bytes.
-const log2physSize = 20
-
-// log2phys is a byte-exact mirror of struct log2phys.
+// log2phys is a byte-exact mirror of struct log2phys; the layout itself lives in
+// internal/log2phys so the probe cannot drift away from what the extent query
+// reads.
 type log2phys struct {
-	raw [log2physSize]byte
+	raw [l2p.Size]byte
 }
 
 func newLog2phys(flags uint32, contig, devOffset int64) log2phys {
 	var l log2phys
-	binary.LittleEndian.PutUint32(l.raw[0:4], flags)
-	binary.LittleEndian.PutUint64(l.raw[4:12], uint64(contig))
-	binary.LittleEndian.PutUint64(l.raw[12:20], uint64(devOffset))
+	l.raw = l2p.Encode(contig, devOffset)
 	return l
 }
 
-func (l *log2phys) flags() uint32    { return binary.LittleEndian.Uint32(l.raw[0:4]) }
-func (l *log2phys) contig() int64    { return int64(binary.LittleEndian.Uint64(l.raw[4:12])) }
-func (l *log2phys) devOffset() int64 { return int64(binary.LittleEndian.Uint64(l.raw[12:20])) }
+func (l *log2phys) flags() uint32    { return l2p.Flags(l.raw[:]) }
+func (l *log2phys) contig() int64    { _, contig := l2p.Parse(l.raw[:]); return contig }
+func (l *log2phys) devOffset() int64 { devOffset, _ := l2p.Parse(l.raw[:]); return devOffset }
 func (l *log2phys) hex() string      { return fmt.Sprintf("% x", l.raw[:]) }
 
 // maxSteps bounds enumeration so a pathological answer cannot loop forever.

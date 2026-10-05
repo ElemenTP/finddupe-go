@@ -24,6 +24,7 @@ finddupe-go/
 │   ├── fileid/                # Dev/Inode/NumLinks from a stat result
 │   │   ├── fileid_unix.go     # Unix: read from the stat struct already in hand
 │   │   └── fileid_other.go    # Other platforms: no identity in os.FileInfo
+│   ├── log2phys/              # macOS: struct log2phys layout (shared with the probe)
 │   ├── checksum/              # File signature + identity computation
 │   │   ├── checksum.go        # Compute, ComputeFileInfo (returns Info), ComputeFromReader
 │   │   ├── stat_unix.go       # Unix: size/mtime/identity from one fstat

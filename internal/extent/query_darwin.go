@@ -12,6 +12,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"finddupe/internal/log2phys"
 )
 
 // Supported reports whether extent querying is implemented on this platform.
@@ -39,12 +41,6 @@ var errCloneIDFallback = errors.New("F_LOG2PHYS_EXT not supported for this file"
 // The 4-byte packing must be reproduced explicitly: a Go struct with natural
 // alignment would place the fields at 8 and 16 and read the kernel's output
 // from the wrong bytes.
-const (
-	l2pSize      = 20
-	l2pContigOff = 4
-	l2pDevOff    = 12
-)
-
 // getattrlist(2) constants, verified against sys/attr.h.
 const (
 	attrBitMapCount      = 5
@@ -111,11 +107,10 @@ func extentsFcntl(path string) ([]Extent, error) {
 	// growth between the conversion and the call. Heap objects are not moved by
 	// the garbage collector, and KeepAlive keeps this one reachable across the
 	// call. One record is reused for every step of the walk.
-	rec := new([l2pSize]byte)
+	request := log2phys.Encode(int64(size-offset), int64(offset))
+	rec := &request
 
 	for offset < size {
-		binary.LittleEndian.PutUint64(rec[l2pContigOff:l2pDevOff], uint64(size-offset))
-		binary.LittleEndian.PutUint64(rec[l2pDevOff:l2pSize], uint64(offset))
 
 		_, err := unix.FcntlInt(f.Fd(), unix.F_LOG2PHYS_EXT, int(uintptr(unsafe.Pointer(&rec[0]))))
 		runtime.KeepAlive(rec)
@@ -134,8 +129,7 @@ func extentsFcntl(path string) ([]Extent, error) {
 			return nil, err
 		}
 
-		contig := int64(binary.LittleEndian.Uint64(rec[l2pContigOff:l2pDevOff]))
-		devOffset := int64(binary.LittleEndian.Uint64(rec[l2pDevOff:l2pSize]))
+		devOffset, contig := log2phys.Parse(rec[:])
 
 		// A non-positive device offset is a hole or an unmapped range; the
 		// length still advances the walk.
