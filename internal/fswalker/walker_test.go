@@ -834,3 +834,46 @@ func TestWalk_FileInfoCarriesModTime(t *testing.T) {
 		}
 	}
 }
+
+// TestWalk_SymlinkedPrefixReportsFilesOnce covers a directory reached under two
+// spellings: the walk root is spelled through a symlink, and a directory symlink
+// inside the tree resolves to the canonical path of a directory that is already
+// part of the walk. A visited set keyed by the path spelling holds both, so the
+// subtree is walked twice and every file in it is reported twice — which is what
+// a symlinked prefix (macOS /var, a symlinked TMPDIR) produced.
+func TestWalk_SymlinkedPrefixReportsFilesOnce(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.MkdirAll(filepath.Join(target, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, dir, "target/sub/inside.txt", "content")
+
+	alias := filepath.Join(dir, "alias")
+	symlinkTo(t, target, alias)
+
+	// The walk starts inside the aliased spelling of the tree, and a link inside
+	// it points at the canonical spelling of the same directory.
+	walkRoot := filepath.Join(alias, "sub")
+	symlinkTo(t, filepath.Join(target, "sub"), filepath.Join(walkRoot, "loop"))
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{walkRoot}, fswalker.WalkOptions{FollowSymlinks: true})
+	paths, errs := collectResults(t, ch)
+
+	if len(errs) > 0 {
+		t.Errorf("unexpected errors: %v", errs)
+	}
+
+	inside := 0
+	for _, path := range paths {
+		if strings.HasSuffix(path, "inside.txt") {
+			inside++
+		}
+	}
+	if inside != 1 {
+		t.Errorf("inside.txt was reported %d times, want 1 (paths: %v)", inside, paths)
+	}
+}

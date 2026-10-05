@@ -52,9 +52,66 @@ func sendResult(ctx context.Context, ch chan<- Result, result Result) bool {
 // already-visited directories (symlink loop prevention within this pattern) and
 // whether the pattern matched anything.
 type walkState struct {
-	seen    map[string]bool
+	seen    map[dirKey]bool
 	matched int
 	failed  bool
+}
+
+// dirKey identifies a directory the walk has entered. Physical identity is
+// preferred, because the walker sees the same directory under two spellings: the
+// path WalkDir builds from the walk root, and the canonical path a symlink
+// resolved to. When the walk root itself is spelled through a symlink (or the
+// prefix is one, as /var is on macOS) those spellings differ, and a path-keyed
+// set walked the subtree twice. Platforms whose FileInfo exposes no identity fall
+// back to the path spelling.
+type dirKey struct {
+	dev   uint64
+	inode uint64
+	path  string
+}
+
+// dirKeyOf builds the key for a directory that was just stat'ed.
+func dirKeyOf(path string, info os.FileInfo) dirKey {
+	if info != nil {
+		if dev, inode, _, ok := fileid.FromFileInfo(info); ok {
+			return dirKey{dev: dev, inode: inode}
+		}
+	}
+	return dirKey{path: path}
+}
+
+// enter records a directory and reports whether it had already been visited.
+func (st *walkState) enter(path string, info os.FileInfo) bool {
+	key := dirKeyOf(path, info)
+	if st.seen[key] {
+		return true
+	}
+	if st.seen == nil {
+		st.seen = make(map[dirKey]bool)
+	}
+	st.seen[key] = true
+	return false
+}
+
+// skipVisitedDir records a plain directory for the loop check and reports whether
+// the walk must skip it because the same directory was already entered (under
+// either spelling). Nothing is recorded unless symlinks are followed: without -j
+// no directory symlink is ever walked, so the set could only waste memory.
+func skipVisitedDir(baseDir, path string, d os.DirEntry, opts WalkOptions, st *walkState) bool {
+	if !opts.FollowSymlinks {
+		return false
+	}
+
+	// The stat can fail; the directory is then identified by its path spelling.
+	info, infoErr := d.Info()
+	if infoErr != nil {
+		info = nil
+	}
+
+	// The root of the current walk is never skipped: it is the entry the walk
+	// starts from and may have been registered by the symlink that led here.
+	// Recording it is what makes a symlink pointing back at it terminate.
+	return st.enter(path, info) && path != baseDir
 }
 
 // ZeroLenCounter is the interface for tracking skipped zero-length files.
@@ -127,7 +184,7 @@ func (w *Walker) walkPattern(
 	// report "no files matched" for a pattern that does match. Duplicate files
 	// reached by several patterns are deduplicated downstream
 	// (scanChecksums.seenPaths, Detector.seenPaths).
-	st := &walkState{seen: make(map[string]bool)}
+	st := &walkState{}
 
 	if _, statErr := os.Stat(absPattern); statErr == nil {
 		// The pattern names an existing path, so it is taken literally: a path
@@ -329,16 +386,13 @@ func (w *Walker) createWalkFn(
 		}
 		depth := pathDepth(baseDir, path)
 
-		// Plain directories are walked by WalkDir itself. Recording them in
-		// seen keeps a symlink pointing at a directory that is already (or
-		// later) part of the tree from being walked twice. The root of the
-		// current walk is exempt: it is the entry the walk starts from and may
-		// have been registered by the symlink that led here.
+		// Plain directories are walked by WalkDir itself; recording them keeps a
+		// symlink pointing at a directory that is already (or later) part of the
+		// tree from being walked twice (see skipVisitedDir).
 		if d.IsDir() && !isSymlink {
-			if path != baseDir && st.seen[path] {
+			if skipVisitedDir(baseDir, path, d, opts, st) {
 				return filepath.SkipDir
 			}
-			st.seen[path] = true
 
 			// Do not descend deeper than the pattern can match: "*.txt" needs one
 			// level below the base directory, "*/x.txt" two, "**" any number.
@@ -456,17 +510,19 @@ func (w *Walker) entryInfo(path string, d os.DirEntry, opts WalkOptions) (os.Fil
 }
 
 // walkSymlinkTarget recursively walks the resolved target of a directory
-// symlink. seen is keyed by resolved path and prevents symlink loops; the
-// caller passes the already-resolved target.
+// symlink; the caller passes the already-resolved target. The target is recorded
+// in the same set as the plain directories, so a target that is already part of
+// the tree (under either spelling) is not walked twice and a loop terminates.
 func (w *Walker) walkSymlinkTarget(
 	ctx context.Context, target, matchPattern string,
 	opts WalkOptions, ch chan<- Result, st *walkState,
 ) {
-	// Prevent infinite loops: if we've already visited this target, skip it.
-	if st.seen[target] {
+	// The stat is needed for the identity; a target that cannot be stat'ed is
+	// walked anyway and reports its own errors.
+	info, _ := os.Stat(target)
+	if st.enter(target, info) {
 		return
 	}
-	st.seen[target] = true
 
 	// Walk the resolved target directory.
 	walkFn := w.createWalkFn(ctx, target, matchPattern, opts, ch, st)
