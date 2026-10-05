@@ -208,7 +208,7 @@ func (w *Walker) reportNoMatch(ctx context.Context, pattern string, ch chan<- Re
 // For "/data" (no wildcard) → ("/data", "**").
 func splitPattern(pattern string) (string, string) {
 	if baseDir, match := splitAtExistingDir(pattern); baseDir != "" {
-		return baseDir, match
+		return driveRoot(baseDir), match
 	}
 
 	// No part of the pattern exists: fall back to the first metacharacter so the
@@ -227,8 +227,25 @@ func splitPattern(pattern string) (string, string) {
 	if sepIdx < 0 {
 		return ".", pattern
 	}
+	if sepIdx == 0 {
+		// The wildcard sits directly below the volume root ("/*.conf"): the prefix
+		// before the separator is the empty string, which no stat call can resolve,
+		// and "nothing matched" was the result. The separator itself is the base
+		// directory.
+		return pattern[:1], pattern[1:]
+	}
 
-	return pattern[:sepIdx], pattern[sepIdx+1:]
+	return driveRoot(pattern[:sepIdx]), pattern[sepIdx+1:]
+}
+
+// driveRoot gives a bare Windows drive letter its separator back. "C:" on its own
+// names that drive's *current* directory, not its root, so walking it would scan
+// the wrong tree; "C:\\" (or "C:/", as written) is the root.
+func driveRoot(baseDir string) string {
+	if len(baseDir) == 2 && baseDir[1] == ':' {
+		return baseDir + string(filepath.Separator)
+	}
+	return baseDir
 }
 
 // splitAtExistingDir returns the last separator whose following component
@@ -618,14 +635,33 @@ func relativeParts(baseDir, path string) []string {
 
 // pathDepth returns how many components path sits below baseDir (0 for baseDir
 // itself).
+// separators holds the characters that separate path components exactly once:
+// Unix and Windows both accept "/", and Windows also accepts its own separator,
+// which must not be added a second time on Unix.
+var separators = func() string {
+	if filepath.Separator == '/' {
+		return "/"
+	}
+	return "/" + string(filepath.Separator)
+}()
+
 func pathDepth(baseDir, path string) int {
-	if len(path) <= len(baseDir) {
+	// The separator that ends baseDir is not a component boundary, so it is
+	// trimmed first: "/" plus "x.conf" is one component below "/". Without this a
+	// wildcard directly below the volume root matched nothing, because the only
+	// separator in the path belonged to the base directory.
+	base := strings.TrimRight(baseDir, separators)
+	rest, ok := strings.CutPrefix(path, base)
+	if !ok || rest == "" || !strings.ContainsAny(rest[:1], separators) {
+		return 0
+	}
+	if rest = strings.TrimLeft(rest, separators); rest == "" {
 		return 0
 	}
 
-	depth := 0
-	for i := len(baseDir); i < len(path); i++ {
-		if path[i] == '/' || path[i] == '\\' {
+	depth := 1
+	for _, c := range rest {
+		if strings.ContainsRune(separators, c) {
 			depth++
 		}
 	}
