@@ -14,6 +14,12 @@ import (
 // ErrCoWNotSupported indicates the filesystem does not support Copy-on-Write cloning.
 var ErrCoWNotSupported = errors.New("CoW clone not supported on this filesystem; use --hardlink or --delete instead")
 
+// ErrCrossDevice indicates a clone was refused because the two files live on
+// different volumes. It is not a filesystem limitation: a clone shares storage
+// blocks, and blocks cannot be shared across a volume boundary, so no CoW
+// implementation can satisfy the request.
+var ErrCrossDevice = errors.New("cannot clone across volumes")
+
 // cloneFile replaces the duplicate (Files[1]) with a CoW clone of the original
 // (Files[0]). If the two already share all their storage — because they are the
 // same physical file or their extent layout is identical — nothing is done.
@@ -30,11 +36,20 @@ func (e *Executor) cloneFile(ex dupe.Execution, victimInfo os.FileInfo) (Result,
 		return ResultSkippedRO, nil
 	}
 
+	if !sameDevice(keeper, victim) {
+		return ResultSkippedCrossDevice, nil
+	}
+
 	if alreadyShared(keeper, victim) {
 		return ResultAlreadyShared, nil
 	}
 
 	if err := cloneReplace(keeper.Path, victim.Path); err != nil {
+		// A volume boundary can also surface here when the device of one side was
+		// unknown before the attempt; that is a skip, not a failure.
+		if errors.Is(err, ErrCrossDevice) {
+			return ResultSkippedCrossDevice, nil
+		}
 		return ResultError, err
 	}
 	return ResultCoWCloned, nil
@@ -96,8 +111,14 @@ func (e *Executor) detectCoW(ctx context.Context, ex dupe.Execution) (Outcome, e
 		// Unsupported filesystem: leave FileShared nil.
 		return out, nil
 	}
+	if physicalIdentityMissing(groupExtents) {
+		// The volume has extents to describe but reports no physical identity for
+		// them, so nothing can be compared: the group has no answer, and printing
+		// 0% would claim that nothing is shared.
+		return out, nil
+	}
 
-	out.FileShared = groupSharedBytes(ex.Files, groupExtents, usesSharedFlag(groupExtents))
+	out.FileShared = groupSharedBytes(ex.Files, groupExtents)
 	return out, nil
 }
 
@@ -118,17 +139,23 @@ func queryGroupExtents(files []dupe.FileInfo) ([][]extent.Extent, int) {
 	return groupExtents, queried
 }
 
-// usesSharedFlag reports whether any extent in the group carries the
-// filesystem's "shared" flag.
-func usesSharedFlag(groupExtents [][]extent.Extent) bool {
+// physicalIdentityMissing reports whether the group has extents but none of them
+// carries a physical identity. The kernel's per-extent "shared" flag is not a
+// substitute: it says the extent is shared with *someone*, which is not the
+// question — every member's ratio is how much it shares with the rest of its
+// group. A group with no extents at all (a fully sparse file) is not missing
+// anything: it genuinely shares nothing.
+func physicalIdentityMissing(groupExtents [][]extent.Extent) bool {
+	sawExtent := false
 	for _, extents := range groupExtents {
 		for _, x := range extents {
-			if x.Shared {
-				return true
+			if x.Physical != 0 {
+				return false
 			}
+			sawExtent = true
 		}
 	}
-	return false
+	return sawExtent
 }
 
 // groupSharedBytes returns the already-shared bytes of every group member.
@@ -139,15 +166,7 @@ func usesSharedFlag(groupExtents [][]extent.Extent) bool {
 // O(n²) extent work for a group of n files). An unknown device forms its own
 // bucket: comparing it against a known one could invent sharing that does not
 // exist, while reporting too little only means a clone is attempted.
-func groupSharedBytes(files []dupe.FileInfo, groupExtents [][]extent.Extent, useSharedFlag bool) []int64 {
-	if useSharedFlag {
-		shared := make([]int64, len(files))
-		for i, extents := range groupExtents {
-			shared[i] = extent.SharedFlagBytes(extents)
-		}
-		return shared
-	}
-
+func groupSharedBytes(files []dupe.FileInfo, groupExtents [][]extent.Extent) []int64 {
 	buckets := make(map[uint64][]int, len(files))
 	for i, fi := range files {
 		buckets[fi.Dev] = append(buckets[fi.Dev], i)

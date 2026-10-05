@@ -25,6 +25,9 @@ func clonePlatformFile(src, dst string) error {
 	defer dstFile.Close()
 
 	if cloneErr := unix.IoctlFileClone(int(dstFile.Fd()), int(srcFile.Fd())); cloneErr != nil {
+		if errors.Is(cloneErr, unix.EXDEV) {
+			return errors.Join(ErrCrossDevice, cloneErr)
+		}
 		if isCloneUnsupportedErr(cloneErr) {
 			return errors.Join(ErrCoWNotSupported, cloneErr)
 		}
@@ -39,6 +42,5 @@ func isCloneUnsupportedErr(err error) bool {
 	return errors.Is(err, unix.EOPNOTSUPP) ||
 		errors.Is(err, unix.ENOTTY) ||
 		errors.Is(err, unix.EINVAL) ||
-		errors.Is(err, unix.EXDEV) ||
 		errors.Is(err, unix.ENOSYS)
 }

@@ -108,6 +108,9 @@ func clonePlatformFile(src, dst string) error {
 		nil,
 	)
 	if ioErr != nil {
+		if errors.Is(ioErr, windows.ERROR_NOT_SAME_DEVICE) {
+			return errors.Join(ErrCrossDevice, ioErr)
+		}
 		detail := fmt.Errorf("duplicate %d bytes of %s at offset 0: %w", aligned, src, ioErr)
 		if allocErr != nil {
 			detail = fmt.Errorf("%w (destination preallocation also failed: %w)", detail, allocErr)

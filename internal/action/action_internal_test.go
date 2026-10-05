@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"finddupe/internal/checksum"
+	"finddupe/internal/config"
 	"finddupe/internal/dupe"
+	"finddupe/internal/extent"
 )
 
 // TestSameDevice covers the guard that keeps a hardlink from being attempted
@@ -182,5 +184,79 @@ func TestUnchanged_DetectsReplacedFile(t *testing.T) {
 	if _, ok := unchanged(fi); ok {
 		t.Error("a replaced file whose size and modification time still match must not verify: " +
 			"the content the decision was made on is gone")
+	}
+}
+
+// TestCloneFile_CrossDeviceIsSkipped verifies the pre-check that keeps a --cow
+// run from attempting a clone across a volume boundary at all. The attempt could
+// only fail (storage blocks cannot be shared across volumes) and the error was
+// reported as "the filesystem does not support CoW", which reads like a
+// limitation of the filesystem instead of of the pair. Unknown devices stay
+// conservative (see sameDevice) and are still attempted.
+func TestCloneFile_CrossDeviceIsSkipped(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	keeperPath := filepath.Join(dir, "keeper.bin")
+	victimPath := filepath.Join(dir, "victim.bin")
+	content := []byte("identical content for the cross-device test")
+	for _, path := range []string{keeperPath, victimPath} {
+		if writeErr := os.WriteFile(path, content, 0o644); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+
+	victimInfo, err := os.Lstat(victimPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exec := New(Options{Action: config.ActionCoWClone})
+	result, cloneErr := exec.cloneFile(dupe.Execution{
+		Type: dupe.DupeElim,
+		Files: []dupe.FileInfo{
+			{Path: keeperPath, Size: int64(len(content)), Dev: 7, Inode: 1},
+			{Path: victimPath, Size: int64(len(content)), Dev: 8, Inode: 2},
+		},
+	}, victimInfo)
+	if cloneErr != nil {
+		t.Fatalf("cloneFile() error = %v, want a skip", cloneErr)
+	}
+	if result != ResultSkippedCrossDevice {
+		t.Fatalf("cloneFile() = %v, want ResultSkippedCrossDevice", result)
+	}
+	if _, statErr := os.Lstat(victimPath); statErr != nil {
+		t.Fatalf("the victim must be left untouched: %v", statErr)
+	}
+}
+
+// TestPhysicalIdentityMissing covers when a group simply has no answer: a volume
+// that describes extents but gives them no physical identity cannot be compared,
+// and publishing 0% would claim that nothing is shared. A group with no extents at
+// all (fully sparse files) is a real answer — it shares nothing.
+func TestPhysicalIdentityMissing(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		group [][]extent.Extent
+		want  bool
+	}{
+		{name: "no extents at all", group: [][]extent.Extent{nil, nil}, want: false},
+		{name: "extents with identity", group: [][]extent.Extent{{{Physical: 4096, Length: 100}}}, want: false},
+		{name: "extents without identity", group: [][]extent.Extent{{{Length: 100}}}, want: true},
+		{name: "mixed, one member has identity", group: [][]extent.Extent{
+			{{Length: 100}},
+			{{Physical: 4096, Length: 100}},
+		}, want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := physicalIdentityMissing(tc.group); got != tc.want {
+				t.Errorf("physicalIdentityMissing(%v) = %v, want %v", tc.group, got, tc.want)
+			}
+		})
 	}
 }

@@ -77,7 +77,7 @@ The NTFS file index serves the same role as the Unix inode, and the volume seria
 
 ### Device Matters
 
-`Dev` is part of the identity because inode numbers are only unique per device. Hardlink detection (`--hardlink`, `--listlink`) and CoW extent comparison both compare `(Dev, Inode)` / `Dev`, so files on different volumes are never confused: `--hardlink` refuses a pair whose `Dev` differs (`ResultSkippedCrossDevice`) instead of removing a victim it cannot link, and `alreadyShared` refuses to call two layouts identical across devices because physical offsets only mean something within one volume.
+`Dev` is part of the identity because inode numbers are only unique per device. Hardlink detection (`--hardlink`, `--listlink`) and CoW extent comparison both compare `(Dev, Inode)` / `Dev`, so files on different volumes are never confused: `--hardlink` and `--cow` both refuse a pair whose `Dev` differs (`ResultSkippedCrossDevice`) instead of removing a victim it cannot link or reporting a volume boundary as "this filesystem does not support CoW", and `alreadyShared` refuses to call two layouts identical across devices because physical offsets only mean something within one volume.
 
 ### Fallback
 
@@ -301,25 +301,27 @@ unreliable there. It stays conservative: anything uncertain compares unequal and
 the caller clones anyway, which is safe because content equality was already
 established.
 
-For the group ratios there are two signals:
+The group ratio is one signal, everywhere:
 
-1. `extent.SharedFlagBytes(e)` sums the lengths of extents the filesystem marked
-   `Shared` (Linux `FIEMAP_EXTENT_SHARED`). It is a per-file signal: it says the
-   extent is shared with *someone*, not with whom. It is used for the whole group
-   as soon as any member's extents carry the flag.
-2. `extent.SharedWithGroup(group)` intersects each member's physical ranges with
-   the ranges of every other member, in one sweep over the whole group. Allocated
-   extents of different files never overlap unless the blocks are shared, so this
-   counts a shared run even when the filesystem splits it at different boundaries
-   in each file (an APFS clone whose first blocks were rewritten keeps sharing its
-   untouched tail, reported as an extent starting mid-way through the original's
-   run).
-   Encoded (compressed) and Opaque (clone-ID) extents fall back to an exact
-   key match, because their identities are not byte ranges.
-   It is used where no shared flag exists, and only between members on the same
-   device. On macOS it is the device offset from `F_LOG2PHYS_EXT` for
-   uncompressed files (partial ratios included) and the APFS clone ID for
-   decmpfs-compressed files (family-level: 100% or 0%).
+`extent.SharedWithGroup(group)` intersects each member's physical ranges with the
+ranges of every other member, in one sweep over the whole group. Allocated extents
+of different files never overlap unless the blocks are shared, so this counts a
+shared run even when the filesystem splits it at different boundaries in each file
+(an APFS clone whose first blocks were rewritten keeps sharing its untouched tail,
+reported as an extent starting mid-way through the original's run). Encoded
+(compressed) and Opaque (clone-ID) extents fall back to an exact key match, because
+their identities are not byte ranges. It is only applied between members on the
+same device. On macOS the identity is the device offset from `F_LOG2PHYS_EXT` for
+uncompressed files (partial ratios included) and the APFS clone ID for
+decmpfs-compressed files (family-level: 100% or 0%).
+
+`extent.SharedFlagBytes(e)` sums the lengths of extents the filesystem marked
+`Shared` (Linux `FIEMAP_EXTENT_SHARED`). It is a *per-file* signal — the extent is
+shared with someone, not necessarily with another member of the group — so it is
+diagnostic only (`extentdump` prints it) and never the ratio. Using it made an
+untouched original report 100% on a group whose clone had been partially
+rewritten, where the group-based answer is the untouched share (75% in the probe's
+1 MiB / 256 KiB case).
 
 ### ReFS / Dev Drive: Measured Behaviour
 
@@ -374,7 +376,7 @@ and the clone proceeds without it.
 
 ## Compressed-btrfs Caveat
 
-On btrfs with compression, extents are reported as `Encoded`: their physical offsets and logical lengths cannot be compared directly, so the physical-identity path (`SharedWithGroup`) skips them. In-group detection then depends on the filesystem's `FIEMAP_EXTENT_SHARED` hint (`SharedFlagBytes`); if the kernel does not set that hint, two compressed clones may not be reported as sharing. Encoded extents are matched by their physical start instead, which covers aligned runs.
+On btrfs with compression, extents are reported as `Encoded`: their physical offsets and logical lengths cannot be compared as byte ranges, so the range sweep skips them and they are matched by exact physical start instead (which covers aligned runs). The kernel's `FIEMAP_EXTENT_SHARED` hint is not consulted for the ratio, so two compressed clones are reported as sharing when their starts match.
 
 ### Compression State and Clone Sources
 
@@ -420,9 +422,9 @@ accounting changes, and it would also change which path survives in
 Physical identities are only comparable within one device (an APFS clone ID is
 per-volume as well). `extent.SharedWithGroup` is therefore only given the
 members whose non-zero `Dev` matches the file being measured; a member on a
-different volume contributes nothing. The `FIEMAP_EXTENT_SHARED` flag path does
-not need this check, because the kernel already knows whether the extent is
-shared.
+different volume contributes nothing. An extent whose physical identity is unknown
+(zero) is skipped rather than treated as device offset 0, and a group whose extents
+all lack an identity is reported as "unavailable" instead of 0%.
 
 ### Validating Extent APIs on Real Machines
 

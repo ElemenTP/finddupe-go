@@ -144,10 +144,11 @@ bytes saved. When extent information is unavailable for the whole group, the
 members are still listed with a note instead of per-file ratios.
 
 Detection costs an extra open + extent query per file, which is why it is opt-in.
-On Linux the `FIEMAP_EXTENT_SHARED` flag is used when the filesystem sets it;
-otherwise (macOS/Windows, and Linux filesystems without the flag) the physical
-start address is compared within the group and the same device. See
-[cross-platform.md](cross-platform.md).
+The ratio always answers the same question — how much of this file is shared with
+another member of its group — by comparing physical extents within the same device
+(Linux/macOS/Windows, and the APFS clone ID for compressed files). The kernel's
+per-extent `FIEMAP_EXTENT_SHARED` flag is a different question ("shared with
+someone") and is only a diagnostic. See [cross-platform.md](cross-platform.md).
 
 ## `finddupe dedupe` — Scan and Eliminate
 
@@ -237,7 +238,7 @@ Read-only victims that are skipped print `Skipping duplicate readonly file '<pat
 Two safety skips protect a live filesystem:
 
 - A pair whose keeper or victim no longer matches the size and modification time recorded when its content was hashed prints `Skipping '<victim>' (original '<keeper>'): one of them changed during the scan.` and increments `SkippedChangedFiles` (summarized as `N files skipped (changed during the scan)`). The same check runs inside the readers: a file that changed size (or, when resuming a partial digest, was modified) fails with `dupe.ErrFileChanged` and is counted as unreadable instead of being hashed.
-- `dedupe --hardlink` refuses a pair on two different devices (a hardlink cannot span volumes) and logs `hardlink not possible across devices`, leaving both files untouched (`ResultSkippedCrossDevice`).
+- `dedupe --hardlink` refuses a pair on two different devices (a hardlink cannot span volumes) and logs `hardlink not possible across devices`, leaving both files untouched (`ResultSkippedCrossDevice`). `dedupe --cow` refuses the same pair for the same reason — storage blocks cannot be shared across volumes — instead of reporting that the filesystem does not support CoW. When a device is unknown (`Dev == 0`, identity unavailable) the attempt is made and a volume-boundary error from the clone is still reported as the same skip.
 
 An action that fails logs `action failed` with both paths and the underlying error, for example the `ErrCoWNotSupported` message when `--cow` meets a filesystem without reflink support.
 

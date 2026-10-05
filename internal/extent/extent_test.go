@@ -11,7 +11,9 @@ import (
 )
 
 // TestSharedWithGroupOverlap covers the physical-range arithmetic of the group
-// helper: how much of the first member the second one covers.
+// helper: how much of the first member the second one covers. The fixtures use
+// realistic non-zero physical offsets: a zero physical identity means "unknown"
+// (see physicalRange) and is skipped rather than treated as device offset 0.
 func TestSharedWithGroupOverlap(t *testing.T) {
 	t.Parallel()
 
@@ -22,32 +24,32 @@ func TestSharedWithGroupOverlap(t *testing.T) {
 	}{
 		{
 			name: "partial overlap",
-			a:    []extent.Extent{{Physical: 0, Length: 100}, {Physical: 200, Length: 100}},
-			b:    []extent.Extent{{Physical: 50, Length: 100}},
+			a:    []extent.Extent{{Physical: 1000, Length: 100}, {Physical: 2000, Length: 100}},
+			b:    []extent.Extent{{Physical: 1050, Length: 100}},
 			want: 50,
 		},
 		{
 			name: "disjoint",
-			a:    []extent.Extent{{Physical: 0, Length: 100}},
-			b:    []extent.Extent{{Physical: 1000, Length: 100}},
+			a:    []extent.Extent{{Physical: 1000, Length: 100}},
+			b:    []extent.Extent{{Physical: 9000, Length: 100}},
 			want: 0,
 		},
 		{
 			name: "identical",
-			a:    []extent.Extent{{Physical: 0, Length: 100}, {Physical: 200, Length: 100}},
-			b:    []extent.Extent{{Physical: 0, Length: 100}, {Physical: 200, Length: 100}},
+			a:    []extent.Extent{{Physical: 1000, Length: 100}, {Physical: 2000, Length: 100}},
+			b:    []extent.Extent{{Physical: 1000, Length: 100}, {Physical: 2000, Length: 100}},
 			want: 200,
 		},
 		{
 			name: "empty",
 			a:    nil,
-			b:    []extent.Extent{{Physical: 0, Length: 100}},
+			b:    []extent.Extent{{Physical: 1000, Length: 100}},
 			want: 0,
 		},
 		{
 			name: "multiple overlaps",
-			a:    []extent.Extent{{Physical: 0, Length: 100}, {Physical: 300, Length: 100}},
-			b:    []extent.Extent{{Physical: 50, Length: 200}, {Physical: 350, Length: 10}},
+			a:    []extent.Extent{{Physical: 1000, Length: 100}, {Physical: 1300, Length: 100}},
+			b:    []extent.Extent{{Physical: 1050, Length: 200}, {Physical: 1350, Length: 10}},
 			want: 60,
 		},
 		{
@@ -395,5 +397,34 @@ func TestSharedWithGroup(t *testing.T) {
 	}
 	if got := extent.SharedWithGroup([][]extent.Extent{opaqueA, opaqueA}); got[0] != 2097152 {
 		t.Fatalf("SharedWithGroup(same opaque key) = %v, want 2097152", got)
+	}
+}
+
+// TestEqual_IdentityKind covers the rule that physical identities of different
+// kinds are never the same thing: an opaque APFS clone ID can be numerically equal
+// to a device offset, and a compressed extent's start does not describe the same
+// bytes as a plain extent at that offset. Treating them as equal would skip a clone
+// that is actually needed.
+func TestEqual_IdentityKind(t *testing.T) {
+	t.Parallel()
+
+	plain := []extent.Extent{{Logical: 0, Physical: 4096, Length: 100}}
+	opaque := []extent.Extent{{Logical: 0, Physical: 4096, Length: 100, Opaque: true}}
+	encoded := []extent.Extent{{Logical: 0, Physical: 4096, Length: 100, Encoded: true}}
+
+	if !extent.Equal(plain, plain) {
+		t.Error("identical plain layouts must compare equal")
+	}
+	for _, tc := range []struct {
+		name string
+		a, b []extent.Extent
+	}{
+		{name: "plain vs opaque", a: plain, b: opaque},
+		{name: "plain vs encoded", a: plain, b: encoded},
+		{name: "opaque vs encoded", a: opaque, b: encoded},
+	} {
+		if extent.Equal(tc.a, tc.b) {
+			t.Errorf("%s: layouts with different kinds of physical identity compared equal", tc.name)
+		}
 	}
 }

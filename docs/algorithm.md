@@ -183,7 +183,7 @@ Before acting on a DupeElim (keeper = Files[0], victim = Files[1]):
   else if action != report and (keeper or victim changed since it was hashed):
       → ResultSkippedChanged             # the duplicate decision is stale
   else if action == hardlink and not sameDevice(keeper, victim):
-      → ResultSkippedCrossDevice         # hard links cannot span volumes
+      → ResultSkippedCrossDevice         # hard links and clones cannot span volumes
   else:
       → execute the configured action
 ```
@@ -283,8 +283,9 @@ For a `DupeElim` execution:
 3. If the action is not "report" and either file no longer matches the size and
    modification time recorded when its content was hashed
       → ResultSkippedChanged (the duplicate decision is stale; nothing is touched)
-4. Hardlink only: if keeper and victim are on different devices
-      → ResultSkippedCrossDevice (a hardlink can never span volumes)
+4. Hardlink and CoW clone: if keeper and victim are on different devices
+      → ResultSkippedCrossDevice (neither a hardlink nor a clone can span
+        volumes; a clone shares storage blocks)
 5. Otherwise execute the configured action
 ```
 
@@ -394,15 +395,16 @@ has finished, the detector state is complete and the pipeline asks for groups.
    groups.
 2. The detector turns each bucket into one `CoWDetect` execution instead of one
    execution per pair, drained in bounded batches.
-3. `detectCoW` computes, for every member, how many of its bytes are already
-   shared with another group member:
-   - if any extent in the group carries the filesystem's `Shared` flag
-     (Linux `FIEMAP_EXTENT_SHARED`), `extent.SharedFlagBytes` is used. This is a
-     per-file signal: it says the extent is shared with someone, not with whom;
-   - otherwise the physical start address is used as identity within the same
-     device via `extent.SharedWithGroup`, capped to the shorter extent.
-   `Outcome.FileShared []int64` carries one value per `Outcome.Files` entry; it is
-   nil when extent information is unavailable for the whole group.
+3. `detectCoW` computes, for every member, how many of its bytes it shares with
+   another member of *its own group*: `extent.SharedWithGroup` intersects each
+   member's physical ranges with the ranges of the others in one sweep, within the
+   same device. The kernel's per-extent `Shared` flag (Linux
+   `FIEMAP_EXTENT_SHARED`) is not used for this: it says the extent is shared with
+   *someone*, which made an untouched original look 100% shared where a partially
+   rewritten clone shares only its tail. `Outcome.FileShared []int64` carries one
+   value per `Outcome.Files` entry; it is nil when extent information is
+   unavailable for the whole group, and also when the filesystem reports extents
+   without a physical identity (reporting 0% would claim nothing is shared).
 
 `find --cow` therefore reports a group, not a pair:
 

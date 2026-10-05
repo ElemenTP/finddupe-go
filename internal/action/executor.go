@@ -56,8 +56,9 @@ const (
 	// touched.
 	ResultSkippedChanged
 
-	// ResultSkippedCrossDevice means the pair can never be hardlinked because
-	// the two files live on different devices.
+	// ResultSkippedCrossDevice means the pair lives on two different devices, so
+	// it can neither be hardlinked nor CoW-cloned: both actions need the two
+	// files to share one volume.
 	ResultSkippedCrossDevice
 )
 

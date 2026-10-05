@@ -87,6 +87,8 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDoExecution_DupeElim_Hardlink_LinkFailureKeepsVictim` | Regression: a failed link leaves the victim (and its content) untouched and no temp file behind |
 | `TestDoExecution_DupeElim_Hardlink_PreservesKeeperMetadata` | Hardlinking does not rewrite the keeper's mode/mtime |
 | `TestDoExecution_DupeElim_CrossDeviceSkipsHardlink` | Different `Dev` → `ResultSkippedCrossDevice`, both files preserved |
+| `TestCloneFile_CrossDeviceIsSkipped` | A `--cow` pair on two devices is skipped before any attempt (the clone could not share blocks across volumes); a zero device stays conservative and is still attempted |
+| `TestWalk_SymlinkedPrefixReportsFilesOnce` | A directory reached under two spellings (walk root spelled through a symlink, link resolving to the canonical path) is walked once |
 | `TestDoExecution_DupeElim_ChangedFileSkipped` | A file changed after hashing → `ResultSkippedChanged` for delete/hardlink/CoW |
 | `TestDoExecution_DupeElim_UnchangedFileIsActedOn` | A matching size/mtime does not block the action |
 | `TestDoExecution_CoWClone_CrossDeviceNotShared` | Identical extent layouts on different devices are not treated as shared |

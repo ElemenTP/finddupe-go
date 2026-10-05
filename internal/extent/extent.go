@@ -111,7 +111,8 @@ type Extent struct {
 
 // Equal reports whether two extent lists describe the same storage layout:
 // same count in the same logical order, with equal logical offset, physical
-// identity, and length.
+// identity, and length. Physical identities are only comparable within one
+// device: the caller must have checked that both files live on the same volume.
 //
 // It is deliberately conservative: it returns false for empty lists and for any
 // unknown (zero) physical identity. Encoded (compressed/inline) extents are
@@ -129,6 +130,13 @@ func Equal(a, b []Extent) bool {
 		if a[i].Physical == 0 || b[i].Physical == 0 {
 			return false
 		}
+		// Physical identities of different kinds are never the same thing: an
+		// opaque APFS clone ID can be numerically equal to a device offset, and a
+		// compressed extent's start does not describe the same bytes as a plain
+		// one at the same offset.
+		if a[i].Opaque != b[i].Opaque || a[i].Encoded != b[i].Encoded {
+			return false
+		}
 		if a[i].Logical != b[i].Logical ||
 			a[i].Physical != b[i].Physical ||
 			a[i].Length != b[i].Length {
@@ -139,8 +147,12 @@ func Equal(a, b []Extent) bool {
 }
 
 // SharedFlagBytes returns the number of bytes covered by extents the filesystem
-// marked as shared (Linux FIEMAP_EXTENT_SHARED). This is a per-file signal: it
-// says the extent is shared with someone, not with whom.
+// marked as shared (Linux FIEMAP_EXTENT_SHARED). It is a per-file signal: the
+// extent is shared with *someone*, not necessarily with another member of the
+// group, so it is diagnostic only — the probe prints it to show what the kernel
+// reports. The ratio `find --cow` publishes is computed from the group's physical
+// identities ([SharedWithGroup]), which answers the same question on every
+// platform.
 func SharedFlagBytes(e []Extent) int64 {
 	var n int64
 	for _, x := range e {
@@ -343,7 +355,10 @@ type rangeKey func(Extent) (interval, bool)
 // offset. Opaque identities are excluded: only exact equality is meaningful for
 // them, so they are matched by start instead.
 func physicalRange(e Extent) (interval, bool) {
-	if e.Encoded || e.Opaque || e.Length == 0 {
+	// A zero physical identity means "unknown", not "the start of the device":
+	// taking it as an offset would make the unknown extents of two unrelated files
+	// overlap.
+	if e.Encoded || e.Opaque || e.Length == 0 || e.Physical == 0 {
 		return interval{}, false
 	}
 	return interval{start: e.Physical, end: e.Physical + e.Length}, true

@@ -12,6 +12,9 @@ import (
 // macOS supports this on APFS via clonefile(2).
 func clonePlatformFile(src, dst string) error {
 	if err := unix.Clonefile(src, dst, 0); err != nil {
+		if errors.Is(err, unix.EXDEV) {
+			return errors.Join(ErrCrossDevice, err)
+		}
 		if isCloneUnsupportedErr(err) {
 			return errors.Join(ErrCoWNotSupported, err)
 		}
@@ -25,7 +28,6 @@ func clonePlatformFile(src, dst string) error {
 func isCloneUnsupportedErr(err error) bool {
 	return errors.Is(err, unix.ENOTSUP) ||
 		errors.Is(err, unix.EOPNOTSUPP) ||
-		errors.Is(err, unix.EXDEV) ||
 		errors.Is(err, unix.EINVAL) ||
 		errors.Is(err, unix.ENOSYS)
 }

@@ -873,8 +873,10 @@ func TestDoExecution_CoWClone_CrossDeviceNotShared(t *testing.T) {
 		t.Fatalf("same device: Result = %v, want ResultAlreadyShared", out.Result)
 	}
 
-	// Different devices: the same layout must not be trusted, so the pair is
-	// cloned instead of being silently skipped.
+	// Different devices: the layout must not be trusted and no clone can be
+	// attempted at all, because storage blocks cannot be shared across volumes.
+	// The pair is skipped — the same outcome a hardlink would get — instead of
+	// being reported as "this filesystem does not support CoW".
 	kp.Dev, vp.Dev = 1, 2
 	out, err = exec.DoExecution(context.Background(), dupe.Execution{
 		Key:   testKey,
@@ -884,8 +886,65 @@ func TestDoExecution_CoWClone_CrossDeviceNotShared(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cross-device clone: %v", err)
 	}
-	if out.Result != action.ResultCoWCloned {
-		t.Fatalf("different devices: Result = %v, want ResultCoWCloned", out.Result)
+	if out.Result != action.ResultSkippedCrossDevice {
+		t.Fatalf("different devices: Result = %v, want ResultSkippedCrossDevice", out.Result)
+	}
+}
+
+// TestDoExecution_CoWDetect_PartialCloneRatio covers a group whose clone was
+// partially rewritten: the ratio answers how much each member shares with the rest
+// of its group, so both members report the untouched tail. The kernel's per-extent
+// "shared" flag would answer a different question ("shared with someone") and made
+// the untouched original look 100% shared on filesystems that set it.
+func TestDoExecution_CoWDetect_PartialCloneRatio(t *testing.T) {
+	t.Parallel()
+
+	dir := cloneCapableDir(t)
+	data := randomBytes(t)
+	original := writeFile(t, dir, "a.bin", data)
+	clone := writeFile(t, dir, "clone.bin", data)
+
+	exec := action.New(action.Options{Action: config.ActionCoWClone})
+	if out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, original), fileInfo(t, clone)},
+	}); err != nil || out.Result != action.ResultCoWCloned {
+		t.Fatalf("clone setup: result=%v err=%v", out.Result, err)
+	}
+
+	// Rewrite the first quarter of the clone with the very same bytes: the content
+	// is unchanged, but those blocks can no longer be shared with the original.
+	rewritten := len(data) / 4
+	file, err := os.OpenFile(clone, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, writeErr := file.WriteAt(data[:rewritten], 0); writeErr != nil {
+		_ = file.Close()
+		t.Fatalf("rewrite the clone: %v", writeErr)
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.CoWDetect,
+		Files: []dupe.FileInfo{fileInfo(t, original), fileInfo(t, clone)},
+	})
+	if err != nil {
+		t.Fatalf("CoWDetect: %v", err)
+	}
+	if out.FileShared == nil {
+		t.Skip("extent information unavailable")
+	}
+
+	want := int64(len(data) - rewritten)
+	for i, shared := range out.FileShared {
+		if shared != want {
+			t.Errorf("member %d shared = %d, want %d (the group shares the untouched tail)", i, shared, want)
+		}
 	}
 }
 
