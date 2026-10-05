@@ -18,11 +18,6 @@ func Supported() bool { return true }
 // Identity describes what Extent.Physical carries on this platform.
 func Identity() string { return "physical LCN (FSCTL_GET_RETRIEVAL_POINTERS)" }
 
-const (
-	retrievalPointersHeaderSize = 16
-	retrievalPointerPairSize    = 16
-)
-
 // startingVcnInput mirrors STARTING_VCN_INPUT_BUFFER.
 type startingVcnInput struct {
 	StartingVcn int64
@@ -76,11 +71,13 @@ func query(path string) ([]Extent, error) {
 			return nil, ioErr
 		}
 
-		extentCount := *(*uint32)(unsafe.Pointer(&buf[0]))
+		// The count comes from the driver: bound it by what the buffer can hold
+		// before it sizes an allocation.
+		extentCount := boundedExtentCount(*(*uint32)(unsafe.Pointer(&buf[0])), len(buf))
 		prevVcn := *(*int64)(unsafe.Pointer(&buf[8]))
 
 		out := make([]Extent, 0, extentCount)
-		for i := uint32(0); i < extentCount; i++ {
+		for i := range extentCount {
 			base := retrievalPointersHeaderSize + int(i)*retrievalPointerPairSize
 			if base+retrievalPointerPairSize > len(buf) {
 				break

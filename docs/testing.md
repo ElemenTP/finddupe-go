@@ -142,12 +142,13 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestPool_WaitBlocks` | `Wait()` blocks until completion |
 | `TestPool_ZeroSize` | Size 0 → defaults to `runtime.NumCPU()` |
 
-### `internal/extent` (11 tests)
+### `internal/extent` (12 tests)
 
 | Test | Description |
 |------|-------------|
 | `TestSharedWithGroupOverlap` | Table test: partial/identical/disjoint/multiple overlaps, encoded extents without a physical start ignored |
 | `TestQuery_SparseFileIsNotUnsupported` | Regression: a file with nothing allocated is "nothing shared", not "this filesystem is unsupported" |
+| `TestBoundedExtentCount` | A driver-reported extent count is bounded by the buffer before it sizes an allocation or drives the walk |
 | `TestQuery_HardlinksShareExtents` | Two hardlinked 64KB files share every byte; skips if `ErrUnsupported` |
 | `TestQuery_LengthsClampedToFileSize` | Regression: extent lengths never run past EOF, so a sharing ratio cannot exceed 100% |
 | `TestAppendBatch` (linux only) | FIEMAP batch bookkeeping: which offset the next request starts from, so a non-advancing response cannot loop forever |
