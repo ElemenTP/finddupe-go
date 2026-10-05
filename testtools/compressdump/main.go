@@ -13,14 +13,18 @@ import (
 	"finddupe/internal/dupe"
 )
 
+// usageExitCode is returned when no path was given, like a flag error.
+const usageExitCode = 2
+
 func main() {
-	if len(os.Args) < 2 {
+	if len(os.Args) < usageExitCode-1 {
 		fmt.Fprintf(os.Stderr, "usage: %s <path> [path...]\n", os.Args[0])
-		os.Exit(2)
+		os.Exit(usageExitCode)
 	}
 
 	status := 0
 	for _, path := range os.Args[1:] {
+		//nolint:gosec // the paths come from the probe script's own command line
 		info, err := os.Stat(path)
 		if err != nil {
 			fmt.Printf("%s: cannot stat: %v\n", path, err)
