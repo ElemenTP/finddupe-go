@@ -319,6 +319,22 @@ The Windows probe bundle was run against a ReFS Dev Drive (Windows 11, ReFS 3.14
   of the clone path names itself in its error, so a probe log identifies the call
   that failed instead of reporting "not supported on this filesystem" for
   everything.
+- **The cluster size is resolved three ways.** `GetDiskFreeSpaceW` needs a volume
+  *root*, and that Dev Drive answered `ERROR_FILE_NOT_FOUND` for both the mount
+  point (GetVolumePathNameW) and the drive letter, which broke the clone path and
+  — because an extent query needs the cluster size to turn cluster numbers into
+  bytes — silently made `find --cow` report 0% shared. `volinfo.ClusterSize` now
+  tries the mount point, then the drive letter, and finally asks the volume through
+  a handle on the path itself (`FILE_FS_SIZE_INFORMATION`, which needs no root);
+  the answer of that last route is validated (a power of two between 512 bytes and
+  64 MiB) so a wrong information class cannot poison it. Every attempt's error is
+  joined into the returned error.
+- **An unsupported extent query stays an error off Unix.** The sparse-file special
+  case ("an unallocated file shares nothing") is decided from the allocation block
+  count, which only Unix exposes. On other platforms the query error is now kept
+  instead of being converted into an empty mapping — that conversion is what made
+  the probe report `extents=0` with no error while the volume had answered
+  nothing.
 
 ## Compressed-btrfs Caveat
 

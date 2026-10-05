@@ -43,8 +43,10 @@ func Query(path string, size int64) ([]Extent, error) {
 		// like one they cannot report extents for (btrfs answers EOPNOTSUPP for a
 		// fully sparse file). An unallocated file shares nothing, which is a real
 		// answer; only a file with data on disk makes the missing information a
-		// limitation of the filesystem.
-		if size > 0 && !hasAllocatedBlocks(path) {
+		// limitation of the filesystem. On platforms that cannot tell the two
+		// apart the error is kept: turning it into "no extents" would report
+		// "nothing is shared" for a query that was never answered.
+		if size > 0 && unallocatedFile(path) {
 			return nil, nil
 		}
 		return nil, err

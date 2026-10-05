@@ -4,8 +4,9 @@ package volinfo
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -21,23 +22,146 @@ var (
 	procGetVolumePathNameW = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetVolumePathNameW")
 )
 
+// Cluster size bounds used to validate the answer of the handle-based fallback:
+// every filesystem the tools support uses a power of two between these values,
+// so a reply that does not fit was read from the wrong structure.
+const (
+	minClusterSize = 512
+	maxClusterSize = 64 * 1024 * 1024
+)
+
+// fileFsSizeInformationClass is the FILE_INFO_BY_HANDLE_CLASS value for
+// FILE_FS_SIZE_INFORMATION. The value collides with another information class,
+// which is why the answer is validated below.
+const fileFsSizeInformationClass = 3
+
+// fileFsSizeInformation mirrors FILE_FS_SIZE_INFORMATION.
+type fileFsSizeInformation struct {
+	TotalAllocationUnits     int64
+	AvailableAllocationUnits int64
+	SectorsPerAllocationUnit uint32
+	BytesPerSector           uint32
+}
+
 // ClusterSize returns the cluster size (allocation unit) of the volume that
-// contains path, caching results per volume mount point. Block cloning can only
-// duplicate whole clusters, and the extent query needs the size to turn cluster
-// numbers into byte offsets.
+// contains path, caching results per volume. Block cloning can only duplicate
+// whole clusters, and the extent query needs the size to turn cluster numbers
+// into byte offsets.
+//
+// Three ways are tried, because the first two depend on resolving a volume root
+// and a volume may refuse that (a ReFS Dev Drive answered ERROR_FILE_NOT_FOUND
+// for both the mount point and the drive letter):
+//
+//  1. GetDiskFreeSpaceW on the mount point of the path (correct for volumes
+//     mounted at a folder, which filepath.VolumeName cannot express);
+//  2. GetDiskFreeSpaceW on the drive letter;
+//  3. the volume's own answer through a handle on the path itself
+//     (FILE_FS_SIZE_INFORMATION), which needs no root at all.
+//
+// path may be a file or a directory; it must exist for the third attempt.
 func ClusterSize(path string) (uint64, error) {
-	root, rootErr := volumeRoot(path)
-	if rootErr != nil {
-		return 0, rootErr
+	abs := absolutePath(path)
+
+	if size, ok := cachedClusterSize(abs); ok {
+		return size, nil
 	}
 
-	clusterMu.Lock()
-	cached, ok := clusterCache[root]
-	clusterMu.Unlock()
-	if ok {
-		return cached, nil
+	roots, mountErr := candidateRoots(abs)
+	attempts := make([]error, 0, len(roots)+2)
+	if mountErr != nil {
+		attempts = append(attempts, fmt.Errorf("volume mount point of %s: %w", abs, mountErr))
 	}
 
+	for _, root := range roots {
+		size, err := clusterSizeOfRoot(root)
+		if err != nil {
+			attempts = append(attempts, fmt.Errorf("GetDiskFreeSpaceW(%q): %w", root, err))
+			continue
+		}
+		storeClusterSize(root, size)
+		return size, nil
+	}
+
+	size, err := clusterSizeFromHandle(abs)
+	if err != nil {
+		attempts = append(attempts, fmt.Errorf("FILE_FS_SIZE_INFORMATION on %s: %w", abs, err))
+		return 0, errors.Join(attempts...)
+	}
+	storeClusterSize(volumeCacheKey(abs), size)
+	return size, nil
+}
+
+// absolutePath makes path absolute, falling back to the input when it cannot.
+func absolutePath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return abs
+}
+
+// candidateRoots returns the volume roots to ask about, mount point first, plus
+// the error the mount point lookup hit (it is diagnostic even when the drive
+// letter still works).
+func candidateRoots(abs string) ([]string, error) {
+	var (
+		roots []string
+		err   error
+	)
+
+	if mount, mountErr := volumeMountPoint(abs); mountErr != nil {
+		err = mountErr
+	} else if mount != "" {
+		roots = append(roots, mount)
+	}
+	if drive := filepath.VolumeName(abs); drive != "" {
+		if root := drive + `\`; len(roots) == 0 || roots[0] != root {
+			roots = append(roots, root)
+		}
+	}
+	return roots, err
+}
+
+// volumeMountPoint returns the mount point the path belongs to. It is the
+// correct answer for a volume mounted at a folder, where filepath.VolumeName
+// would name the drive that hosts the mount point instead.
+func volumeMountPoint(abs string) (string, error) {
+	p, err := windows.UTF16PtrFromString(abs)
+	if err != nil {
+		return "", err
+	}
+
+	buf := make([]uint16, windows.MAX_PATH+1)
+	n, _, callErr := procGetVolumePathNameW.Call(
+		uintptr(unsafe.Pointer(p)),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+	)
+	if n == 0 || int(n) > len(buf) {
+		if errno, ok := callErr.(syscall.Errno); ok && errno != 0 {
+			return "", fmt.Errorf("GetVolumePathNameW: %w", errno)
+		}
+		return "", errors.New("GetVolumePathNameW returned no path")
+	}
+
+	mount := windows.UTF16ToString(buf[:n])
+	if mount == "" {
+		return "", errors.New("GetVolumePathNameW returned an empty path")
+	}
+	return withTrailingSeparator(mount), nil
+}
+
+// withTrailingSeparator returns root with exactly one trailing backslash, which
+// GetDiskFreeSpaceW requires.
+func withTrailingSeparator(root string) string {
+	for len(root) > 1 && (root[len(root)-1] == '\\' || root[len(root)-1] == '/') {
+		root = root[:len(root)-1]
+	}
+	return root + `\`
+}
+
+// clusterSizeOfRoot asks GetDiskFreeSpaceW about one root path.
+func clusterSizeOfRoot(root string) (uint64, error) {
 	p, err := windows.UTF16PtrFromString(root)
 	if err != nil {
 		return 0, err
@@ -62,59 +186,71 @@ func ClusterSize(path string) (uint64, error) {
 
 	size := uint64(sectorsPerCluster) * uint64(bytesPerSector)
 	if size == 0 {
-		return 0, errors.New("unknown cluster size")
+		return 0, errors.New("GetDiskFreeSpaceW reported a zero cluster size")
 	}
-
-	clusterMu.Lock()
-	clusterCache[root] = size
-	clusterMu.Unlock()
 	return size, nil
 }
 
-// volumeRoot returns the mount point the path belongs to. filepath.VolumeName
-// would answer with the drive letter, which is the wrong volume for a volume
-// mounted at a folder (C:\mnt\vol): the cluster size and the extent offsets
-// would then be taken from the wrong filesystem and the clone would be
-// misaligned or rejected.
-func volumeRoot(path string) (string, error) {
-	abs, absErr := filepath.Abs(path)
-	if absErr != nil {
-		abs = path
-	}
-
-	p, err := windows.UTF16PtrFromString(abs)
+// clusterSizeFromHandle asks the volume through a handle on the path itself:
+// FILE_FS_SIZE_INFORMATION reports the sectors per allocation unit and the bytes
+// per sector of the volume that hosts the handle, with no volume root involved.
+func clusterSizeFromHandle(abs string) (uint64, error) {
+	file, err := os.Open(abs)
 	if err != nil {
-		return "", err
+		return 0, err
 	}
+	defer file.Close()
 
-	buf := make([]uint16, windows.MAX_PATH+1)
-	n, _, callErr := procGetVolumePathNameW.Call(
-		uintptr(unsafe.Pointer(p)),
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(len(buf)),
+	var info fileFsSizeInformation
+	infoErr := windows.GetFileInformationByHandleEx(
+		windows.Handle(file.Fd()),
+		fileFsSizeInformationClass,
+		(*byte)(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
 	)
-	if n == 0 {
-		// A path that does not exist yet (the temporary name a clone is about to
-		// be created under) has no mount point to report. Falling back to the
-		// drive letter is still right for the common case; only a volume mounted
-		// at a folder needs the answer above.
-		if drive := filepath.VolumeName(abs); drive != "" {
-			return drive + `\`, nil
-		}
-		if errno, ok := callErr.(syscall.Errno); ok && errno != 0 {
-			return "", errno
-		}
-		return "", errors.New("GetVolumePathNameW failed")
+	if infoErr != nil {
+		return 0, infoErr
 	}
 
-	root := windows.UTF16ToString(buf[:n])
-	if root == "" {
-		return "", errors.New("unknown volume mount point")
+	size := uint64(info.SectorsPerAllocationUnit) * uint64(info.BytesPerSector)
+	if size < minClusterSize || size > maxClusterSize || size&(size-1) != 0 {
+		return 0, fmt.Errorf("implausible cluster size %d (%d sectors of %d bytes)",
+			size, info.SectorsPerAllocationUnit, info.BytesPerSector)
 	}
-	// Mount points are cached in a canonical form so two spellings of the same
-	// volume share one entry.
-	if !strings.HasSuffix(root, `\`) {
-		root += `\`
+	return size, nil
+}
+
+// volumeCacheKey is the stable key a volume's answer is cached under.
+func volumeCacheKey(abs string) string {
+	if drive := filepath.VolumeName(abs); drive != "" {
+		return drive + `\`
 	}
-	return root, nil
+	return filepath.Dir(abs)
+}
+
+// cachedClusterSize returns a cached answer for the path's volume, if any.
+func cachedClusterSize(abs string) (uint64, bool) {
+	clusterMu.Lock()
+	defer clusterMu.Unlock()
+
+	if size, ok := clusterCache[volumeCacheKey(abs)]; ok {
+		return size, true
+	}
+	roots, _ := candidateRoots(abs)
+	for _, root := range roots {
+		if size, ok := clusterCache[root]; ok {
+			return size, true
+		}
+	}
+	return 0, false
+}
+
+// storeClusterSize caches an answer under the root that produced it and under
+// its canonical spelling, so later lookups hit it immediately.
+func storeClusterSize(root string, size uint64) {
+	clusterMu.Lock()
+	defer clusterMu.Unlock()
+
+	clusterCache[root] = size
+	clusterCache[withTrailingSeparator(root)] = size
 }
