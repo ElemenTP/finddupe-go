@@ -468,8 +468,10 @@ func symlinkTarget(path string) (string, error) {
 // entryInfo returns the metadata of the file an entry refers to. Symlinks are
 // resolved only when opts.FollowSymlinks is set. A nil FileInfo with a nil
 // error means "skip this entry": a symlink that is not followed, a broken link,
-// or something that is not a regular file or directory. resolved is the
-// canonical path of a followed symlink and is only used for directories.
+// or something that is not a regular file or directory. resolved is the canonical
+// path of a followed symlink; it is used for the path a link to a *file* is
+// reported under (so an action operates on the file whose content was verified,
+// not on the link) and for walking a link to a directory.
 func (w *Walker) entryInfo(path string, d os.DirEntry, opts WalkOptions) (os.FileInfo, string, error) {
 	if d.Type()&os.ModeSymlink == 0 {
 		info, err := d.Info()
@@ -727,9 +729,13 @@ func pathDepth(baseDir, path string) int {
 // components: "**" matches zero or more components, every other component must
 // match exactly one via [filepath.Match].
 //
-// The greedy backtracking below is linear in the number of components; a
-// recursive implementation retried every split point at every "**", which made a
-// pattern such as "**/**/**/**/*.txt" cost minutes per candidate file.
+// The matcher is the usual greedy two-pointer scan: each "**" is retried one
+// component further only after the rest of the pattern failed there, so the work
+// is bounded by O(pattern components × path components) per candidate. That is
+// what replaced the recursive implementation, which retried every split point at
+// every "**" and made a pattern such as "**/**/**/**/*.txt" cost minutes per
+// candidate file. Adjacent "**" are collapsed at compile time, so a pattern of
+// repeated stars is a single one by the time it gets here.
 func matchComponents(patParts, nameParts []string) bool {
 	var (
 		patIdx  int

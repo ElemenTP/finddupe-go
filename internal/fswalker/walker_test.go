@@ -645,7 +645,9 @@ func TestWalk_ManyDoubleStarsTerminate(t *testing.T) {
 	}
 	writeFile(t, deep, "x.txt", "content")
 
-	pattern := filepath.Join(dir, strings.Repeat("**/", 8)+"*.bin") // matches nothing
+	// Interleaved literals keep every "**" alive: eight adjacent stars would be
+	// collapsed into one at compile time and would never exercise the backtracking.
+	pattern := filepath.Join(dir, strings.Repeat("**/nope/", 8)+"*.bin") // matches nothing
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
