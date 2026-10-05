@@ -3,6 +3,7 @@ package action
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 
@@ -179,12 +180,48 @@ func cloneReplace(src, dst string) error {
 			return cloneErr
 		}
 
+		// The clone's bytes came from src, so anything that describes where those
+		// bytes live belongs to src as well; the victim's metadata must not decide
+		// it (see preserveDataLayout). It goes first so that the victim's file flags,
+		// which are applied after, cannot block the attribute writes.
+		if layoutErr := preserveDataLayout(tmpPath, src); layoutErr != nil {
+			_ = os.Remove(tmpPath)
+			return layoutErr
+		}
+
 		if metaErr := preserveVictimMetadata(tmpPath, dst); metaErr != nil {
 			_ = os.Remove(tmpPath)
 			return metaErr
 		}
+
+		// A clone must hold as many bytes as the file it was cloned from. This is
+		// what stands between a filesystem that silently produced an unusable clone
+		// and the victim being replaced by it: the victim is left untouched and the
+		// action is reported as failed instead.
+		if sizeErr := requireSameSize(tmpPath, src); sizeErr != nil {
+			_ = os.Remove(tmpPath)
+			return sizeErr
+		}
 		return nil
 	})
+}
+
+// requireSameSize checks that a clone holds as many bytes as the file it was
+// cloned from.
+func requireSameSize(clonePath, sourcePath string) error {
+	cloneInfo, err := os.Stat(clonePath)
+	if err != nil {
+		return err
+	}
+	sourceInfo, err := os.Stat(sourcePath)
+	if err != nil {
+		return err
+	}
+	if cloneInfo.Size() != sourceInfo.Size() {
+		return fmt.Errorf("clone of %s holds %d bytes instead of %d: refused to replace the duplicate with it",
+			sourcePath, cloneInfo.Size(), sourceInfo.Size())
+	}
+	return nil
 }
 
 // preserveVictimMetadata gives the clone the victim's metadata — as much of it

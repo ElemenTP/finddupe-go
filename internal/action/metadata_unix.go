@@ -139,17 +139,29 @@ func listXattrs(path string) ([]string, bool) {
 	return names, true
 }
 
-// copyXattr copies one extended attribute between files.
+// copyXattr copies one extended attribute between files, ignoring every failure:
+// losing metadata is preferable to failing a replacement whose content is already
+// in place.
 func copyXattr(dst, src, name string) {
+	_ = copyXattrErr(dst, src, name)
+}
+
+// copyXattrErr copies one extended attribute and reports why it failed. It is
+// used where a missing attribute would corrupt the file rather than merely lose
+// metadata — the compressed payload a clone inherited with its data.
+func copyXattrErr(dst, src, name string) error {
 	size, err := unix.Getxattr(src, name, nil)
-	if err != nil || size <= 0 {
-		return
+	if err != nil {
+		return err
+	}
+	if size <= 0 {
+		return nil
 	}
 
 	value := make([]byte, size)
 	n, err := unix.Getxattr(src, name, value)
 	if err != nil {
-		return
+		return err
 	}
-	_ = unix.Setxattr(dst, name, value[:n], 0)
+	return unix.Setxattr(dst, name, value[:n], 0)
 }

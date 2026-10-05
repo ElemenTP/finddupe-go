@@ -98,7 +98,8 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDoExecution_DupeElim_SymlinkVictimSkipped` | A path that became a symlink after hashing is never acted on, even when its target still matches |
 | `TestDoExecution_CoWClone_PreservesReadOnlyVictimMetadata` | Regression: a read-only victim keeps its extended attributes (the final mode is applied after them) |
 | `TestDataLayoutXattr` | The attributes that carry a file's data layout (macOS decmpfs/resource fork) are exempt from the victim-metadata sync; user metadata is not |
-| `TestDoExecution_CoWClone_KeepsCompressedLayout` (darwin) | Regression: cloning a decmpfs-compressed keeper over an uncompressed victim kept the content and the compression attributes (it used to leave a zero-length file) |
+| `TestDoExecution_CoWClone_KeepsCompressedLayout` (darwin) | Regression: cloning a decmpfs-compressed keeper over an uncompressed victim kept the content, the compression attributes, the `UF_COMPRESSED` flag and the keeper's size (it used to leave a zero-length file) |
+| `TestDoExecution_CoWClone_DoesNotInheritVictimCompression` (darwin) | The other half of the rule: cloning an uncompressed keeper over a compressed victim must not attach the victim's compressed container to the clone |
 
 ### `internal/fswalker` (33 tests)
 

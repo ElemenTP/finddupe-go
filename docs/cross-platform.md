@@ -241,12 +241,16 @@ Verified on a Darwin 27.0.0 / macOS 27 ARM64 APFS data volume:
 - **A clone must keep the data layout it inherited.** Cloning a compressed keeper
   over an uncompressed victim used to end in data loss: the metadata sync removed
   every attribute the victim did not have, which stripped `com.apple.decmpfs` and
-  `com.apple.ResourceFork` (where the payload lives) and left a **zero-length**
-  file in place of a 2 MiB duplicate — the probe's `cmp` check and the
-  `1 files of zero length were skipped` line caught it. Attributes that describe
-  where the bytes live are now exempt from the victim-metadata sync in both
-  directions (`internal/action/xattr_layout_darwin.go`), because the clone's data
-  comes from the keeper.
+  `com.apple.ResourceFork` (where the payload lives), and the file-flags pass then
+  replaced the clone's `UF_COMPRESSED` with the victim's (unset) flag — a
+  compressed payload marked uncompressed reads back as **zero bytes**, and that
+  empty file replaced a 2 MiB duplicate. The probe's `cmp` check and the
+  `1 files of zero length were skipped` line caught it. Three things follow the
+  cloned data now: attributes that describe where the bytes live
+  (`xattr_layout_darwin.go`), the storage file flags `UF_COMPRESSED` and
+  `UF_DATAVAULT` (`flags_darwin.go`), and an explicit layout sync plus a size
+  invariant in `cloneReplace` — the clone must report the keeper's size, and the
+  victim is left untouched with the action reported as failed if it does not.
 
 `getattrlist` itself is still invoked through the raw syscall trap because
 `golang.org/x/sys/unix` (through v0.48.0) exports no libSystem wrapper for it —

@@ -348,12 +348,22 @@ All platforms go through `cloneReplace(src, dst)` in `internal/action/cow.go`:
    → ResultAlreadyShared (no clone, no file change)
 1. Create a temporary file next to the victim
 2. Clone the keeper into the temporary path (platform-specific)
-3. Restore the victim's metadata on the temporary file: ownership, mode
+3. Complete the clone's data layout from the keeper: the clone holds the keeper's
+   bytes, so attributes that describe where those bytes live are the keeper's.
+   macOS needs this explicitly — a decmpfs-compressed file keeps its payload in
+   com.apple.ResourceFork, its header in com.apple.decmpfs and its state in the
+   UF_COMPRESSED flag, and a clone that loses them reads back as zero bytes
+4. Restore the victim's metadata on the temporary file: ownership, mode
    (including setuid/setgid/sticky), extended attributes (which carry POSIX
    ACLs on Linux and resource forks on macOS), timestamps, and (macOS) BSD
-   file flags. Unlike a hardlink, a clone has its own inode, so the victim's
-   identity can be preserved instead of inheriting the keeper's
-4. Atomically replace the victim (os.Rename on Unix,
+   file flags. Storage attributes and storage flags are exempt from that sync in
+   both directions, because they belong to the cloned data. Unlike a hardlink, a
+   clone has its own inode, so the victim's identity can be preserved instead of
+   inheriting the keeper's
+5. Check that the clone reports the keeper's size. A clone that does not is never
+   put in place: the temporary file is removed, the victim is untouched and the
+   action is reported as failed
+6. Atomically replace the victim (os.Rename on Unix,
    MoveFileEx(REPLACE_EXISTING) on Windows)
 ```
 

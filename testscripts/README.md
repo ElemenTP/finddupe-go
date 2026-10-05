@@ -106,7 +106,9 @@ Verified on Darwin 27 / macOS 27 ARM64:
 - compressed files (`afsctool -c`) fall back to the APFS clone ID; `extentdump`
   shows `opaque=true`, and a `cp -c` clone of one reports 100% shared;
 - `cmp src.bin compClone.bin: identical` — a mismatch here means a clone no longer
-  holds its source's bytes; report the log, it is a data-loss bug.
+  holds its source's bytes, and `1 files of zero length were skipped` on the next
+  `find` is the same symptom (the compressed payload was lost while the file was
+  marked uncompressed); report the log, it is a data-loss bug.
 
 ### What a healthy Windows/ReFS run looks like
 
