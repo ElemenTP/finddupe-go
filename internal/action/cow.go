@@ -208,9 +208,19 @@ func cloneReplace(src, dst string) error {
 			return layoutErr
 		}
 
-		if metaErr := preserveVictimMetadata(tmpPath, dst); metaErr != nil {
+		victimInfo, cleared, metaErr := preserveVictimMetadata(tmpPath, dst)
+		if metaErr != nil {
 			_ = os.Remove(tmpPath)
 			return metaErr
+		}
+
+		// Everything below can still fail and the victim was already made
+		// replaceable: put its write protection back before giving up, so a failed
+		// clone leaves the victim exactly as it was found.
+		abandon := func(err error) error {
+			restoreWriteProtection(dst, victimInfo, cleared)
+			_ = os.Remove(tmpPath)
+			return err
 		}
 
 		// A clone must hold as many bytes as the file it was cloned from. This is
@@ -218,8 +228,7 @@ func cloneReplace(src, dst string) error {
 		// and the victim being replaced by it: the victim is left untouched and the
 		// action is reported as failed instead.
 		if sizeErr := requireSameSize(tmpPath, src); sizeErr != nil {
-			_ = os.Remove(tmpPath)
-			return sizeErr
+			return abandon(sizeErr)
 		}
 		return nil
 	})
@@ -244,24 +253,30 @@ func requireSameSize(clonePath, sourcePath string) error {
 }
 
 // preserveVictimMetadata gives the clone the victim's metadata — as much of it
-// as the platform can restore, see preserveMetadata — and clears write
-// protection on the victim, which Windows requires before it can be replaced.
+// as the platform can restore, see preserveMetadata — and then clears the victim's
+// write protection, which Windows needs before it can be replaced. The victim's
+// stat and whether its mode was changed are returned so a later failure can put the
+// protection back; on Unix clearing is a no-op and nothing needs restoring.
 //
 // Unlike hardlinking, cloning does not share an inode with the keeper, so the
 // victim's identity can be preserved instead of inheriting the keeper's.
-func preserveVictimMetadata(tmpPath, dst string) error {
+func preserveVictimMetadata(tmpPath, dst string) (os.FileInfo, bool, error) {
 	info, err := os.Stat(dst)
 	if err != nil {
 		// The victim vanished: do not resurrect it from the keeper's content.
-		return err
+		return nil, false, err
 	}
 
+	// The metadata is applied before the victim's mode is touched, so the clone
+	// inherits the mode the user gave the victim even where making the victim
+	// writable is unavoidable.
 	if metaErr := preserveMetadata(tmpPath, dst); metaErr != nil {
-		return metaErr
+		return nil, false, metaErr
 	}
 
-	if info.Mode().Perm()&0o200 == 0 {
-		return os.Chmod(dst, info.Mode().Perm()|0o200)
+	cleared, clearErr := clearWriteProtection(dst, info)
+	if clearErr != nil {
+		return nil, false, clearErr
 	}
-	return nil
+	return info, cleared, nil
 }
