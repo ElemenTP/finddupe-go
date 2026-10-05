@@ -252,6 +252,13 @@ func printSteps(name string, steps []step, size int64) {
 
 	distinct := map[int64]struct{}{}
 	holes, mapped, contigUsed, lastErr := 0, 0, 0, syscall.Errno(0)
+
+	// clampedOverrun counts the steps the extent query has to clamp: the kernel
+	// described a run longer than the bytes that are left, which would step the
+	// offset past the end of the file. No real kernel has been seen doing it, so
+	// seeing one here is exactly what the clamp is for.
+	clampedOverrun := 0
+	stepsLeft := size
 	for _, s := range steps {
 		distinct[s.devOffset] = struct{}{}
 		if s.devOffset < 0 {
@@ -265,9 +272,21 @@ func printSteps(name string, steps []step, size int64) {
 		if s.errno != 0 {
 			lastErr = s.errno
 		}
+		if s.contig > stepsLeft && stepsLeft >= 0 {
+			clampedOverrun++
+		}
+		if s.contig > 0 {
+			stepsLeft -= s.contig
+		} else {
+			stepsLeft -= 4096
+		}
 	}
-	fmt.Printf("     summary: steps=%d mapped=%d holes=%d distinct-devoffsets=%d contig>0-steps=%d last-errno=%d size=%d\n",
-		len(steps), mapped, holes, len(distinct), contigUsed, lastErr, size)
+	fmt.Printf("     summary: steps=%d mapped=%d holes=%d distinct-devoffsets=%d contig>0-steps=%d clamped-overruns=%d last-errno=%d size=%d\n",
+		len(steps), mapped, holes, len(distinct), contigUsed, clampedOverrun, lastErr, size)
+	if clampedOverrun > 0 {
+		fmt.Printf("     NOTE: %d step(s) reported a contiguous run longer than the file has left;\n"+
+			"           the extent query clamps these, report this log.\n", clampedOverrun)
+	}
 }
 
 // compare walks two files block by block with variant A (falling back to B)

@@ -93,6 +93,32 @@ The whole script output (it is split into `== section ==` markers), plus:
   implement NTFS per-file compression (`compact /c` reports "The request is not
   supported"), which also means `--prefer-compressed` never changes anything there.
 
+### Sections every probe runs
+
+Besides the CoW/compression scenarios, both scripts now end with:
+
+- **`--hardlink` / `--delete`**: the other elimination actions share the decision
+  path (freshness re-check, write protection, metadata). Expect one inode for both
+  names after the hardlink (the script checks it) and exactly one `del-*.bin` left
+  after the delete.
+- **A read-only victim**: the file that sorts *first* is the keeper, so the
+  read-only one must be named `ro-victim.bin` to be the victim. Without `-r` the run
+  reports `Skipping duplicate readonly file` / `N read-only files skipped`; with `-r`
+  the victim is replaced and keeps mode `0444` and its `user.probe` attribute
+  (Linux). This is where the read-only xattr regression lived.
+- **`--prefer-compressed` A/B**: two groups with identical content and different
+  compression state (on btrfs the plain member needs `btrfs property set … compression
+  no` plus an in-place rewrite, which the script does). Without `-C` the smallest
+  path wins and the group ends uncompressed; with `-C` the compressed member is the
+  keeper and every member still reports `compressed=true`. On ReFS both are `false`:
+  the flag is a no-op there.
+
+The Windows script asks `Get-Volume -FilePath` about the target path, so a volume
+mounted at a folder is described by its own filesystem rather than by the host drive
+letter. `darwinfiemap`'s summary prints `clamped-overruns=N`: a step whose kernel
+contiguous run is longer than the file has left is what the extent query's clamp is
+for, so a non-zero value there is worth reporting with the log.
+
 ### What a healthy macOS/APFS run looks like
 
 Verified on Darwin 27 / macOS 27 ARM64:

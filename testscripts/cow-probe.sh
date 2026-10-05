@@ -368,6 +368,101 @@ if [ "$OS" = "Darwin" ] && [ -n "${FIEMAP:-}" ] && [ -x "${FIEMAP:-}" ]; then
 	show "$FIEMAP" "$FI/text.bin" "$FI/text-clone.bin"
 fi
 
+# 6. The other elimination actions, and a read-only victim. --cow is the action the
+#    probe was written for, but --hardlink and --delete run on the same decision
+#    path (freshness re-check, write-protection handling, metadata) and are the ones
+#    a real machine can still surprise us on: hardlinking must produce one inode for
+#    both names, deleting must leave the keeper's bytes alone.
+ACT="$DIR/actions"
+rm -rf "$ACT"
+mkdir -p "$ACT"
+
+random_file "$ACT/hard-src.bin" 262144
+independent_copy "$ACT/hard-src.bin" "$ACT/hard-dst.bin"
+section "dedupe --hardlink: replace the duplicate with a hardlink"
+show "$FD" dedupe --hardlink --no-progress "$ACT"
+ls -li "$ACT"/*.bin 2>&1
+if [ "$(ls -i "$ACT/hard-src.bin" | awk '{print $1}')" = "$(ls -i "$ACT/hard-dst.bin" | awk '{print $1}')" ]; then
+	echo "hardlink: both names share one inode (expected)"
+else
+	echo "hardlink: *** the two names do NOT share an inode ***"
+fi
+
+random_file "$ACT/del-src.bin" 262144
+independent_copy "$ACT/del-src.bin" "$ACT/del-dst.bin"
+section "dedupe --delete: remove the duplicate"
+show "$FD" dedupe --delete --no-progress "$ACT"
+find "$ACT" -name 'del-*.bin' -printf '%f %s\n' 2>/dev/null || ls -l "$ACT"
+echo "expect: one del-*.bin left, 262144 bytes"
+
+# Read-only victim: --cow skips it unless -r is given, and with -r the clone must
+# still carry the victim's metadata (mode and xattr where the probe can set one).
+# The read-only file has to *be* the victim, so the keeper is the name that sorts
+# first: the keeper policy picks the smallest path.
+RO="$DIR/readonly"
+rm -rf "$RO"
+mkdir -p "$RO"
+random_file "$RO/ro-keep.bin" 131072
+independent_copy "$RO/ro-keep.bin" "$RO/ro-victim.bin"
+if command -v setfattr >/dev/null 2>&1; then
+	setfattr -n user.probe -v victim "$RO/ro-victim.bin" 2>/dev/null || true
+fi
+chmod 0444 "$RO/ro-victim.bin"
+section "dedupe --cow without -r: the read-only victim is skipped"
+show "$FD" dedupe --cow --no-progress "$RO"
+echo "expect: no clone, ro-victim.bin still there"
+section "dedupe --cow -r: the read-only victim is replaced"
+show "$FD" dedupe --cow -r --no-progress "$RO"
+ls -l "$RO" 2>&1
+if command -v getfattr >/dev/null 2>&1; then
+	echo "--- xattr on the replaced victim (expect user.probe=victim on Linux) ---"
+	getfattr -d -m - "$RO/ro-victim.bin" 2>&1 || true
+fi
+echo "expect: mode 0444 kept, and on Linux the user.probe attribute kept"
+
+# --prefer-compressed: the keeper must be the compressed member, so the clone
+# inherits its compressed layout instead of turning the group uncompressed. The two
+# files need identical content (otherwise there is nothing to deduplicate) and
+# genuinely different compression state, which on btrfs needs a per-file property
+# plus an in-place rewrite; both groups are run, without and with -C, so the
+# preference is observable.
+if [ "$OS" = "Darwin" ] || [ -n "${CD:-}" ]; then
+	PC="$DIR/prefer-compressed"
+	rm -rf "$PC"
+	mkdir -p "$PC/with" "$PC/without"
+	yes "compressible content for the prefer-compressed probe" 2>/dev/null | head -c 1048576 >"$PC/with/aa-plain.bin" || true
+	compress_file "$PC/with/aa-plain.bin" >/dev/null 2>&1 || true
+	independent_copy "$PC/with/aa-plain.bin" "$PC/with/zz-compressed.bin"
+	# Make the plain member plain: on btrfs a file inherits the mount's compression
+	# unless it is told not to, and an in-place rewrite stores it the new way.
+	if [ "$OS" != "Darwin" ] && command -v btrfs >/dev/null 2>&1; then
+		btrfs property set "$PC/with/aa-plain.bin" compression no 2>/dev/null || true
+		dd if="$PC/with/zz-compressed.bin" of="$PC/with/aa-plain.bin" conv=notrunc status=none 2>/dev/null || true
+	fi
+	cp -R "$PC/with/." "$PC/without/" 2>/dev/null || true
+
+	section "compression state before --prefer-compressed (expect one plain, one compressed)"
+	if [ -n "${CD:-}" ]; then
+		"$CD" "$PC/with/aa-plain.bin" "$PC/with/zz-compressed.bin" 2>&1
+	fi
+
+	section "dedupe --cow without -C: the smallest path is the keeper"
+	show "$FD" dedupe --cow --no-progress "$PC/without"
+	if [ -n "${CD:-}" ]; then
+		echo "--- without -C: both should now report the keeper's (plain) state ---"
+		"$CD" "$PC/without/aa-plain.bin" "$PC/without/zz-compressed.bin" 2>&1
+	fi
+
+	section "dedupe --cow -C: the compressed member is the keeper"
+	show "$FD" dedupe --cow --prefer-compressed --no-progress "$PC/with"
+	if [ -n "${CD:-}" ]; then
+		echo "--- with -C: both should now be compressed ---"
+		"$CD" "$PC/with/aa-plain.bin" "$PC/with/zz-compressed.bin" 2>&1
+	fi
+	echo "expect: -C keeps the group compressed; without it the plain member wins"
+	echo "(on ReFS --prefer-compressed is a no-op: NTFS per-file compression does not exist there)"
+fi
+
 echo
 echo "================================================================"
 echo "== probe finished; target directory kept at: $DIR"

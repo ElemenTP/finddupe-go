@@ -85,14 +85,13 @@ Section "environment"
 Write-Host ("date:      " + (Get-Date))
 Write-Host ("target:    " + $Dir)
 Write-Host ("powershell " + $PSVersionTable.PSVersion)
-$qualifier = Split-Path -Qualifier $Dir
-$letter = $qualifier.TrimEnd(':')
-Write-Host "--- Get-Volume ---"
-# A volume mounted at a folder has no drive letter: the probe is diagnostic, so
-# report what is available instead of failing.
-$volume = $null
-if ($letter) { $volume = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue }
-if ($volume) { $volume | Format-List 2>&1 | Out-String | Write-Host } else { Write-Host "(no drive letter for $qualifier)" }
+# Ask about the volume the *path* is on. Split-Path -Qualifier would name the host
+# drive for a volume mounted at a folder (C: for C:\mnt\refs), so Get-Volume and
+# the filesystem check below would describe the wrong volume.
+$volume = Get-Volume -FilePath $Dir -ErrorAction SilentlyContinue
+$qualifier = if ($volume -and $volume.DriveLetter) { "$($volume.DriveLetter):" } else { Split-Path -Qualifier $Dir }
+Write-Host "--- Get-Volume (for $Dir) ---"
+if ($volume) { $volume | Format-List 2>&1 | Out-String | Write-Host } else { Write-Host "(no volume found for $Dir)" }
 Write-Host "--- fsutil fsinfo volumeinfo ---"
 & fsutil fsinfo volumeinfo "$qualifier" 2>&1 | Write-Host
 Write-Host "--- fsutil fsinfo refsinfo (ReFS only) ---"
@@ -100,7 +99,7 @@ Write-Host "--- fsutil fsinfo refsinfo (ReFS only) ---"
 
 $fsType = if ($volume) { $volume.FileSystem } else { "" }
 if ($fsType -and $fsType -ne "ReFS") {
-    Write-Warning "volume $qualifier is $fsType, not ReFS; block cloning is expected to be unsupported"
+    Write-Warning "volume $qualifier is $fsType, not ReFS; block cloning is expected to be unsupported (NTFS cannot clone, and --prefer-compressed may choose an NTFS-compressed file whose extents cannot be cloned either)"
 } else {
     Write-Host "volume is ReFS: block cloning should be available"
 }
@@ -227,6 +226,49 @@ Show $FD @("dedupe", "--cow", "--no-progress", $cmp)
 
 Section "find --cow: compressible after cloning"
 Show $FD @("find", "--cow", "--no-progress", $cmp)
+
+# The other elimination actions, a read-only victim, and --prefer-compressed. --cow
+# is what this probe was written for, but --hardlink and --delete share the same
+# decision path (freshness re-check, write protection, metadata) and are what a real
+# machine can still surprise us on.
+$act = Join-Path $Dir "actions"
+New-Item -ItemType Directory -Force -Path $act | Out-Null
+New-RandomFile (Join-Path $act "hard-src.bin") 262144
+New-SameContentCopy (Join-Path $act "hard-src.bin") (Join-Path $act "hard-dst.bin")
+Section "dedupe --hardlink: replace the duplicate with a hardlink"
+Show $FD @("dedupe", "--hardlink", "--no-progress", $act)
+& fsutil hardlink list (Join-Path $act "hard-src.bin") 2>&1 | Write-Host
+
+New-RandomFile (Join-Path $act "del-src.bin") 262144
+New-SameContentCopy (Join-Path $act "del-src.bin") (Join-Path $act "del-dst.bin")
+Section "dedupe --delete: remove the duplicate"
+Show $FD @("dedupe", "--delete", "--no-progress", $act)
+Get-ChildItem $act -Filter "del-*.bin" | Select-Object Name, Length | Format-Table | Out-String | Write-Host
+Write-Host "expect: one del-*.bin left, 262144 bytes"
+
+$ro = Join-Path $Dir "readonly"
+New-Item -ItemType Directory -Force -Path $ro | Out-Null
+New-RandomFile (Join-Path $ro "ro-src.bin") 131072
+New-SameContentCopy (Join-Path $ro "ro-src.bin") (Join-Path $ro "ro-dst.bin")
+Set-ItemProperty -Path (Join-Path $ro "ro-dst.bin") -Name IsReadOnly -Value $true
+Section "dedupe --cow without -r: a read-only victim is skipped"
+Show $FD @("dedupe", "--cow", "--no-progress", $ro)
+Section "dedupe --cow -r: the read-only victim is replaced"
+Show $FD @("dedupe", "--cow", "-r", "--no-progress", $ro)
+Get-ChildItem $ro | Select-Object Name, Length, LastWriteTime | Format-Table | Out-String | Write-Host
+Write-Host "expect: the read-only attribute is kept on the survivor"
+
+$pc = Join-Path $Dir "prefer-compressed"
+New-Item -ItemType Directory -Force -Path $pc | Out-Null
+New-RandomFile (Join-Path $pc "zz-plain.bin") 1048576
+$text = ("finddupe prefer-compressed probe line`n" * 32768)
+[System.IO.File]::WriteAllText((Join-Path $pc "aa-compressed.bin"), $text)
+Section "compression state before --prefer-compressed"
+if ($CD) { & $CD (Join-Path $pc "aa-compressed.bin") (Join-Path $pc "zz-plain.bin") 2>&1 | Write-Host } else { Write-Host "compressdump not found" }
+Section "dedupe --cow --prefer-compressed: the compressed member is the keeper"
+Show $FD @("dedupe", "--cow", "--prefer-compressed", "--no-progress", $pc)
+if ($CD) { & $CD (Join-Path $pc "aa-compressed.bin") (Join-Path $pc "zz-plain.bin") 2>&1 | Write-Host } else { Write-Host "compressdump not found" }
+Write-Host "expect: on ReFS compression is unavailable, so --prefer-compressed changes nothing"
 
 Write-Host ""
 Write-Host "================================================================"
