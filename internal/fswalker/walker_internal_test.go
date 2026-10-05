@@ -109,3 +109,29 @@ func TestPathDepth(t *testing.T) {
 		})
 	}
 }
+
+// TestMatchComponent_CaseFolding covers the platform rule for glob matching. On
+// Windows, where filenames are case-insensitive, "*.TXT" is expected to find
+// "photo.txt" exactly as the shell would; a case-sensitive platform keeps the two
+// apart, because a case-insensitive volume is not detected at run time.
+func TestMatchComponent_CaseFolding(t *testing.T) {
+	t.Parallel()
+
+	if foldCase {
+		for _, tc := range []struct{ pattern, name string }{
+			{pattern: "*.TXT", name: "photo.txt"},
+			{pattern: "PHOTO.TXT", name: "photo.txt"},
+			{pattern: "*.txt", name: "PHOTO.TXT"},
+		} {
+			if !matchComponent(tc.pattern, tc.name) {
+				t.Errorf("matchComponent(%q, %q) = false, want true on a case-folding platform",
+					tc.pattern, tc.name)
+			}
+		}
+		return
+	}
+
+	if matchComponent("*.TXT", "photo.txt") {
+		t.Error(`a case-sensitive platform must not match "*.TXT" against "photo.txt"`)
+	}
+}

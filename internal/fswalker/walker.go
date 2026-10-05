@@ -673,8 +673,7 @@ func (p compiledPattern) matches(path string, depth int) bool {
 	if !p.recursive && p.depth == 1 {
 		// Single-component pattern: match the basename without splitting.
 		base := path[strings.LastIndexAny(path, "/\\")+1:]
-		matched, err := filepath.Match(p.parts[0], base)
-		return err == nil && matched
+		return matchComponent(p.parts[0], base)
 	}
 	return matchComponents(p.parts, relativeParts(p.baseDir, path))
 }
@@ -766,8 +765,13 @@ func matchComponents(patParts, nameParts []string) bool {
 	return patIdx == len(patParts)
 }
 
-// matchComponent matches one path component against one pattern component.
+// matchComponent matches one path component against one pattern component. Where
+// the platform folds case for filenames (Windows) the comparison folds it too, so
+// "*.TXT" finds "photo.txt" as a user of that platform expects; a malformed
+// pattern matches nothing, which the caller reports as a pattern that matched no
+// files.
 func matchComponent(pattern, name string) bool {
+	pattern, name = foldForMatch(pattern, name)
 	matched, err := filepath.Match(pattern, name)
 	return err == nil && matched
 }

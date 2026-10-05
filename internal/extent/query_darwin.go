@@ -150,6 +150,16 @@ func extentsFcntl(path string) ([]Extent, error) {
 		if contig <= 0 {
 			contig = blksize
 		}
+		// The kernel describes one contiguous run, but the clamp keeps a bogus or
+		// stale length from stepping past the end of the file: an offset beyond it
+		// would make the loop report extents for bytes the file does not have, and a
+		// negative one would not terminate.
+		if remaining := size - offset; contig > remaining {
+			contig = remaining
+		}
+		if contig <= 0 {
+			return extents, nil
+		}
 		offset += contig
 	}
 

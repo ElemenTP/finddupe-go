@@ -519,3 +519,11 @@ Go strings are UTF-8 natively:
 - Linux/macOS: filenames are bytes, Go treats as UTF-8
 - Windows: `os.Open` accepts UTF-8 and converts to UTF-16 internally (Go 1.16+)
 - Paths from `filepath.WalkDir` are UTF-8 on all platforms
+
+### Glob Case Folding
+
+On Windows a pattern is matched case-insensitively (`C:\Data\*.TXT` finds
+`photo.txt`), because filenames are case-insensitive there and that is what the
+shell does. Everywhere else the comparison stays case-sensitive, matching the
+shell: an APFS volume can be either, and the tool does not probe for it — a
+case-insensitive macOS volume is therefore matched case-sensitively.
