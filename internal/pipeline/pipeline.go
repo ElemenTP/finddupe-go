@@ -285,8 +285,8 @@ func submitChecksum(
 }
 
 // coordinator owns all detector state while the pipeline runs. It feeds
-// insertions and executor outcomes to the detector, dispatches the resulting
-// executions, and closes the execution channel once no work remains.
+// insertions and executor outcomes to the detector, queues the executions they
+// produce, and closes the execution channel once no work remains.
 type coordinator struct {
 	ctx         context.Context
 	detector    *dupe.Detector
@@ -295,15 +295,22 @@ type coordinator struct {
 	executionCh chan<- dupe.Execution
 	final       func() []dupe.Execution
 	finalDone   bool
+	pending     []dupe.Execution
 	inFlight    int
 	execClosed  bool
 }
 
 // coordinate runs the coordinator loop until the input and all executor
 // outcomes are drained. final, when non-nil, is called once after the input is
-// drained to produce any last batch of work (the CoW groups).
+// drained and no work is in flight, to produce any last batch of work (the CoW
+// groups).
 //
-//nolint:gocognit // the coordinator is an explicit state machine over two channels
+// The loop never sends on the execution channel from outside the select, so it
+// cannot block there while outcomes wait to be read. Blocking sends in the
+// insert/complete paths would deadlock against executors blocked on a full
+// outcome channel, which is exactly what a large scan can hit.
+//
+//nolint:gocognit // explicit state machine over input, outcomes and queued work
 func coordinate(
 	ctx context.Context,
 	detector *dupe.Detector,
@@ -327,106 +334,67 @@ func coordinate(
 	fiCh := fileInfoCh
 	outCh := outcomeCh
 
-	for fiCh != nil || outCh != nil {
+	// Bound the queue of executions waiting to be sent: without a blocking send
+	// there is no natural back-pressure, so stop pulling new files while the
+	// executors are behind. Never below one, so an unbuffered execution channel
+	// still makes progress.
+	backlogLimit := max(cap(executionCh)*channelBufferFactor, 1)
+
+	for fiCh != nil || outCh != nil || len(c.pending) > 0 {
+		// The send case is part of the select so that draining outcomes always
+		// stays possible, even when the execution channel is full.
+		var recv <-chan dupe.FileInfo
+		if len(c.pending) < backlogLimit {
+			recv = fiCh
+		}
+		var send chan<- dupe.Execution
+		var next dupe.Execution
+		if !c.execClosed && len(c.pending) > 0 {
+			send, next = c.executionCh, c.pending[0]
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 
-		case fi, ok := <-fiCh:
+		case fi, ok := <-recv:
 			if !ok {
 				fiCh = nil
-				if c.inFlight == 0 {
-					if !c.finish() {
-						return ctx.Err()
-					}
-				}
-				continue
-			}
-			if !c.insert(fi) {
-				return ctx.Err()
+			} else {
+				c.pending = append(c.pending, c.detector.Insert(fi)...)
 			}
 
 		case out, ok := <-outCh:
 			if !ok {
 				outCh = nil
-				continue
+			} else {
+				reportOutcome(ctx, out, c.stats, c.logger)
+				c.pending = append(c.pending, completeExecution(c.detector, out)...)
+				c.inFlight--
 			}
-			if !c.complete(out) {
-				return ctx.Err()
-			}
-			if fiCh == nil && c.inFlight == 0 {
-				if !c.finish() {
-					return ctx.Err()
+
+		case send <- next:
+			c.pending = c.pending[1:]
+			c.inFlight++
+		}
+
+		// Once the input is drained and nothing is queued or in flight, the
+		// detector state is final: emit the one-shot batch (CoW groups) and, when
+		// that produced nothing, close the execution channel.
+		if fiCh == nil && len(c.pending) == 0 && c.inFlight == 0 {
+			if !c.finalDone {
+				c.finalDone = true
+				if c.final != nil {
+					c.pending = append(c.pending, c.final()...)
 				}
+			}
+			if len(c.pending) == 0 {
+				c.closeExec()
 			}
 		}
 	}
 
 	return nil
-}
-
-// finish dispatches the one-shot final batch (the CoW groups) and closes the
-// execution channel when nothing is left. It must only be called once the input
-// is drained and all hashing work has completed, so the detector state is final.
-func (c *coordinator) finish() bool {
-	if !c.dispatchFinal() {
-		return false
-	}
-	if c.inFlight == 0 {
-		c.closeExec()
-	}
-	return true
-}
-
-// dispatchFinal dispatches the one-shot final batch of work, if any.
-func (c *coordinator) dispatchFinal() bool {
-	if c.finalDone || c.final == nil {
-		return true
-	}
-	c.finalDone = true
-
-	for _, ex := range c.final() {
-		if !c.dispatch(ex) {
-			return false
-		}
-	}
-	return true
-}
-
-// insert feeds a scanned file to the detector and dispatches the work it
-// produces. It reports false when the context is cancelled.
-func (c *coordinator) insert(fi dupe.FileInfo) bool {
-	for _, ex := range c.detector.Insert(fi) {
-		if !c.dispatch(ex) {
-			return false
-		}
-	}
-	return true
-}
-
-// complete reports an executor outcome, feeds it back to the detector and
-// dispatches the follow-up work. It reports false when the context is cancelled.
-func (c *coordinator) complete(out action.Outcome) bool {
-	reportOutcome(c.ctx, out, c.stats, c.logger)
-
-	for _, ex := range completeExecution(c.detector, out) {
-		if !c.dispatch(ex) {
-			return false
-		}
-	}
-	c.inFlight--
-	return true
-}
-
-// dispatch sends one execution and counts it as in flight.
-func (c *coordinator) dispatch(ex dupe.Execution) bool {
-	select {
-	case c.executionCh <- ex:
-		c.inFlight++
-		return true
-	case <-c.ctx.Done():
-		return false
-	}
 }
 
 // closeExec closes the execution channel exactly once.
