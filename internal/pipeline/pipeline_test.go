@@ -118,3 +118,40 @@ func TestRun_ListLink(t *testing.T) {
 		t.Fatalf("Run() = %v, want nil", err)
 	}
 }
+
+// TestRun_FailedActionFailsTheRun verifies that an elimination which failed changes
+// the exit status. The victim is left in place, so a script must be able to tell
+// "everything was deduplicated" from "some victims were not"; the summary names the
+// count and the log carries the reason. Scan-level warnings (an unreadable file)
+// deliberately do not behave this way.
+func TestRun_FailedActionFailsTheRun(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := "identical content, so the pair is a duplicate"
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(dir, "b.txt")
+	if err := os.WriteFile(victim, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A CoW clone onto a filesystem that cannot clone fails the action; on a
+	// filesystem that supports it there is nothing to test here.
+	cfg := &config.Config{
+		Action:       config.ActionCoWClone,
+		Paths:        []string{dir},
+		ShowProgress: false,
+	}
+	err := pipeline.Run(context.Background(), cfg)
+	if err == nil {
+		t.Skip("this filesystem cloned the pair, there is no failing action to observe")
+	}
+	if !strings.Contains(err.Error(), "could not be processed") {
+		t.Fatalf("Run() = %v, want a failure naming the unprocessed files", err)
+	}
+	if _, statErr := os.Lstat(victim); statErr != nil {
+		t.Fatalf("the victim must be left in place: %v", statErr)
+	}
+}

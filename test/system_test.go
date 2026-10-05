@@ -827,15 +827,30 @@ func TestDedupeCoW_Unsupported(t *testing.T) {
 	makeFile(t, dir, "a.txt", "cow test")
 	makeFile(t, dir, "b.txt", "cow test")
 
-	_, stderr, code := run(t, "dedupe", "--cow", dir, "--no-progress")
+	stdout, stderr, code := run(t, "dedupe", "--cow", dir, "--no-progress")
 
-	// CoW should fail with an error (not implemented).
-	// The pipeline logs errors but the process may still exit 0.
-	// We just verify it doesn't crash.
-	if code != 0 {
-		t.Logf("CoW exit code: %d (expected, not implemented)", code)
+	// Both files must still be there: a failed clone leaves the victim in place.
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("expected %s to still exist: %v", name, err)
+		}
 	}
-	_ = stderr
+
+	// Either the filesystem cloned the pair (nothing failed, exit 0) or the clone
+	// failed: then the summary names the unprocessed file and the exit code is
+	// non-zero, so a script can tell the two apart.
+	if strings.Contains(stdout, "could not be processed") {
+		if code == 0 {
+			t.Errorf("exit code = 0 although the summary reports unprocessed files:\n%s", stdout)
+		}
+		if !strings.Contains(stderr, "action failed") && !strings.Contains(stderr, "CoW clone not supported") {
+			t.Errorf("a failed action must be explained on stderr, got:\n%s", stderr)
+		}
+		return
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d although no action failed:\n%s", code, stdout)
+	}
 }
 
 // =============================================================================

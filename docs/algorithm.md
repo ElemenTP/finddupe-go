@@ -427,7 +427,7 @@ Same-inode (hardlinked) aliases are not separate members.
 
 `Dupes:` follows the *decision*, not the action: a pair whose content was verified
 identical counts as a duplicate even when the elimination was skipped (read-only,
-`--ref`, cross-device hardlink, NTFS link limit) or failed, because the duplicate
+`--ref`, cross-device hardlink or clone, NTFS link limit) or failed, because the duplicate
 storage is still there. Three outcomes are deliberately excluded: a pair that
 turned out to be the same inode (already hardlinked) or to already share all its
 extents (already shared) is not duplicate storage, and a pair whose decision was

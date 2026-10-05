@@ -80,7 +80,10 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		err := runListLink(ctx, cfg, stats, logger, report)
 		stopProgress()
 		printSummary(stats, report)
-		return err
+		if err != nil {
+			return err
+		}
+		return actionFailures(stats)
 	}
 
 	walkResultCh := make(chan fswalker.Result, threads*channelBufferFactor)
@@ -138,7 +141,22 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	return misses.err()
+	if missErr := misses.err(); missErr != nil {
+		return missErr
+	}
+	return actionFailures(stats)
+}
+
+// actionFailures turns failed eliminations into a non-zero exit. The summary
+// already names the count and the log carries the reason, but a script has to be
+// able to tell "everything was deduplicated" from "some victims were left alone
+// because the action failed"; a scan-level warning (an unreadable file, a
+// permission error while walking) deliberately stays a warning.
+func actionFailures(stats *dupe.Stats) error {
+	if n := stats.FailedFiles.Load(); n > 0 {
+		return fmt.Errorf("%d files could not be processed: see the log", n)
+	}
+	return nil
 }
 
 // startProgress draws the progress line while the scan runs and returns a stop

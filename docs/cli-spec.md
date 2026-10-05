@@ -292,7 +292,12 @@ CPUs: 16
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| Non-zero (1) | Error (invalid arguments, I/O failure, a pattern that matched no files) or interruption via SIGINT/SIGTERM |
+| Non-zero (1) | Error (invalid arguments, I/O failure, a pattern that matched no files), an elimination that failed (the summary reports `N files could not be processed`, the log has the reason), or interruption via SIGINT/SIGTERM |
+
+Files that could not be *read* during the scan stay a warning: they are skipped and
+counted, but they never change the exit code. A failed action is different — the
+victim was left in place — so a script can rely on a zero exit meaning every
+duplicate decision was carried out.
 
 On SIGINT/SIGTERM the context is cancelled, `pipeline.Run` returns the context error, and `cmd.Execute` exits non-zero.
 
