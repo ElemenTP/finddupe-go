@@ -294,7 +294,24 @@ For the group ratios there are two signals:
    uncompressed files (partial ratios included) and the APFS clone ID for
    decmpfs-compressed files (family-level: 100% or 0%).
 
-### Compressed-btrfs Caveat
+### ReFS / Dev Drive: Measured Behaviour
+
+The Windows probe bundle was run against a ReFS Dev Drive (Windows 11, ReFS 3.14,
+4096-byte clusters) and reported two things worth knowing:
+
+- **`--prefer-compressed` is a no-op there.** ReFS does not implement NTFS per-file
+  compression (`compact /c` answers "The request is not supported"), so every answer
+  is `compressed=false` and the keeper order stays the default one. The flag is only
+  meaningful on Linux (btrfs/zfs) and macOS (APFS).
+- **Extent reporting may be unavailable even though the filesystem is "supported".**
+  On that volume `FSCTL_GET_RETRIEVAL_POINTERS` returned success without writing any
+  data. The query now reports that as "not supported" (`FSCTL_GET_RETRIEVAL_POINTERS
+  returned no data`) instead of an empty mapping, so `find --cow` prints "extent
+  information unavailable on this filesystem; listing members only" rather than
+  claiming 0% shared, while `dedupe --cow` still clones — the clone path only needs
+  `FSCTL_DUPLICATE_EXTENTS_TO_FILE` and the volume's cluster size.
+
+## Compressed-btrfs Caveat
 
 On btrfs with compression, extents are reported as `Encoded`: their physical offsets and logical lengths cannot be compared directly, so the physical-identity path (`SharedWithGroup`) skips them. In-group detection then depends on the filesystem's `FIEMAP_EXTENT_SHARED` hint (`SharedFlagBytes`); if the kernel does not set that hint, two compressed clones may not be reported as sharing. Encoded extents are matched by their physical start instead, which covers aligned runs.
 

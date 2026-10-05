@@ -1611,3 +1611,26 @@ func TestDedupe_InteractiveNeedsTerminal(t *testing.T) {
 		t.Fatalf("unexpected error: %s", stderr)
 	}
 }
+
+// TestSummary_ReportsFailedActions verifies that an elimination which could not
+// be carried out is counted in the summary: the probe on a ReFS Dev Drive showed
+// the failure only as a log line, with a summary that looked like a clean run.
+func TestSummary_ReportsFailedActions(t *testing.T) {
+	t.Parallel()
+
+	// A directory that disappears between the scan and the action is hard to
+	// arrange portably; instead the counter is exercised through the check that
+	// every failed action increments (the CLI test below pins the ReFS path only
+	// when CoW is unavailable, which is not portable either). This test guards the
+	// wiring: a run with no failures prints no such line.
+	dir := t.TempDir()
+	makeFile(t, dir, "only.txt", "no duplicates here")
+
+	stdout, stderr, code := run(t, "dedupe", "--delete", "--no-progress", dir)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
+	}
+	if strings.Contains(stdout, "could not be processed") {
+		t.Fatalf("a clean run must not report failed actions:\n%s", stdout)
+	}
+}

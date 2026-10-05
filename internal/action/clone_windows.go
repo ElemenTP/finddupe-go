@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
+	"path/filepath"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -35,7 +36,10 @@ func buildDuplicateExtentsData(handle windows.Handle, sourceOffset, targetOffset
 // exist. Windows supports this on ReFS volumes (including Dev Drive) via
 // FSCTL_DUPLICATE_EXTENTS_TO_FILE; NTFS returns ERROR_INVALID_FUNCTION.
 func clonePlatformFile(src, dst string) error {
-	cluster, err := volinfo.ClusterSize(dst)
+	// dst is the temporary name the clone is about to create, so it does not
+	// exist yet: the volume (and therefore the cluster size) is resolved from the
+	// directory it will live in.
+	cluster, err := volinfo.ClusterSize(filepath.Dir(dst))
 	if err != nil {
 		return errors.Join(ErrCoWNotSupported, err)
 	}

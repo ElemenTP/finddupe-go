@@ -133,6 +133,11 @@ Dupes:     128 kB in      1 files
   1 CoW groups found (128 kB of file bytes already shared)
 ```
 
+`FailedFiles` (`N files could not be processed`) counts eliminations that were
+attempted and failed — a CoW clone on a volume that refuses it, for example. Such a
+pair is left untouched and the run continues; the failure is also logged at error
+level with the sentence joined onto one line.
+
 `CoWSharedBytes` (the `X of file bytes already shared` total) is a per-file sum:
 each shared range is counted once per member, so it must not be read as physical
 bytes saved. When extent information is unavailable for the whole group, the

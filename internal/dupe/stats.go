@@ -50,6 +50,11 @@ type Stats struct {
 	// SkippedChangedFiles is the number of duplicate pairs left alone because
 	// one of the files changed after its content had been hashed.
 	SkippedChangedFiles atomic.Int64
+
+	// FailedFiles counts victims whose elimination was attempted and failed
+	// (for example a CoW clone on a volume that refuses it). The pair is left
+	// untouched; the run continues.
+	FailedFiles atomic.Int64
 }
 
 // NewStats creates a new zero-initialized Stats.

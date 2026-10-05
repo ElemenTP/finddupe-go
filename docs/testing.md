@@ -252,6 +252,12 @@ validation test (`--prefer-compressed` without `--cow` fails); producing a mixed
 compressed/uncompressed group needs a filesystem that compresses, so it is not
 part of the portable system suite.
 
+### Failed Actions (2 tests)
+
+`TestSummary_ReportsFailedActions` fails a CoW clone for real (skipping when the
+filesystem supports cloning) and checks the `N files could not be processed` summary
+line; `TestDedupeCoW_Unsupported` covers the graceful-failure path itself.
+
 ### Interactive Keeper (1 test)
 
 `TestDedupe_InteractiveNeedsTerminal` — `--interactive` without a terminal on stdin

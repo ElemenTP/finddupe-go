@@ -123,7 +123,8 @@ type Stats struct {
     CoWSharedBytes  atomic.Int64 // Per-file sum of already-shared bytes (each range once per file)
     SkippedROFiles  atomic.Int64 // Read-only files skipped
     SkippedRefFiles atomic.Int64 // Reference files skipped
-    SkippedChangedFiles atomic.Int64 // Files whose pair changed after hashing
+    SkippedChangedFiles atomic.Int64
+    FailedFiles        atomic.Int64 // Eliminations that were attempted and failed // Files whose pair changed after hashing
 }
 ```
 

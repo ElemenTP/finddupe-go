@@ -691,8 +691,9 @@ func reportElimination(
 		logger.WarnContext(ctx, "hardlink limit reached",
 			"keeper", keeper.Path, "victim", victim.Path)
 	case action.ResultError:
+		stats.FailedFiles.Add(1)
 		logger.ErrorContext(ctx, "action failed",
-			"keeper", keeper.Path, "victim", victim.Path, "error", out.Err)
+			"keeper", keeper.Path, "victim", victim.Path, "error", oneLine(out.Err))
 	}
 }
 
@@ -843,6 +844,18 @@ func printSummary(stats *dupe.Stats, report *reportWriter) {
 	if n := stats.SkippedChangedFiles.Load(); n > 0 {
 		report.printf("  %d files skipped (changed during the scan)\n", n)
 	}
+	if n := stats.FailedFiles.Load(); n > 0 {
+		report.printf("  %d files could not be processed (see the log)\n", n)
+	}
+}
+
+// oneLine renders an error for a log line. [errors.Join] separates its parts with a
+// newline, which would split one log record into several.
+func oneLine(err error) string {
+	if err == nil {
+		return ""
+	}
+	return strings.ReplaceAll(err.Error(), "\n", "; ")
 }
 
 // formatSize renders a byte count in a compact human-readable form. Exact

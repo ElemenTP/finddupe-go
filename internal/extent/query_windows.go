@@ -4,6 +4,7 @@ package extent
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"unsafe"
 
@@ -69,6 +70,13 @@ func query(path string) ([]Extent, error) {
 				return nil, ErrUnsupported
 			}
 			return nil, ioErr
+		}
+
+		// A driver that reports success without writing anything has not answered
+		// the query (observed on a ReFS Dev Drive): an empty mapping would be read
+		// as "this file shares nothing", which is a different statement.
+		if returned == 0 {
+			return nil, fmt.Errorf("%w: FSCTL_GET_RETRIEVAL_POINTERS returned no data", ErrUnsupported)
 		}
 
 		// The count comes from the driver: bound it by what the buffer can hold

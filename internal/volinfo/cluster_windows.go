@@ -94,6 +94,13 @@ func volumeRoot(path string) (string, error) {
 		uintptr(len(buf)),
 	)
 	if n == 0 {
+		// A path that does not exist yet (the temporary name a clone is about to
+		// be created under) has no mount point to report. Falling back to the
+		// drive letter is still right for the common case; only a volume mounted
+		// at a folder needs the answer above.
+		if drive := filepath.VolumeName(abs); drive != "" {
+			return drive + `\`, nil
+		}
 		if errno, ok := callErr.(syscall.Errno); ok && errno != 0 {
 			return "", errno
 		}
