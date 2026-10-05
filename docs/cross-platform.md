@@ -304,12 +304,21 @@ The Windows probe bundle was run against a ReFS Dev Drive (Windows 11, ReFS 3.14
   is `compressed=false` and the keeper order stays the default one. The flag is only
   meaningful on Linux (btrfs/zfs) and macOS (APFS).
 - **Extent reporting may be unavailable even though the filesystem is "supported".**
-  On that volume `FSCTL_GET_RETRIEVAL_POINTERS` returned success without writing any
-  data. The query now reports that as "not supported" (`FSCTL_GET_RETRIEVAL_POINTERS
-  returned no data`) instead of an empty mapping, so `find --cow` prints "extent
-  information unavailable on this filesystem; listing members only" rather than
-  claiming 0% shared, while `dedupe --cow` still clones — the clone path only needs
-  `FSCTL_DUPLICATE_EXTENTS_TO_FILE` and the volume's cluster size.
+  On that volume `FSCTL_GET_RETRIEVAL_POINTERS` answered the request but reported no
+  extents for files that clearly have data. That is no longer read as an empty
+  mapping (which `find --cow` printed as "shared: 0.0%", a claim the answer does not
+  support): a file larger than one cluster whose query reports no extents is
+  reported as unavailable, with the raw numbers (`reported no extents for a
+  N-byte file (returned M bytes)`) so a probe log can tell the two cases apart.
+  Cloning is unaffected by this: it needs `FSCTL_DUPLICATE_EXTENTS_TO_FILE` and the
+  volume's cluster size, not the mapping.
+- **Destination preallocation is best-effort.** `SetFileInformationByHandle` with
+  `FileAllocationInfo` is an optimization (it keeps the clone from fragmenting) and
+  a ReFS Dev Drive rejected it; it is now attempted without being required, and the
+  failure is reported next to the clone error if the clone itself fails. Every step
+  of the clone path names itself in its error, so a probe log identifies the call
+  that failed instead of reporting "not supported on this filesystem" for
+  everything.
 
 ## Compressed-btrfs Caveat
 

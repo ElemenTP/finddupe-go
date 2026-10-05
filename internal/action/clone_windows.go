@@ -5,6 +5,7 @@ package action
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"unsafe"
@@ -41,43 +42,47 @@ func clonePlatformFile(src, dst string) error {
 	// directory it will live in.
 	cluster, err := volinfo.ClusterSize(filepath.Dir(dst))
 	if err != nil {
-		return errors.Join(ErrCoWNotSupported, err)
+		return errors.Join(ErrCoWNotSupported, fmt.Errorf("cluster size of %s: %w", filepath.Dir(dst), err))
 	}
 
 	srcFile, err := os.Open(src)
 	if err != nil {
-		return err
+		return fmt.Errorf("open source %s: %w", src, err)
 	}
 	defer srcFile.Close()
 
 	info, err := srcFile.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("stat source %s: %w", src, err)
 	}
 	size := info.Size()
 
 	dstFile, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		return err
+		return fmt.Errorf("create destination %s: %w", dst, err)
 	}
 	defer dstFile.Close()
 
 	dstHandle := windows.Handle(dstFile.Fd())
 
-	// Block cloning requires the destination clusters to be allocated.
+	// The destination must cover the range that is about to be cloned.
+	if truncErr := dstFile.Truncate(size); truncErr != nil {
+		return fmt.Errorf("size destination %s to %d bytes: %w", dst, size, truncErr)
+	}
+
+	// Reserving the destination clusters keeps the clone from being fragmented,
+	// but it is an optimization: a volume that rejects the call (a ReFS Dev Drive
+	// answered ERROR_FILE_NOT_FOUND) must not stop the clone, so the failure is
+	// only reported if the clone itself fails.
+	var allocErr error
 	if size > 0 {
 		alloc := size
-		if allocErr := windows.SetFileInformationByHandle(
+		allocErr = windows.SetFileInformationByHandle(
 			dstHandle,
 			windows.FileAllocationInfo,
 			(*byte)(unsafe.Pointer(&alloc)),
 			uint32(unsafe.Sizeof(alloc)),
-		); allocErr != nil {
-			return errors.Join(ErrCoWNotSupported, allocErr)
-		}
-	}
-	if truncErr := dstFile.Truncate(size); truncErr != nil {
-		return truncErr
+		)
 	}
 
 	// Block cloning only operates on whole clusters. A file smaller than one
@@ -85,7 +90,8 @@ func clonePlatformFile(src, dst string) error {
 	// lie; reject it instead of silently writing a full copy.
 	aligned := size - size%int64(cluster)
 	if aligned == 0 {
-		return errors.Join(ErrCoWNotSupported, errors.New("file is smaller than one cluster"))
+		return errors.Join(ErrCoWNotSupported,
+			fmt.Errorf("file is %d bytes, smaller than the %d-byte cluster", size, cluster))
 	}
 
 	data := buildDuplicateExtentsData(windows.Handle(srcFile.Fd()), 0, 0, aligned)
@@ -102,17 +108,21 @@ func clonePlatformFile(src, dst string) error {
 		nil,
 	)
 	if ioErr != nil {
-		if isBlockCloneUnsupported(ioErr) {
-			return errors.Join(ErrCoWNotSupported, ioErr)
+		detail := fmt.Errorf("duplicate %d bytes of %s at offset 0: %w", aligned, src, ioErr)
+		if allocErr != nil {
+			detail = fmt.Errorf("%w (destination preallocation also failed: %w)", detail, allocErr)
 		}
-		return ioErr
+		if isBlockCloneUnsupported(ioErr) {
+			return errors.Join(ErrCoWNotSupported, detail)
+		}
+		return detail
 	}
 
 	if tail := size - aligned; tail > 0 {
 		// The clone covers whole clusters only; the trailing bytes have to be
 		// copied explicitly, at their own offset in the destination.
 		if copyErr := copyTailAt(dstFile, srcFile, aligned, aligned, tail); copyErr != nil {
-			return copyErr
+			return fmt.Errorf("copy the %d-byte tail of %s: %w", tail, src, copyErr)
 		}
 	}
 

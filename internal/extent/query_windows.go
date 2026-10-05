@@ -87,6 +87,19 @@ func query(path string) ([]Extent, error) {
 		extentCount := boundedExtentCount(*(*uint32)(unsafe.Pointer(&buf[0])), len(buf))
 		prevVcn := *(*int64)(unsafe.Pointer(&buf[8]))
 
+		// A volume can answer the request (returned bytes) while reporting no
+		// extents for a file that must have some: a ReFS Dev Drive did exactly
+		// that. An empty mapping would be read as "this file shares nothing",
+		// which is a different statement, so files larger than one cluster are
+		// reported as unavailable instead.
+		if extentCount == 0 {
+			if info, statErr := f.Stat(); statErr == nil && info.Size() > int64(cluster) {
+				return nil, fmt.Errorf(
+					"%w: FSCTL_GET_RETRIEVAL_POINTERS reported no extents for a %d-byte file (returned %d bytes)",
+					ErrUnsupported, info.Size(), returned)
+			}
+		}
+
 		out := make([]Extent, 0, extentCount)
 		for i := range extentCount {
 			base := retrievalPointersHeaderSize + int(i)*retrievalPointerPairSize
