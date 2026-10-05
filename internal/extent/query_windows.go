@@ -76,7 +76,10 @@ func query(path string) ([]Extent, error) {
 		// the query (observed on a ReFS Dev Drive): an empty mapping would be read
 		// as "this file shares nothing", which is a different statement.
 		if returned == 0 {
-			return nil, fmt.Errorf("%w: FSCTL_GET_RETRIEVAL_POINTERS returned no data", ErrUnsupported)
+			// The byte count is included because this is exactly what a probe log
+			// needs to tell "the volume does not answer" from "we asked wrongly".
+			return nil, fmt.Errorf("%w: FSCTL_GET_RETRIEVAL_POINTERS returned 0 of %d bytes",
+				ErrUnsupported, bufSize)
 		}
 
 		// The count comes from the driver: bound it by what the buffer can hold
