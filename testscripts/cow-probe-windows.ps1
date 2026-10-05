@@ -246,29 +246,55 @@ Show $FD @("dedupe", "--delete", "--no-progress", $act)
 Get-ChildItem $act -Filter "del-*.bin" | Select-Object Name, Length | Format-Table | Out-String | Write-Host
 Write-Host "expect: one del-*.bin left, 262144 bytes"
 
+# The keeper policy keeps the smallest path, so the read-only file must sort *last*
+# to be the victim this section is about; naming it ro-dst.bin made the read-only
+# file the keeper and the section proved nothing.
 $ro = Join-Path $Dir "readonly"
 New-Item -ItemType Directory -Force -Path $ro | Out-Null
-New-RandomFile (Join-Path $ro "ro-src.bin") 131072
-New-SameContentCopy (Join-Path $ro "ro-src.bin") (Join-Path $ro "ro-dst.bin")
-Set-ItemProperty -Path (Join-Path $ro "ro-dst.bin") -Name IsReadOnly -Value $true
-Section "dedupe --cow without -r: a read-only victim is skipped"
+New-RandomFile (Join-Path $ro "ro-keep.bin") 131072
+New-SameContentCopy (Join-Path $ro "ro-keep.bin") (Join-Path $ro "ro-victim.bin")
+Set-ItemProperty -Path (Join-Path $ro "ro-victim.bin") -Name IsReadOnly -Value $true
+Section "dedupe --cow without -r: the read-only victim is skipped"
 Show $FD @("dedupe", "--cow", "--no-progress", $ro)
+Write-Host "expect: no clone, ro-victim.bin still there and still read-only"
 Section "dedupe --cow -r: the read-only victim is replaced"
 Show $FD @("dedupe", "--cow", "-r", "--no-progress", $ro)
-Get-ChildItem $ro | Select-Object Name, Length, LastWriteTime | Format-Table | Out-String | Write-Host
+Get-ChildItem $ro | Select-Object Name, Length, Attributes | Format-Table | Out-String | Write-Host
 Write-Host "expect: the read-only attribute is kept on the survivor"
 
+# --prefer-compressed needs identical content and genuinely different compression
+# state. compact /c is NTFS-only (ReFS refuses it), so on ReFS both members stay
+# plain and the section shows that the flag has nothing to prefer there; a ReFS copy
+# may also become a block clone, which makes the pair already shared and the run a
+# no-op. Both are expected on that volume.
+function New-CompressionPair([string]$dir) {
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $text = ("finddupe prefer-compressed probe line`n" * 32768)
+    [System.IO.File]::WriteAllText((Join-Path $dir "zz-compressed.bin"), $text)
+    & compact /c (Join-Path $dir "zz-compressed.bin") 2>&1 | Out-Null
+    Copy-Item (Join-Path $dir "zz-compressed.bin") (Join-Path $dir "aa-plain.bin") -Force
+    # Copying can carry the compressed attribute along, so the plain member is told
+    # explicitly not to be compressed (also NTFS-only, and a no-op where the volume
+    # cannot compress at all).
+    & compact /u (Join-Path $dir "aa-plain.bin") 2>&1 | Out-Null
+}
+
 $pc = Join-Path $Dir "prefer-compressed"
-New-Item -ItemType Directory -Force -Path $pc | Out-Null
-New-RandomFile (Join-Path $pc "zz-plain.bin") 1048576
-$text = ("finddupe prefer-compressed probe line`n" * 32768)
-[System.IO.File]::WriteAllText((Join-Path $pc "aa-compressed.bin"), $text)
-Section "compression state before --prefer-compressed"
-if ($CD) { & $CD (Join-Path $pc "aa-compressed.bin") (Join-Path $pc "zz-plain.bin") 2>&1 | Write-Host } else { Write-Host "compressdump not found" }
-Section "dedupe --cow --prefer-compressed: the compressed member is the keeper"
-Show $FD @("dedupe", "--cow", "--prefer-compressed", "--no-progress", $pc)
-if ($CD) { & $CD (Join-Path $pc "aa-compressed.bin") (Join-Path $pc "zz-plain.bin") 2>&1 | Write-Host } else { Write-Host "compressdump not found" }
-Write-Host "expect: on ReFS compression is unavailable, so --prefer-compressed changes nothing"
+New-CompressionPair (Join-Path $pc "with")
+New-CompressionPair (Join-Path $pc "without")
+
+Section "compression state before --prefer-compressed (expect aa-plain=false, zz-compressed=true on NTFS)"
+if ($CD) { & $CD (Join-Path $pc "with\aa-plain.bin") (Join-Path $pc "with\zz-compressed.bin") 2>&1 | Write-Host } else { Write-Host "compressdump not found" }
+
+Section "dedupe --cow without -C: the plain member is the keeper"
+Show $FD @("dedupe", "--cow", "--no-progress", (Join-Path $pc "without"))
+if ($CD) { & $CD (Join-Path $pc "without\aa-plain.bin") (Join-Path $pc "without\zz-compressed.bin") 2>&1 | Write-Host } else { Write-Host "compressdump not found" }
+
+Section "dedupe --cow -C: the compressed member is the keeper"
+Show $FD @("dedupe", "--cow", "--prefer-compressed", "--no-progress", (Join-Path $pc "with"))
+if ($CD) { & $CD (Join-Path $pc "with\aa-plain.bin") (Join-Path $pc "with\zz-compressed.bin") 2>&1 | Write-Host } else { Write-Host "compressdump not found" }
+Write-Host "expect: on a volume that can compress, -C keeps the group compressed and"
+Write-Host "        without it the plain member wins; on ReFS the flag changes nothing"
 
 $res = Join-Path $Dir "resident"
 New-Item -ItemType Directory -Force -Path $res | Out-Null

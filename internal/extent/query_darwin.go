@@ -106,11 +106,14 @@ func extentsFcntl(path string) ([]Extent, error) {
 	// pointer semantics and a stack-allocated record could be moved by stack
 	// growth between the conversion and the call. Heap objects are not moved by
 	// the garbage collector, and KeepAlive keeps this one reachable across the
-	// call. One record is reused for every step of the walk.
-	request := log2phys.Encode(int64(size-offset), int64(offset))
-	rec := &request
+	// call. One record is reused for every step of the walk, and it must be
+	// *rewritten* for each step: the kernel answers about the range the record
+	// describes, so a request left at offset 0 would make every step describe the
+	// first run and the walk would stop after it.
+	rec := new([log2phys.Size]byte)
 
 	for offset < size {
+		*rec = log2phys.Encode(int64(size-offset), int64(offset))
 
 		_, err := unix.FcntlInt(f.Fd(), unix.F_LOG2PHYS_EXT, int(uintptr(unsafe.Pointer(&rec[0]))))
 		runtime.KeepAlive(rec)

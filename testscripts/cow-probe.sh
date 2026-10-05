@@ -421,45 +421,55 @@ fi
 echo "expect: mode 0444 kept, and on Linux the user.probe attribute kept"
 
 # --prefer-compressed: the keeper must be the compressed member, so the clone
-# inherits its compressed layout instead of turning the group uncompressed. The two
-# files need identical content (otherwise there is nothing to deduplicate) and
-# genuinely different compression state, which on btrfs needs a per-file property
-# plus an in-place rewrite; both groups are run, without and with -C, so the
-# preference is observable.
-if [ "$OS" = "Darwin" ] || [ -n "${CD:-}" ]; then
-	PC="$DIR/prefer-compressed"
-	rm -rf "$PC"
-	mkdir -p "$PC/with" "$PC/without"
-	yes "compressible content for the prefer-compressed probe" 2>/dev/null | head -c 1048576 >"$PC/with/aa-plain.bin" || true
-	compress_file "$PC/with/aa-plain.bin" >/dev/null 2>&1 || true
-	independent_copy "$PC/with/aa-plain.bin" "$PC/with/zz-compressed.bin"
-	# Make the plain member plain: on btrfs a file inherits the mount's compression
-	# unless it is told not to, and an in-place rewrite stores it the new way.
-	if [ "$OS" != "Darwin" ] && command -v btrfs >/dev/null 2>&1; then
-		btrfs property set "$PC/with/aa-plain.bin" compression no 2>/dev/null || true
-		dd if="$PC/with/zz-compressed.bin" of="$PC/with/aa-plain.bin" conv=notrunc status=none 2>/dev/null || true
-	fi
-	cp -R "$PC/with/." "$PC/without/" 2>/dev/null || true
+# inherits its compressed layout instead of turning the group uncompressed.
+#
+# The pair is built twice, once per run: a plain copy made by cp decompresses on
+# APFS, so copying a directory to get a second pair would silently give two plain
+# files and the "without -C" leg would prove nothing. The compressed member is named
+# so that it sorts *last*: without -C the smallest path wins, which is the plain one.
+make_compression_pair() {
+	dir="$1"
+	rm -rf "$dir"
+	mkdir -p "$dir"
 
-	section "compression state before --prefer-compressed (expect one plain, one compressed)"
+	yes "compressible content for the prefer-compressed probe" 2>/dev/null |
+		head -c 1048576 >"$dir/zz-compressed.bin" || true
+	compress_file "$dir/zz-compressed.bin" >/dev/null 2>&1 || true
+
+	# A fresh copy: cp writes the bytes again, which stores them uncompressed on
+	# APFS. On btrfs the mount may compress them anyway, so the file is told not
+	# to and rewritten in place.
+	independent_copy "$dir/zz-compressed.bin" "$dir/aa-plain.bin"
+	if [ "$OS" != "Darwin" ] && command -v btrfs >/dev/null 2>&1; then
+		btrfs property set "$dir/aa-plain.bin" compression no 2>/dev/null || true
+		dd if="$dir/zz-compressed.bin" of="$dir/aa-plain.bin" conv=notrunc status=none 2>/dev/null || true
+	fi
+}
+
+if [ -n "${CD:-}" ] || [ "$OS" = "Darwin" ]; then
+	PC="$DIR/prefer-compressed"
+	make_compression_pair "$PC/with"
+	make_compression_pair "$PC/without"
+
+	section "compression state before --prefer-compressed (expect aa-plain=false, zz-compressed=true)"
 	if [ -n "${CD:-}" ]; then
 		"$CD" "$PC/with/aa-plain.bin" "$PC/with/zz-compressed.bin" 2>&1
 	fi
 
-	section "dedupe --cow without -C: the smallest path is the keeper"
+	section "dedupe --cow without -C: the plain member is the keeper"
 	show "$FD" dedupe --cow --no-progress "$PC/without"
 	if [ -n "${CD:-}" ]; then
-		echo "--- without -C: both should now report the keeper's (plain) state ---"
+		echo "--- without -C: the group should now be uncompressed ---"
 		"$CD" "$PC/without/aa-plain.bin" "$PC/without/zz-compressed.bin" 2>&1
 	fi
 
 	section "dedupe --cow -C: the compressed member is the keeper"
 	show "$FD" dedupe --cow --prefer-compressed --no-progress "$PC/with"
 	if [ -n "${CD:-}" ]; then
-		echo "--- with -C: both should now be compressed ---"
+		echo "--- with -C: both members should be compressed ---"
 		"$CD" "$PC/with/aa-plain.bin" "$PC/with/zz-compressed.bin" 2>&1
 	fi
-	echo "expect: -C keeps the group compressed; without it the plain member wins"
+	echo "expect: -C keeps the group compressed, without it the plain member wins"
 	echo "(on ReFS --prefer-compressed is a no-op: NTFS per-file compression does not exist there)"
 fi
 

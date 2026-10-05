@@ -264,6 +264,12 @@ Verified on a Darwin 27.0.0 / macOS 27 ARM64 APFS data volume:
   invariant in `cloneReplace` — the clone must report the keeper's size, and the
   victim is left untouched with the action reported as failed if it does not.
 
+The query must rewrite its request for every step: the kernel answers about the range
+the record describes, so a record left at offset 0 makes each step describe the first
+run and the walk ends after it — 4 KiB reported for a 1 MiB file, and ratios of 0.4%
+where the file was fully shared. `TestQuery_ExtentsCoverTheFile` checks that a written
+file's extents cover all of its bytes, on whichever platform the tests run.
+
 `getattrlist` itself is still invoked through the raw syscall trap because
 `golang.org/x/sys/unix` (through v0.48.0) exports no libSystem wrapper for it —
 it provides `Setattrlist` and the deprecated `SYS_*` numbers only — and cgo would

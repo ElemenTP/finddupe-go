@@ -66,6 +66,13 @@ func query(path string) ([]Extent, error) {
 				bufSize *= 2
 				continue
 			}
+			if errors.Is(ioErr, windows.ERROR_HANDLE_EOF) {
+				// The query ran off the end of the mapping: the file has no
+				// allocated extents (data stored resident in its record, or fully
+				// sparse). That is "nothing is shared", not a limitation of the
+				// volume, and a sub-cluster file is the common case.
+				return []Extent{}, nil
+			}
 			if isUnsupportedWindowsErr(ioErr) {
 				return nil, ErrUnsupported
 			}

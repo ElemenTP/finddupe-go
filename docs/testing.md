@@ -64,6 +64,8 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDetector_CoWDetectMode` | One `CoWDetect` per content bucket, members in keeper order |
 | `TestDetector_InsertInodeGroups` | `InsertInode`/`InodeGroups` group by `(Dev, Inode)` |
 | `TestDetector_Empty` | Zero state: no executions, no inode groups, non-nil stats |
+| `TestQuery_ExtentsCoverTheFile` | A written file's extents cover all of its bytes (a macOS request that was not rewritten per step reported 4 KiB of a 1 MiB file) |
+| `TestQuery_SubClusterFileIsNotAnError` | A resident sub-cluster file (NTFS keeps tiny files in their record) is an empty mapping, not an error |
 | `TestPreserveMetadata_UsesTheCallersStat` | The clone's metadata comes from the stat the freshness check made, not from a second read of the source (a stale value passed in must win) |
 | `fsprobe.CapableDir` | Shared by the action, extent and system suites: tries the default temp dir, then the working directory, and skips the test when neither filesystem supports the feature (one copy instead of three) |
 | `TestDetector_SamePathInsertedTwice` | Inserting one path twice is ignored (overlapping patterns cannot self-eliminate) |

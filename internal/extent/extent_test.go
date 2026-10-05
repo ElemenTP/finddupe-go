@@ -413,3 +413,65 @@ func TestEqual_IdentityKind(t *testing.T) {
 		}
 	}
 }
+
+// TestQuery_ExtentsCoverTheFile verifies that a written file's extents describe all
+// of its bytes, which every sharing ratio is computed from. The macOS query returned
+// only its first run (4 KiB of a 1 MiB file) while the request record was not
+// rewritten for each step, and `find --cow` then reported 0.4% where the file was
+// fully shared.
+func TestQuery_ExtentsCoverTheFile(t *testing.T) {
+	t.Parallel()
+
+	probe := randomData(t, 1<<20)
+	dir := extentCapableDir(t, probe)
+
+	path := filepath.Join(dir, "covered.bin")
+	if err := os.WriteFile(path, probe, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	extents, err := extent.Query(path, int64(len(probe)))
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+
+	var total int64
+	for _, e := range extents {
+		total += int64(e.Length)
+	}
+	if total != int64(len(probe)) {
+		t.Errorf("extents cover %d of %d bytes (%d extents): %+v",
+			total, len(probe), len(extents), extents)
+	}
+}
+
+// TestQuery_SubClusterFileIsNotAnError verifies that a file whose data is stored
+// resident — anything smaller than a cluster, which NTFS keeps in the file record —
+// is reported as having nothing allocated rather than as an error. The Windows query
+// fails with a handle-EOF for such a file, which reached the caller as "extent query
+// error" for every tiny duplicate.
+func TestQuery_SubClusterFileIsNotAnError(t *testing.T) {
+	t.Parallel()
+
+	probe := randomData(t, 1<<20)
+	dir := extentCapableDir(t, probe)
+
+	small := []byte("tiny")
+	path := filepath.Join(dir, "small.bin")
+	if err := os.WriteFile(path, small, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	extents, err := extent.Query(path, int64(len(small)))
+	if err != nil {
+		t.Fatalf("a sub-cluster file must not be an error: %v", err)
+	}
+
+	var total int64
+	for _, e := range extents {
+		total += int64(e.Length)
+	}
+	if total > int64(len(small)) {
+		t.Errorf("extents cover %d bytes of a %d-byte file", total, len(small))
+	}
+}
