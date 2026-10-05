@@ -189,7 +189,7 @@ func TestDetector_ThreeIdenticalFiles_AllReported(t *testing.T) {
 // SHA-256, and a third file that finishes hashing in the meantime used to
 // condemn them to never being hashed again — so a genuine duplicate between the
 // stranded file and the finished one was never reported.
-func TestDetector_StrandedFileIsHashedAndMatched(t *testing.T) {
+func TestDetector_EarlyStoppedCompareIsCompleted(t *testing.T) {
 	t.Parallel()
 
 	d := dupe.NewDetector(dupe.NewStats())
