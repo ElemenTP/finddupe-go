@@ -17,7 +17,7 @@ finddupe-go/
 │   │   └── config.go          # Config struct, Action type
 │   ├── dupe/                  # Core types and duplicate-detection state machine
 │   │   ├── fileinfo.go        # FileInfo, InodeKey, GroupKey, Execution, ExecutionType
-│   │   ├── detector.go        # Detector state machine (Insert/OnHashDone/OnCompareDone)
+│   │   ├── detector.go        # Detector state machine (Insert/OnHashDone/OnCompareDone/NextFinal)
 │   │   └── stats.go           # Thread-safe statistics (+ ZeroLenCounter)
 │   ├── fswalker/              # Filesystem traversal
 │   │   ├── walker.go          # Walker, Result, WalkOptions, glob matching
@@ -25,8 +25,8 @@ finddupe-go/
 │   │   └── walker_windows.go  # Windows: returns zeros — done in checksum
 │   ├── checksum/              # File signature + identity computation
 │   │   ├── checksum.go        # Compute, ComputeFileInfo (returns Info), ComputeFromReader
-│   │   ├── inode_unix.go      # Unix: fileIdentity from f.Stat().Sys()
-│   │   └── inode_windows.go   # Windows: fileIdentity from GetFileInformationByHandle
+│   │   ├── stat_unix.go       # Unix: size/mtime/identity from one fstat
+│   │   └── stat_windows.go    # Windows: identity from GetFileInformationByHandle
 │   ├── action/                # Stateless duplicate elimination + CoW detection
 │   │   ├── executor.go        # Executor, DoExecution, Outcome, Result
 │   │   ├── delete.go          # File deletion (+ readonly handling)
@@ -41,7 +41,7 @@ finddupe-go/
 │   │   ├── replace_unix.go    # Unix: atomic os.Rename
 │   │   └── replace_windows.go # Windows: MoveFileEx(REPLACE_EXISTING)
 │   ├── extent/                # Physical extent query for CoW detection
-│   │   ├── extent.go          # Extent, SharedBytes, Equal, SharedFlagBytes, SharedWithOthers
+│   │   ├── extent.go          # Extent, SharedBytes, Equal, SharedFlagBytes, SharedWithGroup
 │   │   ├── query_linux.go     # Linux: FS_IOC_FIEMAP
 │   │   ├── query_darwin.go    # macOS: F_LOG2PHYS_EXT (libSystem), clone ID fallback
 │   │   ├── query_windows.go   # Windows: FSCTL_GET_RETRIEVAL_POINTERS
@@ -173,8 +173,8 @@ func ComputeFromReader(r io.Reader, size int64) (uint64, error)
 ```
 
 **Platform-specific**:
-- `inode_unix.go`: `fileIdentity(f *os.File)` reads `Dev`/`Inode`/`NumLinks` from `f.Stat().Sys().(*syscall.Stat_t)`
-- `inode_windows.go`: `fileIdentity(f *os.File)` calls `GetFileInformationByHandle` on `f.Fd()`
+- `stat_unix.go`: `statFile(f *os.File)` reads size, mtime and `Dev`/`Inode`/`NumLinks` from a single `f.Stat().Sys().(*syscall.Stat_t)`
+- `stat_windows.go`: `statFile(f *os.File)` takes size/mtime from `os.FileInfo` and the volume serial, file index and link count from `GetFileInformationByHandle` on `f.Fd()` (which `os.FileInfo` does not expose)
 
 `ComputeFileInfo` is the primary function used by the pipeline — it opens the file once and returns all metadata, keeping I/O in the parallel worker-pool path. For files ≤ 32KB it also returns the full SHA-256 at no extra I/O cost. It stats the open file and returns `dupe.ErrFileChanged` when its size is no longer the size the walker reported, so a file that grew or shrank cannot be signed as if it had the scanned content.
 
@@ -254,17 +254,17 @@ type Extent struct {
     Encoded  bool
 }
 
-func Query(path string) ([]Extent, error)
+func Query(path string, size int64) ([]Extent, error)
 func SharedBytes(a, b []Extent) int64
 func Equal(a, b []Extent) bool
 func SharedFlagBytes(e []Extent) int64
-func SharedWithOthers(own []Extent, others [][]Extent) int64
+func SharedWithGroup(group [][]Extent) []int64
 func Supported() bool
 ```
 
 **Platform implementations**: Linux FIEMAP (`FS_IOC_FIEMAP`), macOS `fcntl(F_LOG2PHYS_EXT)` through the libSystem wrapper (`unix.FcntlInt`) with a `getattrlist(ATTR_CMNEXT_CLONEID)` fallback for decmpfs-compressed files, Windows `FSCTL_GET_RETRIEVAL_POINTERS`; other platforms return `ErrUnsupported`.
 
-**Helpers**: `SharedBytes` is the pairwise physical-overlap helper (falling back to shared logical ranges for compressed btrfs). `Equal` is the conservative already-sharing fast path for `dedupe --cow`. `SharedFlagBytes` sums extents the filesystem marked `Shared` (a per-file signal). `SharedWithOthers` sums in-group physical-start matches, capped to the shorter extent, for filesystems without a shared flag.
+**Helpers**: `Query` takes the file size the caller already knows, so it needs no stat of its own. `SharedBytes` is the pairwise physical-overlap helper (falling back to shared logical ranges for compressed btrfs). `Equal` is the conservative already-sharing fast path for `dedupe --cow`. `SharedFlagBytes` sums extents the filesystem marked `Shared` (a per-file signal). `SharedWithGroup` answers the already-shared bytes of every member of one content group in a single O(M log M) sweep; it is what `find --cow` reports, and it replaced a per-member "union of all the others" that cost O(n²).
 
 **Dependencies**: `golang.org/x/sys` (Unix/Windows syscalls)
 

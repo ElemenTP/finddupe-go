@@ -87,7 +87,11 @@ func randomData(t *testing.T, size int) []byte {
 // report them.
 func queryOrSkip(t *testing.T, path string) []extent.Extent {
 	t.Helper()
-	extents, err := extent.Query(path)
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		t.Fatalf("stat %s: %v", path, statErr)
+	}
+	extents, err := extent.Query(path, info.Size())
 	if err != nil {
 		if errors.Is(err, extent.ErrUnsupported) {
 			t.Skipf("extent query unsupported: %v", err)
@@ -128,7 +132,7 @@ func extentCapableDir(t *testing.T, probeData []byte) string {
 		if err := os.WriteFile(probe, probeData, 0o644); err != nil {
 			continue
 		}
-		_, err := extent.Query(probe)
+		_, err := extent.Query(probe, int64(len(probeData)))
 		_ = os.Remove(probe)
 		if err == nil {
 			return dir
@@ -137,6 +141,39 @@ func extentCapableDir(t *testing.T, probeData []byte) string {
 
 	t.Skip("extent queries unsupported by the default temp dir and the repository filesystem")
 	return ""
+}
+
+// TestQuery_SparseFileIsNotUnsupported verifies that a file with nothing
+// allocated is reported as "nothing is shared" rather than as "this filesystem
+// cannot report extents". btrfs answers EOPNOTSUPP for a fully sparse file, which
+// used to make find --cow claim the filesystem was unsupported while it was
+// querying every other file on the volume just fine.
+func TestQuery_SparseFileIsNotUnsupported(t *testing.T) {
+	t.Parallel()
+
+	data := randomData(t, 64*1024)
+	dir := extentCapableDir(t, data)
+
+	sparse := filepath.Join(dir, "sparse.bin")
+	f, err := os.Create(sparse)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if truncErr := f.Truncate(1 << 20); truncErr != nil {
+		_ = f.Close()
+		t.Skipf("cannot create a sparse file: %v", truncErr)
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		t.Fatalf("close: %v", closeErr)
+	}
+
+	extents, err := extent.Query(sparse, 1<<20)
+	if err != nil {
+		t.Fatalf("a sparse file on a supported filesystem must not be reported as unsupported: %v", err)
+	}
+	if len(extents) != 0 {
+		t.Fatalf("sparse file reported %d extents, want none", len(extents))
+	}
 }
 
 func TestQuery_HardlinksShareExtents(t *testing.T) {
@@ -280,7 +317,7 @@ func TestSharedFlagBytes(t *testing.T) {
 	}
 }
 
-func TestSharedWithOthers(t *testing.T) {
+func TestSharedWithGroup(t *testing.T) {
 	t.Parallel()
 
 	own := []extent.Extent{
@@ -292,17 +329,20 @@ func TestSharedWithOthers(t *testing.T) {
 		{Logical: 100, Physical: 16384, Length: 100}, // not shared
 	}
 
-	if got := extent.SharedWithOthers(own, [][]extent.Extent{other}); got != 100 {
-		t.Fatalf("SharedWithOthers = %d, want 100", got)
+	if got := extent.SharedWithGroup([][]extent.Extent{own, other}); got[0] != 100 || got[1] != 100 {
+		t.Fatalf("SharedWithGroup = %v, want [100 100]", got)
 	}
-	if got := extent.SharedWithOthers(own, nil); got != 0 {
-		t.Fatalf("SharedWithOthers(nil) = %d, want 0", got)
+	if got := extent.SharedWithGroup([][]extent.Extent{own}); got[0] != 0 {
+		t.Fatalf("SharedWithGroup(single) = %v, want [0]", got)
+	}
+	if got := extent.SharedWithGroup([][]extent.Extent{own, nil}); got[0] != 0 || got[1] != 0 {
+		t.Fatalf("SharedWithGroup(nil member) = %v, want [0 0]", got)
 	}
 
 	// A shorter other extent caps the counted bytes.
 	short := []extent.Extent{{Logical: 0, Physical: 4096, Length: 40}}
-	if got := extent.SharedWithOthers(own, [][]extent.Extent{short}); got != 40 {
-		t.Fatalf("SharedWithOthers(short) = %d, want 40", got)
+	if got := extent.SharedWithGroup([][]extent.Extent{own, short}); got[0] != 40 {
+		t.Fatalf("SharedWithGroup(short) = %v, want 40 for the first member", got)
 	}
 
 	// A shared run that starts mid-way through own's run is still counted: this
@@ -310,20 +350,42 @@ func TestSharedWithOthers(t *testing.T) {
 	// extent starting inside the original's run.
 	big := []extent.Extent{{Logical: 0, Physical: 1000, Length: 1044480}}
 	tail := []extent.Extent{{Logical: 262144, Physical: 1000 + 258048, Length: 786432}}
-	if got := extent.SharedWithOthers(big, [][]extent.Extent{tail}); got != 786432 {
-		t.Fatalf("SharedWithOthers(mid-run tail) = %d, want 786432", got)
+	if got := extent.SharedWithGroup([][]extent.Extent{big, tail}); got[0] != 786432 {
+		t.Fatalf("SharedWithGroup(mid-run tail) = %v, want 786432 for the original", got)
 	}
 
 	// A byte shared with several others is counted once.
-	if got := extent.SharedWithOthers(own, [][]extent.Extent{other, other}); got != 100 {
-		t.Fatalf("SharedWithOthers(duplicated others) = %d, want 100", got)
+	if got := extent.SharedWithGroup([][]extent.Extent{own, other, other}); got[0] != 100 {
+		t.Fatalf("SharedWithGroup(duplicated others) = %v, want 100", got)
 	}
 
-	// Encoded (compressed) extents have no comparable physical range, so they
-	// fall back to an exact physical start match.
+	// Only the members that really share are credited: the third copy shares with
+	// nobody, so it stays at zero while the first two count each other.
+	lonely := []extent.Extent{{Logical: 0, Physical: 999999, Length: 100}}
+	if got := extent.SharedWithGroup([][]extent.Extent{own, other, lonely}); got[2] != 0 {
+		t.Fatalf("SharedWithGroup(unrelated member) = %v, want 0 for the third", got)
+	}
+
+	// Encoded (compressed) extents have no comparable physical range, so they fall
+	// back to an exact physical start match.
 	encoded := []extent.Extent{{Logical: 0, Physical: 4096, Length: 100, Encoded: true}}
-	if got := extent.SharedWithOthers(encoded, [][]extent.Extent{encoded}); got != 100 {
-		t.Fatalf("SharedWithOthers(encoded) = %d, want 100", got)
+	if got := extent.SharedWithGroup([][]extent.Extent{encoded, encoded}); got[0] != 100 {
+		t.Fatalf("SharedWithGroup(encoded) = %v, want 100", got)
+	}
+
+	// A file that shares both a plain run and an encoded one is credited for both:
+	// the encoded start match used to be dropped as soon as any plain overlap was
+	// found.
+	mixedOwn := []extent.Extent{
+		{Logical: 0, Physical: 5000, Length: 100},
+		{Logical: 100, Physical: 4096, Length: 100, Encoded: true},
+	}
+	mixedOther := []extent.Extent{
+		{Logical: 0, Physical: 5000, Length: 100},
+		{Logical: 100, Physical: 4096, Length: 100},
+	}
+	if got := extent.SharedWithGroup([][]extent.Extent{mixedOwn, mixedOther}); got[0] != 200 {
+		t.Fatalf("SharedWithGroup(mixed plain+encoded) = %v, want 200", got)
 	}
 
 	// Opaque keys (the APFS clone ID used for compressed files) are not device
@@ -331,10 +393,10 @@ func TestSharedWithOthers(t *testing.T) {
 	// overlapping ranges, while an identical key still means shared.
 	opaqueA := []extent.Extent{{Logical: 0, Physical: 52139610, Length: 2097152, Opaque: true}}
 	opaqueB := []extent.Extent{{Logical: 0, Physical: 52139611, Length: 2097152, Opaque: true}}
-	if got := extent.SharedWithOthers(opaqueA, [][]extent.Extent{opaqueB}); got != 0 {
-		t.Fatalf("SharedWithOthers(adjacent opaque keys) = %d, want 0", got)
+	if got := extent.SharedWithGroup([][]extent.Extent{opaqueA, opaqueB}); got[0] != 0 {
+		t.Fatalf("SharedWithGroup(adjacent opaque keys) = %v, want 0", got)
 	}
-	if got := extent.SharedWithOthers(opaqueA, [][]extent.Extent{opaqueA}); got != 2097152 {
-		t.Fatalf("SharedWithOthers(same opaque key) = %d, want 2097152", got)
+	if got := extent.SharedWithGroup([][]extent.Extent{opaqueA, opaqueA}); got[0] != 2097152 {
+		t.Fatalf("SharedWithGroup(same opaque key) = %v, want 2097152", got)
 	}
 }

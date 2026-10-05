@@ -50,16 +50,19 @@ func alreadyShared(keeper, victim dupe.FileInfo) bool {
 	}
 
 	// Physical offsets are only comparable within one device, so two files on
-	// different volumes must never be declared identical from their layouts.
-	if !sameDevice(keeper, victim) {
+	// different volumes must never be declared identical from their layouts. An
+	// unknown device counts as "different": claiming shared storage would skip a
+	// clone that is needed, while cloning a pair that already shares its blocks
+	// is harmless.
+	if keeper.Dev == 0 || victim.Dev == 0 || keeper.Dev != victim.Dev {
 		return false
 	}
 
-	keeperExtents, err := extent.Query(keeper.Path)
+	keeperExtents, err := extent.Query(keeper.Path, keeper.Size)
 	if err != nil {
 		return false
 	}
-	victimExtents, err := extent.Query(victim.Path)
+	victimExtents, err := extent.Query(victim.Path, victim.Size)
 	if err != nil {
 		return false
 	}
@@ -94,13 +97,7 @@ func (e *Executor) detectCoW(ctx context.Context, ex dupe.Execution) (Outcome, e
 		return out, nil
 	}
 
-	useSharedFlag := usesSharedFlag(groupExtents)
-	shared := make([]int64, len(ex.Files))
-	for i := range ex.Files {
-		shared[i] = fileSharedBytes(ex.Files, i, groupExtents, useSharedFlag)
-	}
-
-	out.FileShared = shared
+	out.FileShared = groupSharedBytes(ex.Files, groupExtents, usesSharedFlag(groupExtents))
 	return out, nil
 }
 
@@ -111,7 +108,7 @@ func queryGroupExtents(files []dupe.FileInfo) ([][]extent.Extent, int) {
 	queried := 0
 
 	for i, fi := range files {
-		extents, err := extent.Query(fi.Path)
+		extents, err := extent.Query(fi.Path, fi.Size)
 		if err != nil {
 			continue
 		}
@@ -134,29 +131,40 @@ func usesSharedFlag(groupExtents [][]extent.Extent) bool {
 	return false
 }
 
-// fileSharedBytes returns the already-shared bytes of one group member.
-func fileSharedBytes(files []dupe.FileInfo, i int, groupExtents [][]extent.Extent, useSharedFlag bool) int64 {
-	own := groupExtents[i]
-	if own == nil {
-		return 0
-	}
+// groupSharedBytes returns the already-shared bytes of every group member.
+//
+// Physical addresses are only comparable within one device, so the members are
+// bucketed by device first and each bucket is answered in one group-wide pass
+// instead of rebuilding the union of all the others for every member (which cost
+// O(n²) extent work for a group of n files). An unknown device forms its own
+// bucket: comparing it against a known one could invent sharing that does not
+// exist, while reporting too little only means a clone is attempted.
+func groupSharedBytes(files []dupe.FileInfo, groupExtents [][]extent.Extent, useSharedFlag bool) []int64 {
 	if useSharedFlag {
-		return extent.SharedFlagBytes(own)
+		shared := make([]int64, len(files))
+		for i, extents := range groupExtents {
+			shared[i] = extent.SharedFlagBytes(extents)
+		}
+		return shared
 	}
 
-	fi := files[i]
-	others := make([][]extent.Extent, 0, len(files)-1)
-	for j, list := range groupExtents {
-		if j == i || list == nil {
-			continue
-		}
-		// Physical addresses are only comparable within one device.
-		if fi.Dev != 0 && files[j].Dev != 0 && fi.Dev != files[j].Dev {
-			continue
-		}
-		others = append(others, list)
+	buckets := make(map[uint64][]int, len(files))
+	for i, fi := range files {
+		buckets[fi.Dev] = append(buckets[fi.Dev], i)
 	}
-	return extent.SharedWithOthers(own, others)
+
+	shared := make([]int64, len(files))
+	for _, indexes := range buckets {
+		lists := make([][]extent.Extent, len(indexes))
+		for j, i := range indexes {
+			lists[j] = groupExtents[i]
+		}
+		perMember := extent.SharedWithGroup(lists)
+		for j, i := range indexes {
+			shared[i] = perMember[j]
+		}
+	}
+	return shared
 }
 
 // cloneReplace writes a CoW clone of src to a temporary file next to dst and

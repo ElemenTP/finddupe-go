@@ -9,8 +9,8 @@ finddupe-go targets three platforms: **Linux**, **macOS**, and **Windows**. Plat
 ```
 internal/
 ├── checksum/
-│   ├── inode_unix.go      // //go:build unix     → fileIdentity
-│   └── inode_windows.go   // //go:build windows  → fileIdentity
+│   ├── stat_unix.go       // //go:build unix     → statFile
+│   └── stat_windows.go    // //go:build windows  → statFile
 ├── fswalker/
 │   ├── walker_unix.go     // //go:build unix     → getFileIdentity
 │   └── walker_windows.go  // //go:build windows  → getFileIdentity
@@ -36,19 +36,19 @@ internal/
 
 Identity retrieval has two entry points with the same `(dev, inode, numLinks)` result:
 
-- `checksum.fileIdentity(f *os.File)` — called in the **parallel worker pool** after `os.Open`.
+- `checksum.statFile(f *os.File)` — called in the **parallel worker pool** after `os.Open`.
 - `fswalker.getFileIdentity(path, info fs.FileInfo)` — called from the walker; on Unix it uses the already-available stat struct, on Windows it returns zeros.
 
 This split matters for performance: on Windows `GetFileInformationByHandle` requires a handle, and opening files in the walker would serialize all I/O and kill multi-threading.
 
 ### Unix (Linux, macOS)
 
-`checksum/inode_unix.go`:
+`checksum/stat_unix.go`:
 ```go
-func fileIdentity(f *os.File) (uint64, uint64, uint64) {
+func statFile(f *os.File) (fileStat, error) {
     info, _ := f.Stat()
     stat, ok := info.Sys().(*syscall.Stat_t)
-    // read stat.Dev, stat.Ino, stat.Nlink
+    // size, mtime, and stat.Dev / stat.Ino / stat.Nlink from the same fstat
 }
 ```
 
@@ -58,7 +58,7 @@ func fileIdentity(f *os.File) (uint64, uint64, uint64) {
 
 `checksum/inode_windows.go`:
 ```go
-func fileIdentity(f *os.File) (dev, inode, numLinks uint64) {
+func statFile(f *os.File) (dev, inode, numLinks uint64) {
     var info syscall.ByHandleFileInformation
     syscall.GetFileInformationByHandle(syscall.Handle(f.Fd()), &info)
     dev = uint64(info.VolumeSerialNumber)
@@ -280,12 +280,13 @@ For the group ratios there are two signals:
    `Shared` (Linux `FIEMAP_EXTENT_SHARED`). It is a per-file signal: it says the
    extent is shared with *someone*, not with whom. It is used for the whole group
    as soon as any member's extents carry the flag.
-2. `extent.SharedWithOthers(own, others)` intersects `own`'s physical ranges
-   with the union of the other members' ranges. Allocated extents of different
-   files never overlap unless the blocks are shared, so this counts a shared run
-   even when the filesystem splits it at different boundaries in each file (an
-   APFS clone whose first blocks were rewritten keeps sharing its untouched tail,
-   reported as an extent starting mid-way through the original's run).
+2. `extent.SharedWithGroup(group)` intersects each member's physical ranges with
+   the ranges of every other member, in one sweep over the whole group. Allocated
+   extents of different files never overlap unless the blocks are shared, so this
+   counts a shared run even when the filesystem splits it at different boundaries
+   in each file (an APFS clone whose first blocks were rewritten keeps sharing its
+   untouched tail, reported as an extent starting mid-way through the original's
+   run).
    Encoded (compressed) and Opaque (clone-ID) extents fall back to an exact
    key match, because their identities are not byte ranges.
    It is used where no shared flag exists, and only between members on the same
@@ -300,7 +301,7 @@ For the group ratios there are two signals:
 
 ### Compressed-btrfs Caveat
 
-On btrfs with compression, extents are reported as `Encoded`: their physical offsets and logical lengths cannot be compared directly, so the physical-identity path (`SharedWithOthers`) skips them. In-group detection then depends on the filesystem's `FIEMAP_EXTENT_SHARED` hint (`SharedFlagBytes`); if the kernel does not set that hint, two compressed clones may not be reported as sharing. The pairwise `SharedBytes` helper still offers its shared-logical-range fallback.
+On btrfs with compression, extents are reported as `Encoded`: their physical offsets and logical lengths cannot be compared directly, so the physical-identity path (`SharedWithGroup`) skips them. In-group detection then depends on the filesystem's `FIEMAP_EXTENT_SHARED` hint (`SharedFlagBytes`); if the kernel does not set that hint, two compressed clones may not be reported as sharing. The pairwise `SharedBytes` helper still offers its shared-logical-range fallback.
 
 ### Compression State and Clone Sources
 
@@ -334,7 +335,7 @@ accounting changes, and it would also change which path survives in
 ### Same-Device Rule
 
 Physical identities are only comparable within one device (an APFS clone ID is
-per-volume as well). `extent.SharedWithOthers` is therefore only given the
+per-volume as well). `extent.SharedWithGroup` is therefore only given the
 members whose non-zero `Dev` matches the file being measured; a member on a
 different volume contributes nothing. The `FIEMAP_EXTENT_SHARED` flag path does
 not need this check, because the kernel already knows whether the extent is

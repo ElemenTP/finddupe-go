@@ -143,7 +143,7 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestQuery_IndependentCopiesShareNothing` | Two independent copies share nothing; skips if `ErrUnsupported` |
 | `TestEqual` | Equal layouts compare true; length/order/physical differences, empty lists, encoded extents, and zero physical addresses compare false |
 | `TestSharedFlagBytes` | Only extents flagged `Shared` contribute their lengths |
-| `TestSharedWithOthers` | Physical-start identity within a group, capped to the shorter extent; nil others → 0 |
+| `TestSharedWithGroup` | Per-member in-group sharing, capped to the shorter extent; unrelated members stay at 0 |
 | `TestQuery_CloneSharesExtents` (darwin only) | A `cp -c` clone maps to the same physical extents (or clone ID) as its original; an independently written copy does not |
 | `TestQuery_PartialClone` (darwin only) | Rewriting part of a clone with identical bytes is reported as partial sharing, not all-or-nothing; skips if the filesystem kept the extents shared |
 

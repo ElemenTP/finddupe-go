@@ -138,7 +138,7 @@ func inspect(path string) {
 	fmt.Printf("  size=%d blocks=%d blksize=%d dev=%d ino=%d\n",
 		info.Size(), st.Blocks, st.Blksize, st.Dev, st.Ino)
 
-	if extents, qErr := extent.Query(path); qErr == nil {
+	if extents, qErr := extent.Query(path, info.Size()); qErr == nil {
 		fmt.Printf("  clone-id reference: identity=%s extents=%d", extent.Identity(), len(extents))
 		for _, e := range extents {
 			fmt.Printf(" physical=%d length=%d", e.Physical, e.Length)

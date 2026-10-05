@@ -53,7 +53,7 @@ func dump(path string) {
 		fmt.Printf("%s (size=%d)\n  identity error: %v\n", path, stat.Size(), idErr)
 	}
 
-	extents, err := extent.Query(path)
+	extents, err := extent.Query(path, stat.Size())
 	if err != nil {
 		fmt.Printf("  extent query error: %v\n", err)
 		return

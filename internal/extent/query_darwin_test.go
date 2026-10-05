@@ -90,7 +90,7 @@ func TestQuery_PartialClone(t *testing.T) {
 			origExtents, cloneExtents)
 	}
 
-	shared := extent.SharedWithOthers(origExtents, [][]extent.Extent{cloneExtents})
+	shared := extent.SharedWithGroup([][]extent.Extent{origExtents, cloneExtents})[0]
 	if shared <= 0 || shared >= size {
 		t.Fatalf("expected partial sharing in (0, %d), got %d\n orig=%+v\nclone=%+v",
 			size, shared, origExtents, cloneExtents)

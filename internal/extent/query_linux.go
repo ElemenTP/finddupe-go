@@ -66,8 +66,10 @@ func query(path string) ([]Extent, error) {
 	var out []Extent
 	start := uint64(0)
 
+	// One buffer serves every batch of this file.
+	buf := make([]byte, fiemapHeaderSize+fiemapBatchExtents*fiemapExtentSize)
+
 	for {
-		buf := make([]byte, fiemapHeaderSize+fiemapBatchExtents*fiemapExtentSize)
 		hdr := (*fiemapHeader)(unsafe.Pointer(&buf[0]))
 		hdr.Start = start
 		hdr.Length = ^uint64(0) // to end of file
@@ -91,16 +93,27 @@ func query(path string) ([]Extent, error) {
 		if n <= 0 {
 			break
 		}
+		// The count equals fm_extent_count only when the array filled up, so a
+		// short batch means the mapping is complete: one ioctl fewer per file.
+		if n > fiemapBatchExtents {
+			n = fiemapBatchExtents
+		}
 
 		extents := unsafe.Slice((*fiemapExtent)(unsafe.Pointer(&buf[fiemapHeaderSize])), n)
 		last, next := appendBatch(&out, extents)
+		if last {
+			break
+		}
+
+		// The count equals fm_extent_count only when the array filled up, so a
+		// short batch means the mapping is complete.
+		if n < fiemapBatchExtents {
+			break
+		}
 
 		// The kernel must move past the offset that was asked for; a batch that
 		// does not would otherwise be requested again forever.
 		if next <= start {
-			break
-		}
-		if last {
 			break
 		}
 		start = next

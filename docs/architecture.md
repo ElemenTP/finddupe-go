@@ -45,7 +45,7 @@ This replaces the older design in which the detector and executor were each a si
 │  checksum.ComputeFileInfo(path, size)                     │
 │    → opens the file once                                  │
 │    → reads 32KB, computes CRC + sum → Signature           │
-│    → fileIdentity(f) → Dev, Inode, NumLinks               │
+│    → statFile(f) → Dev, Inode, NumLinks               │
 │    → SHA-256 at zero extra cost for files ≤ 32KB          │
 │  Set fi fields, send FileInfo on fileInfoCh               │
 └───────────────────────────┬───────────────────────────────┘
@@ -127,7 +127,7 @@ pipeline.Run(ctx, cfg)                                      │
   │   checksum.ComputeFileInfo(path, size) → checksum.Info  │
   │     ├── os.Open (once per file)                         │
   │     ├── Read 32KB → CRC + sum → Signature               │
-  │     ├── fileIdentity(f) → Dev, Inode, NumLinks          │
+  │     ├── statFile(f) → Dev, Inode, NumLinks          │
   │     └── SHA-256 for files ≤ 32KB                        │
   │     │                                                   │
   │     ▼                                                   │
@@ -158,7 +158,7 @@ pipeline.Run(ctx, cfg)                                      │
   │                 └── cow:      cloneReplace (FICLONE/…)  │
   │                                                         │
   │   CoWDetect → extent.Query + SharedFlagBytes/           │
-  │              SharedWithOthers → "shared: N%" per member │
+  │              SharedWithGroup → "shared: N%" per member │
   │                                                         │
   ▼                                                         │
 Results + final summary printed to stdout                    │
@@ -208,7 +208,7 @@ Results + final summary printed to stdout                    │
   │ - Walk()        │ │ - Compute()  │ │ - Detector │ │ - Executor   │
   │ - ** matcher    │ │ - ComputeFile│ │ - Execution│ │ - Outcome    │
   │ - getFileIdentity│ │   Info()    │ │ - FileInfo │ │ - Delete     │
-  │   (per OS)      │ │ - fileIdentity│ │ - Stats    │ │ - Hardlink   │
+  │   (per OS)      │ │ - statFile│ │ - Stats    │ │ - Hardlink   │
   │                 │ │   (per OS)   │ │ - InodeKey │ │ - CoW clone  │
   └─────────────────┘ └──────────────┘ └────────────┘ │   (per OS)   │
                                                       │ - CoW detect │

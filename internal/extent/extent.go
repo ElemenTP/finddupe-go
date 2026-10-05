@@ -5,7 +5,7 @@ package extent
 
 import (
 	"errors"
-	"os"
+	"slices"
 	"sort"
 )
 
@@ -25,21 +25,31 @@ var ErrUnsupported = errors.New("extent query not supported on this filesystem")
 // allocated blocks, so a 100000-byte file can come back as one 102400-byte
 // extent. Left alone, that makes a fully shared file report more shared bytes
 // than it has (and a ratio above 100%).
-func Query(path string) ([]Extent, error) {
+//
+// size is the file size the caller already knows from its scan, so no stat is
+// needed here — and it is the size the decision is based on, which is the
+// meaningful limit if the file changed since.
+//
+// A filesystem that supports extent queries but has no extents to report for the
+// file (a sparse file, or resident NTFS data) returns an empty slice, not an
+// error: nothing is shared, which is a real answer.
+func Query(path string, size int64) ([]Extent, error) {
 	extents, err := query(path)
 	if err != nil {
+		if !errors.Is(err, ErrUnsupported) {
+			return nil, err
+		}
+		// Some filesystems report a file that has no extents to report exactly
+		// like one they cannot report extents for (btrfs answers EOPNOTSUPP for a
+		// fully sparse file). An unallocated file shares nothing, which is a real
+		// answer; only a file with data on disk makes the missing information a
+		// limitation of the filesystem.
+		if size > 0 && !hasAllocatedBlocks(path) {
+			return nil, nil
+		}
 		return nil, err
 	}
-
-	info, statErr := os.Stat(path)
-	if statErr == nil {
-		extents = clampToSize(extents, info.Size())
-	}
-
-	if len(extents) == 0 && statErr == nil && info.Size() > 0 {
-		return nil, ErrUnsupported
-	}
-	return extents, nil
+	return clampToSize(extents, size), nil
 }
 
 // clampToSize drops extents that start at or beyond the end of the file and
@@ -153,64 +163,182 @@ func SharedFlagBytes(e []Extent) int64 {
 	return n
 }
 
-// SharedWithOthers returns the number of bytes of own that are physically
-// shared with at least one of the other extent lists.
+// SharedWithGroup returns, for each list in the group, the number of bytes that
+// member shares with at least one *other* member of the group. A nil or empty
+// list yields 0.
 //
 // Identity is the physical range: allocated extents of different files never
-// overlap unless the blocks really are shared, so intersecting ranges counts a
+// overlap unless the blocks really are shared, so intersecting ranges count a
 // shared run even when the filesystem splits it at different boundaries in each
 // file (for example an APFS clone whose first blocks were rewritten, where the
 // untouched tail becomes its own run starting mid-way through the original's
 // run). A byte shared with several others is counted once.
 //
-// Encoded (compressed) extents have no comparable physical range and fall back
-// to matching physical starts, which stays valid for aligned runs.
-func SharedWithOthers(own []Extent, others [][]Extent) int64 {
-	if len(own) == 0 || len(others) == 0 {
-		return 0
-	}
-
-	var all []Extent
-	for _, list := range others {
-		all = append(all, list...)
-	}
-	union := mergeIntervals(collectRanges(all, physicalRange))
-
-	if shared := overlapSum(collectRanges(own, physicalRange), union); shared > 0 {
-		return shared
-	}
-	return sharedStartBytes(own, others)
+// Every member's ranges are merged and then all of them are swept once over
+// compressed coordinates, so the per-member answer is exact and the whole group
+// costs O(M log M) in the total number of extents M. Asking each member the same
+// question against the union of all the others rebuilt nearly the same union n
+// times, which cost O(n²·E·log(nE)) for a group of n files.
+//
+// Encoded (compressed/inline) and opaque extents have no comparable range, so
+// their bytes are added from matching physical starts instead. Callers must still
+// filter by device: physical identities are only comparable within one.
+func SharedWithGroup(group [][]Extent) []int64 {
+	merged := mergedPhysicalRanges(group)
+	shared := sharedPlainBytes(merged)
+	sharedEncodedStarts(group, shared)
+	return shared
 }
 
-// sharedStartBytes returns the bytes of own whose physical start is also present
-// in one of the other lists, capped to the shorter extent. It is the fallback
-// for encoded extents, where only aligned starts are comparable.
-func sharedStartBytes(own []Extent, others [][]Extent) int64 {
-	shortest := make(map[uint64]uint64, len(own))
-	for _, list := range others {
-		for _, e := range list {
+// mergedPhysicalRanges returns each member's plain physical ranges, merged, so
+// that every member's ranges are disjoint and counting the ranges covering a
+// segment equals counting the members covering it.
+func mergedPhysicalRanges(group [][]Extent) [][]interval {
+	merged := make([][]interval, len(group))
+	for i, extents := range group {
+		merged[i] = mergeIntervals(collectRanges(extents, physicalRange))
+	}
+	return merged
+}
+
+// sharedPlainBytes returns the bytes each member shares with another member
+// through overlapping physical ranges. The ranges of the whole group are swept
+// once over compressed coordinates, which answers every member exactly in
+// O(M log M) instead of rebuilding the union of all the others per member.
+func sharedPlainBytes(merged [][]interval) []int64 {
+	shared := make([]int64, len(merged))
+
+	coords := collectBoundaries(merged)
+	if len(coords) == 0 {
+		return shared
+	}
+
+	index := boundaryIndexer(coords)
+	sharedLength := prefixSharedLength(coords, coverageBySegment(merged, coords, index))
+	for i, ranges := range merged {
+		for _, iv := range ranges {
+			lo, hi := index(iv.start), index(iv.end)
+			if lo < hi {
+				shared[i] += sharedLength[hi] - sharedLength[lo]
+			}
+		}
+	}
+	return shared
+}
+
+// collectBoundaries returns the sorted, de-duplicated coordinates that delimit
+// the physical ranges of the group.
+func collectBoundaries(merged [][]interval) []uint64 {
+	var coords []uint64
+	for _, ranges := range merged {
+		for _, iv := range ranges {
+			coords = append(coords, iv.start, iv.end)
+		}
+	}
+	if len(coords) == 0 {
+		return nil
+	}
+	slices.Sort(coords)
+	return slices.Compact(coords)
+}
+
+// boundaryIndexer returns a function that maps a coordinate to its index in
+// coords.
+func boundaryIndexer(coords []uint64) func(uint64) int {
+	return func(v uint64) int {
+		return sort.Search(len(coords), func(i int) bool { return coords[i] >= v })
+	}
+}
+
+// coverageBySegment counts, for every elementary segment between two consecutive
+// coordinates, how many members cover it.
+func coverageBySegment(merged [][]interval, coords []uint64, index func(uint64) int) []int32 {
+	coverage := make([]int32, len(coords)+1)
+	for _, ranges := range merged {
+		for _, iv := range ranges {
+			lo, hi := index(iv.start), index(iv.end)
+			coverage[lo]++
+			coverage[hi]--
+		}
+	}
+	return coverage
+}
+
+// prefixSharedLength turns per-segment coverage into a prefix sum of the bytes at
+// least two members cover.
+func prefixSharedLength(coords []uint64, coverage []int32) []int64 {
+	shared := make([]int64, len(coords)+1)
+	active := int32(0)
+	for j := range coords {
+		active += coverage[j]
+		shared[j+1] = shared[j]
+		if active >= 2 && j+1 < len(coords) {
+			shared[j+1] += int64(coords[j+1] - coords[j]) //nolint:gosec // bounded by the file size
+		}
+	}
+	return shared
+}
+
+// startRef records that one member has an extent starting at a physical offset.
+type startRef struct {
+	member int
+	length uint64
+}
+
+// sharedEncodedStarts adds the bytes of encoded and opaque extents whose physical
+// start appears in another member of the group, capped to the shorter extent.
+func sharedEncodedStarts(group [][]Extent, shared []int64) {
+	starts := collectPhysicalStarts(group)
+	for i, extents := range group {
+		shared[i] += encodedSharedBytes(extents, starts, i)
+	}
+}
+
+// collectPhysicalStarts indexes every extent of the group by its physical start.
+func collectPhysicalStarts(group [][]Extent) map[uint64][]startRef {
+	starts := make(map[uint64][]startRef)
+	for i, extents := range group {
+		for _, e := range extents {
 			if e.Physical == 0 || e.Length == 0 {
 				continue
 			}
-			if cur, ok := shortest[e.Physical]; !ok || e.Length < cur {
-				shortest[e.Physical] = e.Length
-			}
+			starts[e.Physical] = append(starts[e.Physical], startRef{member: i, length: e.Length})
 		}
 	}
+	return starts
+}
 
-	var n int64
-	for _, e := range own {
+// encodedSharedBytes sums the bytes of one member's encoded or opaque extents
+// whose physical start another member also reports.
+func encodedSharedBytes(extents []Extent, starts map[uint64][]startRef, self int) int64 {
+	var shared int64
+	for _, e := range extents {
+		if !e.Encoded && !e.Opaque {
+			continue // handled by the physical-range sweep
+		}
 		if e.Physical == 0 || e.Length == 0 {
 			continue
 		}
-		other, ok := shortest[e.Physical]
-		if !ok {
+		if shortest := shortestOther(starts[e.Physical], self); shortest > 0 {
+			shared += int64(min(e.Length, shortest)) //nolint:gosec // bounded by the file size
+		}
+	}
+	return shared
+}
+
+// shortestOther returns the length of the shortest extent at a physical start
+// that belongs to a member other than self.
+func shortestOther(refs []startRef, self int) uint64 {
+	shortest := uint64(0)
+	for _, ref := range refs {
+		if ref.member == self {
 			continue
 		}
-		shared := min(e.Length, other)
-		n += int64(shared) //nolint:gosec // extent lengths are bounded by the file size
+		if shortest == 0 || ref.length < shortest {
+			shortest = ref.length
+		}
 	}
-	return n
+	return shortest
 }
 
 // interval is a half-open byte range used for overlap arithmetic.
@@ -225,7 +353,7 @@ type rangeKey func(Extent) (interval, bool)
 
 // physicalRange selects plain, non-encoded, non-opaque extents by physical
 // offset. Opaque identities are excluded: only exact equality is meaningful for
-// them, so they are handled by sharedStartBytes instead.
+// them, so they are matched by start instead.
 func physicalRange(e Extent) (interval, bool) {
 	if e.Encoded || e.Opaque || e.Length == 0 {
 		return interval{}, false

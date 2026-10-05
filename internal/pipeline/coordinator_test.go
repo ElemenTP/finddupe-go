@@ -3,6 +3,7 @@ package pipeline //nolint:testpackage // needs the unexported coordinator
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"testing"
@@ -65,7 +66,7 @@ func TestCoordinateSaturatedChannels(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- coordinate(ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh, nil)
+		done <- coordinate(ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh, newReportWriter(io.Discard), nil)
 	}()
 
 	select {
@@ -140,7 +141,9 @@ func TestCoordinateFinalizerRounds(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- coordinate(ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh, final)
+		done <- coordinate(
+			ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh, newReportWriter(io.Discard), final,
+		)
 	}()
 
 	select {

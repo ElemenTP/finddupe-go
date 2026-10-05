@@ -2,6 +2,7 @@
 package action
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding"
@@ -10,6 +11,7 @@ import (
 	"hash"
 	"io"
 	"os"
+	"sync"
 
 	"finddupe/internal/config"
 	"finddupe/internal/dupe"
@@ -129,6 +131,64 @@ func hashBufferSize(fileSize int64) int64 {
 	return chunkSizeLarge
 }
 
+// bufferPool is a size-classed pool of read buffers. It stores the slice header,
+// so handing a buffer back does not allocate; without pooling, every HashCalc
+// allocates 64 KiB–1 MiB and every HashComp two more, which on a scan of large
+// duplicates is a stream of large short-lived allocations.
+type bufferPool struct {
+	size int
+	pool sync.Pool
+}
+
+// newBufferPool creates a pool of buffers of the given size.
+func newBufferPool(size int) *bufferPool {
+	p := &bufferPool{size: size}
+	p.pool.New = func() any {
+		buf := make([]byte, size)
+		return &buf
+	}
+	return p
+}
+
+// get returns a buffer of the pool's size.
+func (p *bufferPool) get() *[]byte {
+	buf, ok := p.pool.Get().(*[]byte)
+	if !ok || cap(*buf) < p.size {
+		fresh := make([]byte, p.size)
+		return &fresh
+	}
+	return buf
+}
+
+// put returns a buffer to the pool. Buffers of another size class are dropped.
+func (p *bufferPool) put(buf *[]byte) {
+	if p == nil || buf == nil || cap(*buf) < p.size {
+		return
+	}
+	p.pool.Put(buf)
+}
+
+// Hash read buffers are pooled by size class: one buffer per active executor
+// goroutine at a time.
+var (
+	smallHashBuffers = newBufferPool(int(chunkSizeSmall))
+	largeHashBuffers = newBufferPool(int(chunkSizeLarge))
+)
+
+// acquireHashBuffer returns a read buffer of at least size bytes and the pool it
+// belongs to (nil when the request is larger than any class).
+func acquireHashBuffer(size int64) (*[]byte, *bufferPool) {
+	switch {
+	case size <= chunkSizeSmall:
+		return smallHashBuffers.get(), smallHashBuffers
+	case size <= chunkSizeLarge:
+		return largeHashBuffers.get(), largeHashBuffers
+	default:
+		buf := make([]byte, size)
+		return &buf, nil
+	}
+}
+
 // DoExecution runs a single Execution and reports its outcome.
 func (e *Executor) DoExecution(ctx context.Context, ex dupe.Execution) (Outcome, error) {
 	select {
@@ -185,7 +245,9 @@ func (e *Executor) hashCalc(ctx context.Context, fi dupe.FileInfo) (dupe.FileInf
 		}
 	}
 
-	buf := make([]byte, hashBufferSize(fi.Size))
+	bufPtr, buffers := acquireHashBuffer(hashBufferSize(fi.Size))
+	defer buffers.put(bufPtr)
+	buf := *bufPtr
 	remaining := fi.Size - fi.HashOffset
 
 	for remaining > 0 {
@@ -224,6 +286,8 @@ func (e *Executor) hashCalc(ctx context.Context, fi dupe.FileInfo) (dupe.FileInf
 // hashCompare reads two files chunk by chunk, updating SHA-256 hashers and
 // comparing accumulated hashes after each chunk for early-stop. Saved hash state
 // is resumed if available.
+//
+//nolint:funlen // the chunk loop is one linear pass: read, compare, resume state
 func hashCompare(
 	ctx context.Context, orig, cand dupe.FileInfo, chunkSize int64,
 ) (dupe.FileInfo, dupe.FileInfo, error) {
@@ -260,8 +324,13 @@ func hashCompare(
 	}
 
 	remaining := orig.Size - orig.HashOffset
-	bufOrig := make([]byte, chunkSize)
-	bufCand := make([]byte, chunkSize)
+
+	bufOrigPtr, buffers := acquireHashBuffer(chunkSize)
+	defer buffers.put(bufOrigPtr)
+	bufCandPtr, _ := acquireHashBuffer(chunkSize)
+	defer buffers.put(bufCandPtr)
+
+	bufOrig, bufCand := *bufOrigPtr, *bufCandPtr
 
 	for remaining > 0 {
 		select {
@@ -480,8 +549,11 @@ func storeHashState(fi *dupe.FileInfo, h hash.Hash) {
 }
 
 // hashesEqual compares the current accumulated hashes of two SHA-256 digests.
+// The digests are written into stack arrays: comparing them as strings used to
+// allocate two strings per chunk of every comparison.
 func hashesEqual(a, b hash.Hash) bool {
-	return string(a.Sum(nil)) == string(b.Sum(nil))
+	var digestA, digestB [sha256.Size]byte
+	return bytes.Equal(a.Sum(digestA[:0]), b.Sum(digestB[:0]))
 }
 
 // finishHash finalizes a [hash.Hash] into a [32]byte.

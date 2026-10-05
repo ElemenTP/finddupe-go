@@ -804,11 +804,15 @@ func TestDoExecution_CoWClone_SkipsAlreadyShared(t *testing.T) {
 		t.Fatalf("first clone: result=%v err=%v", out.Result, err)
 	}
 
-	// Second pass must notice they already share storage.
+	// Second pass must notice they already share storage. The device is known
+	// (the scanner always records it), which is what makes physical offsets
+	// comparable at all.
+	kp, vp := fileInfo(t, keeper), fileInfo(t, victim)
+	kp.Dev, vp.Dev = 1, 1
 	out, err := exec.DoExecution(context.Background(), dupe.Execution{
 		Key:   testKey,
 		Type:  dupe.DupeElim,
-		Files: []dupe.FileInfo{fileInfo(t, keeper), fileInfo(t, victim)},
+		Files: []dupe.FileInfo{kp, vp},
 	})
 	if err != nil {
 		t.Fatalf("second clone: %v", err)

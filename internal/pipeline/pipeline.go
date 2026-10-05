@@ -2,9 +2,11 @@
 package pipeline
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -28,6 +30,11 @@ import (
 const (
 	// channelBufferFactor scales pipeline channel buffers with the worker count.
 	channelBufferFactor = 4
+
+	// outputBufferSize is the size of the buffered stdout writer. The report is
+	// written line by line; buffering turns thousands of write(2) calls into a
+	// handful of large ones.
+	outputBufferSize = 64 * 1024
 
 	// defaultThreadsPerCPU is the worker multiplier used when --threads is omitted.
 	defaultThreadsPerCPU = 2
@@ -59,10 +66,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	stopProgress := startProgress(ctx, cfg, stats)
 	defer stopProgress()
 
+	// The report is buffered once for the whole run; every return path flushes it.
+	report := newReportWriter(os.Stdout)
+	defer report.flush()
+
 	if cfg.ListLink {
-		err := runListLink(ctx, cfg, stats, logger)
+		err := runListLink(ctx, cfg, stats, logger, report)
 		stopProgress()
-		printSummary(stats)
+		printSummary(stats, report)
 		return err
 	}
 
@@ -103,10 +114,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// The coordinator owns the detector and decides when work is finished: once
 	// the input is drained it asks the detector for the elimination (or CoW
 	// detection) work of every content group it has found.
-	err := coordinate(ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh, detector.NextFinal)
+	err := coordinate(ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh, report, detector.NextFinal)
 
 	stopProgress()
-	printSummary(stats)
+	printSummary(stats, report)
+	report.flush()
 
 	if err != nil {
 		return err
@@ -177,6 +189,34 @@ func (p *patternMisses) err() error {
 // whichever member's hash completes first — but it makes every report
 // reproducible and gives the user a way to pin the keeper for a run by naming
 // paths deliberately.
+// reportWriter buffers the report: without it every line is a separate write(2),
+// and a slow stdout consumer (a pipe into a pager or a log collector) throttles
+// the scan itself, because the coordinator is the only writer. Every path that
+// can end the run must flush it.
+type reportWriter struct {
+	w *bufio.Writer
+}
+
+// newReportWriter wraps w in a buffer of its own.
+func newReportWriter(w io.Writer) *reportWriter {
+	return &reportWriter{w: bufio.NewWriterSize(w, outputBufferSize)}
+}
+
+// printf writes one formatted report line.
+func (r *reportWriter) printf(format string, args ...any) {
+	_, _ = fmt.Fprintf(r.w, format, args...)
+}
+
+// println writes one report line.
+func (r *reportWriter) println(args ...any) {
+	_, _ = fmt.Fprintln(r.w, args...)
+}
+
+// flush pushes buffered output to the underlying writer.
+func (r *reportWriter) flush() {
+	_ = r.w.Flush()
+}
+
 func fileOrder(a, b dupe.FileInfo) bool {
 	if a.IsRef != b.IsRef {
 		return a.IsRef
@@ -377,6 +417,7 @@ type coordinator struct {
 	stats       *dupe.Stats
 	logger      *slog.Logger
 	executionCh chan<- dupe.Execution
+	report      *reportWriter
 	final       func(limit int) ([]dupe.Execution, bool)
 	finalDone   bool
 	pending     []dupe.Execution
@@ -405,6 +446,7 @@ func coordinate(
 	fileInfoCh <-chan dupe.FileInfo,
 	executionCh chan<- dupe.Execution,
 	outcomeCh <-chan action.Outcome,
+	report *reportWriter,
 	final func(limit int) ([]dupe.Execution, bool),
 ) error {
 	c := &coordinator{
@@ -413,6 +455,7 @@ func coordinate(
 		stats:       stats,
 		logger:      logger,
 		executionCh: executionCh,
+		report:      report,
 		final:       final,
 	}
 	defer c.closeExec()
@@ -454,7 +497,7 @@ func coordinate(
 			if !ok {
 				outCh = nil
 			} else {
-				reportOutcome(ctx, out, c.stats, c.logger)
+				reportOutcome(ctx, out, c.stats, c.logger, c.report)
 				completeExecution(c.detector, out)
 				c.inFlight--
 			}
@@ -550,19 +593,23 @@ func runExecutor(
 }
 
 // reportOutcome prints results and updates statistics for a finished execution.
-func reportOutcome(ctx context.Context, out action.Outcome, stats *dupe.Stats, logger *slog.Logger) {
+func reportOutcome(
+	ctx context.Context, out action.Outcome, stats *dupe.Stats, logger *slog.Logger, report *reportWriter,
+) {
 	switch out.Kind {
 	case dupe.DupeElim:
-		reportElimination(ctx, out, stats, logger)
+		reportElimination(ctx, out, stats, logger, report)
 	case dupe.CoWDetect:
-		reportCoW(out, stats)
+		reportCoW(out, stats, report)
 	case dupe.HashCalc, dupe.HashComp:
 		// No user-visible result.
 	}
 }
 
 // reportElimination handles the reported result of a DupeElim execution.
-func reportElimination(ctx context.Context, out action.Outcome, stats *dupe.Stats, logger *slog.Logger) {
+func reportElimination(
+	ctx context.Context, out action.Outcome, stats *dupe.Stats, logger *slog.Logger, report *reportWriter,
+) {
 	if len(out.Files) < minCompareFiles {
 		return
 	}
@@ -572,34 +619,34 @@ func reportElimination(ctx context.Context, out action.Outcome, stats *dupe.Stat
 
 	switch out.Result {
 	case action.ResultVerifiedDuplicate:
-		fmt.Fprintf(os.Stdout, "Duplicate: '%s'\n", resultPath(keeper.Path))
-		fmt.Fprintf(os.Stdout, "With:      '%s'\n", resultPath(victim.Path))
+		report.printf("Duplicate: '%s'\n", resultPath(keeper.Path))
+		report.printf("With:      '%s'\n", resultPath(victim.Path))
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 	case action.ResultDeleted:
-		fmt.Fprintf(os.Stdout, "Deleted:    '%s'\n", resultPath(victim.Path))
+		report.printf("Deleted:    '%s'\n", resultPath(victim.Path))
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 		stats.DeletedFiles.Add(1)
 	case action.ResultHardlinked:
-		fmt.Fprintf(os.Stdout, "Hardlinked: '%s'\n", resultPath(victim.Path))
+		report.printf("Hardlinked: '%s'\n", resultPath(victim.Path))
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 		stats.HardlinkedFiles.Add(1)
 	case action.ResultCoWCloned:
-		fmt.Fprintf(os.Stdout, "CoW cloned: '%s'\n", resultPath(victim.Path))
+		report.printf("CoW cloned: '%s'\n", resultPath(victim.Path))
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 		stats.CoWClonedFiles.Add(1)
 	case action.ResultSkippedRO:
-		fmt.Fprintf(os.Stdout, "Skipping duplicate readonly file '%s'.\n", resultPath(victim.Path))
+		report.printf("Skipping duplicate readonly file '%s'.\n", resultPath(victim.Path))
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 		stats.SkippedROFiles.Add(1)
 	case action.ResultSkippedRef:
 		stats.SkippedRefFiles.Add(1)
 	case action.ResultSkippedChanged:
-		fmt.Fprintf(os.Stdout,
+		report.printf(
 			"Skipping '%s' (original '%s'): one of them changed during the scan.\n",
 			resultPath(victim.Path), resultPath(keeper.Path))
 		stats.SkippedChangedFiles.Add(1)
@@ -628,7 +675,7 @@ func reportElimination(ctx context.Context, out action.Outcome, stats *dupe.Stat
 // reportCoW prints one identical-content group and, for every member, how much
 // of it is already shared with the rest of the group. The group is what should
 // end up sharing storage (CoW); the ratios show what still needs to be done.
-func reportCoW(out action.Outcome, stats *dupe.Stats) {
+func reportCoW(out action.Outcome, stats *dupe.Stats, report *reportWriter) {
 	if len(out.Files) < minCompareFiles {
 		return
 	}
@@ -637,12 +684,12 @@ func reportCoW(out action.Outcome, stats *dupe.Stats) {
 	stats.DuplicateFiles.Add(int64(len(out.Files) - 1))
 	stats.DuplicateBytes.Add(int64(len(out.Files)-1) * out.Files[0].Size)
 
-	fmt.Fprintf(os.Stdout, "CoW candidate group (%d files, identical content):\n", len(out.Files))
+	report.printf("CoW candidate group (%d files, identical content):\n", len(out.Files))
 
 	if out.FileShared == nil {
-		fmt.Fprintln(os.Stdout, "    extent information unavailable on this filesystem; listing members only")
+		report.println("    extent information unavailable on this filesystem; listing members only")
 		for _, fi := range out.Files {
-			fmt.Fprintf(os.Stdout, "    '%s'\n", resultPath(fi.Path))
+			report.printf("    '%s'\n", resultPath(fi.Path))
 		}
 		return
 	}
@@ -658,14 +705,16 @@ func reportCoW(out action.Outcome, stats *dupe.Stats) {
 		if fi.Size > 0 {
 			percent = float64(shared) / float64(fi.Size) * percentScale
 		}
-		fmt.Fprintf(os.Stdout, "    '%s'  shared: %5.1f%% (%s of %s)\n",
+		report.printf("    '%s'  shared: %5.1f%% (%s of %s)\n",
 			resultPath(fi.Path), percent, formatSize(shared), formatSize(fi.Size))
 	}
 }
 
 // runListLink implements find --listlink: enumerate files that share a physical
 // inode without running duplicate detection.
-func runListLink(ctx context.Context, cfg *config.Config, stats *dupe.Stats, logger *slog.Logger) error {
+func runListLink(
+	ctx context.Context, cfg *config.Config, stats *dupe.Stats, logger *slog.Logger, report *reportWriter,
+) error {
 	threads := resolveThreads(cfg.Threads)
 
 	walkResultCh := make(chan fswalker.Result, threads*channelBufferFactor)
@@ -690,9 +739,9 @@ func runListLink(ctx context.Context, cfg *config.Config, stats *dupe.Stats, log
 	sortGroups(groups)
 
 	for _, group := range groups {
-		fmt.Fprintf(os.Stdout, "Hardlink group, %d hardlinked instances found:\n", len(group))
+		report.printf("Hardlink group, %d hardlinked instances found:\n", len(group))
 		for _, fi := range group {
-			fmt.Fprintf(os.Stdout, "    '%s'\n", resultPath(fi.Path))
+			report.printf("    '%s'\n", resultPath(fi.Path))
 		}
 		stats.HardlinkGroups.Add(1)
 	}
@@ -713,52 +762,52 @@ func sortGroups(groups [][]dupe.FileInfo) {
 }
 
 // printSummary outputs the final statistics.
-func printSummary(stats *dupe.Stats) {
+func printSummary(stats *dupe.Stats, report *reportWriter) {
 	totalFiles := stats.TotalFiles.Load()
 	totalBytes := stats.TotalBytes.Load()
 
 	dupFiles := stats.DuplicateFiles.Load()
 	dupBytes := stats.DuplicateBytes.Load()
 
-	fmt.Fprintln(os.Stdout, "")
-	fmt.Fprintf(os.Stdout, "Files: %8s in %5d files\n",
+	report.println("")
+	report.printf("Files: %8s in %5d files\n",
 		formatSize(totalBytes), totalFiles)
-	fmt.Fprintf(os.Stdout, "Dupes: %8s in %5d files\n",
+	report.printf("Dupes: %8s in %5d files\n",
 		formatSize(dupBytes), dupFiles)
 
 	if n := stats.ZeroLengthFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stdout, "  %d files of zero length were skipped\n", n)
+		report.printf("  %d files of zero length were skipped\n", n)
 	}
 	if n := stats.CantReadFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stdout, "  %d files could not be opened\n", n)
+		report.printf("  %d files could not be opened\n", n)
 	}
 	if n := stats.DeletedFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stdout, "  %d files deleted\n", n)
+		report.printf("  %d files deleted\n", n)
 	}
 	if n := stats.HardlinkedFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stdout, "  %d files replaced with hardlinks\n", n)
+		report.printf("  %d files replaced with hardlinks\n", n)
 	}
 	if n := stats.CoWClonedFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stdout, "  %d files replaced with CoW clones\n", n)
+		report.printf("  %d files replaced with CoW clones\n", n)
 	}
 	if n := stats.HardlinkGroups.Load(); n > 0 {
-		fmt.Fprintf(os.Stdout, "  %d hardlink groups found\n", n)
+		report.printf("  %d hardlink groups found\n", n)
 	}
 	if n := stats.CoWGroups.Load(); n > 0 {
 		// CoWSharedBytes is a per-file sum and would double-count storage, so
 		// only the group count is shown here; per-file ratios are printed with
 		// each group.
-		fmt.Fprintf(os.Stdout, "  %d CoW groups found (%s of file bytes already shared)\n",
+		report.printf("  %d CoW groups found (%s of file bytes already shared)\n",
 			n, formatSize(stats.CoWSharedBytes.Load()))
 	}
 	if n := stats.SkippedROFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stdout, "  %d read-only files skipped\n", n)
+		report.printf("  %d read-only files skipped\n", n)
 	}
 	if n := stats.SkippedRefFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stdout, "  %d reference files skipped\n", n)
+		report.printf("  %d reference files skipped\n", n)
 	}
 	if n := stats.SkippedChangedFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stdout, "  %d files skipped (changed during the scan)\n", n)
+		report.printf("  %d files skipped (changed during the scan)\n", n)
 	}
 }
 

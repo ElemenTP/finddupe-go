@@ -43,7 +43,7 @@ type Info struct {
 }
 ```
 
-The physical identity comes from the platform helper `fileIdentity(f)`:
+The physical identity comes from the platform helper `statFile(f)`:
 - On **Unix**: `Dev`, `Inode`, and `NumLinks` are read from `f.Stat().Sys().(*syscall.Stat_t)`.
 - On **Windows**: they are read from `GetFileInformationByHandle` on the open file handle (volume serial number, `FileIndexHigh<<32 | FileIndexLow`, `NumberOfLinks`).
 
@@ -388,7 +388,7 @@ has finished, the detector state is complete and the pipeline asks for groups.
      (Linux `FIEMAP_EXTENT_SHARED`), `extent.SharedFlagBytes` is used. This is a
      per-file signal: it says the extent is shared with someone, not with whom;
    - otherwise the physical start address is used as identity within the same
-     device via `extent.SharedWithOthers`, capped to the shorter extent.
+     device via `extent.SharedWithGroup`, capped to the shorter extent.
    `Outcome.FileShared []int64` carries one value per `Outcome.Files` entry; it is
    nil when extent information is unavailable for the whole group.
 
