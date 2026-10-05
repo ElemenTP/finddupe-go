@@ -33,6 +33,9 @@ var ErrUnsupported = errors.New("extent query not supported on this filesystem")
 // A filesystem that supports extent queries but has no extents to report for the
 // file (a sparse file, or resident NTFS data) returns an empty slice, not an
 // error: nothing is shared, which is a real answer.
+//
+// Physical identities are only comparable within one device, so callers that
+// compare two files must first establish that both live on the same volume.
 func Query(path string, size int64) ([]Extent, error) {
 	extents, err := query(path)
 	if err != nil {

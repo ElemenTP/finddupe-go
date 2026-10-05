@@ -179,7 +179,11 @@ func WithKeeperChooser(chooser KeeperChooser) Option {
 // zeroSHA is the sentinel key for files whose SHA-256 has not been computed.
 var zeroSHA [32]byte
 
-// minGroupSize is the smallest number of files that can be duplicates.
+// minGroupSize is the smallest number of files that can be duplicates: one file
+// cannot have a duplicate. It is 2 because grouping needs two members, which is a
+// different question from how many files one comparison execution carries
+// (action.minFilesPerExecution) or the pipeline's compare threshold; the three
+// values are deliberately independent rather than one shared constant.
 const minGroupSize = 2
 
 // maxFailedHashRetries is how often finalization re-schedules a file whose hash
@@ -623,14 +627,11 @@ func dedupeByInode(files []FileInfo) []FileInfo {
 	return out
 }
 
-// Len returns the number of unique GroupKeys stored.
+// Len returns the number of unique GroupKeys stored. It is a diagnostic (used by
+// the detector tests): the pipeline never asks, because the detector's own counters
+// are the scan's statistics.
 func (d *Detector) Len() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return len(d.groups)
-}
-
-// Stats returns the detector's statistics accumulator.
-func (d *Detector) Stats() *Stats {
-	return d.stats
 }

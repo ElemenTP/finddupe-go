@@ -38,7 +38,10 @@ type Stats struct {
 	// CoWGroups is the number of CoW (shared-extent) groups found by find --cow.
 	CoWGroups atomic.Int64
 
-	// CoWSharedBytes is the total number of physically shared bytes found.
+	// CoWSharedBytes is the total number of physically shared bytes found, summed
+	// over the members of every group: a byte shared by two members of one group is
+	// therefore counted twice, and the number answers "how much of these files is
+	// already shared", not "how much storage is saved".
 	CoWSharedBytes atomic.Int64
 
 	// SkippedROFiles is the number of read-only files skipped.

@@ -28,7 +28,10 @@ const (
 	chunkSizeMediumLimit = 16 * 1024 * 1024
 
 	// minFilesPerExecution is the number of files a comparison or elimination
-	// execution requires.
+	// execution requires. It is 2 because an execution compares or eliminates a pair,
+	// which is a different question from the smallest duplicate group
+	// (dupe.minGroupSize) or the pipeline's compare threshold; the three are
+	// deliberately independent rather than one shared constant.
 	minFilesPerExecution = 2
 )
 

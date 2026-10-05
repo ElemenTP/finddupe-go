@@ -46,6 +46,10 @@ const (
 	maxThreads = 1024
 
 	// minCompareFiles is the number of files a comparison/elimination execution needs.
+	// It is 2 because a comparison is between two files, which is a different
+	// question from the smallest duplicate group (dupe.minGroupSize) or the files one
+	// execution carries (action.minFilesPerExecution); the three are deliberately
+	// independent rather than one shared constant.
 	minCompareFiles = 2
 
 	// Byte units used when formatting sizes.
