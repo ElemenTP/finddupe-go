@@ -21,7 +21,8 @@ back.
 This writes `bin/cow-test/<platform>/` (and `.zip` if `zip` is installed):
 
 - `linux-amd64`, `darwin-amd64`, `darwin-arm64`, `windows-amd64`, `windows-arm64`
-- each contains `finddupe`, `extentdump`, the probe script, and this README
+- each contains `finddupe`, `extentdump`, `compressdump`, the probe script, and
+  this README
 
 Copy the bundle matching your machine to that machine. The probe creates its
 files in a fresh `finddupe-cow-probe.<random>` subdirectory of the directory you
@@ -32,7 +33,7 @@ point at any writable location.
 
 ```bash
 cd darwin-arm64
-chmod +x cow-probe.sh finddupe extentdump
+chmod +x cow-probe.sh finddupe extentdump compressdump
 ./cow-probe.sh ~/finddupe-cow-probe
 ```
 
@@ -81,6 +82,15 @@ The whole script output (it is split into `== section ==` markers), plus:
 - `extentdump` prints exactly what finddupe sees per file: `logical`,
   `physical`, `length`, and the `shared`/`encoded` flags, plus the shared-flag
   byte total.
+- `compressdump` prints what `dedupe --cow --prefer-compressed` decides per
+  file: `compressed=true/false`, using the same code path the tool uses
+  (Linux: the FIEMAP `encoded` flag; macOS: `UF_COMPRESSED`; Windows:
+  `FILE_ATTRIBUTE_COMPRESSED`). The probe's "transparent compression detection"
+  section writes a compressible file, an incompressible one, and (where the
+  platform allows) a deliberately uncompressed copy of the compressible one, so
+  the three answers can be compared: the first should be `true`, the others
+  `false`. On ReFS every answer is expected to be `false`, because ReFS does not
+  implement NTFS per-file compression.
 - `find --cow` groups byte-identical files that are not hardlinks of each
   other and prints, per file, how many bytes are already shared with the rest
   of the group:

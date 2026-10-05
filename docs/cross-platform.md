@@ -311,7 +311,10 @@ compressed member as the clone source, so the whole group ends up compressed
 instead of inheriting an uncompressed member's layout. Detection is per platform:
 btrfs/most Linux filesystems use the FIEMAP `Encoded` flag, APFS uses
 `UF_COMPRESSED`, NTFS uses `FILE_ATTRIBUTE_COMPRESSED`; an inconclusive answer
-means "not compressed", which only restores the default order.
+means "not compressed", which only restores the default order. `testtools/compressdump`
+(the `compressdump` binary in the probe bundles, see
+[../testscripts/README.md](../testscripts/README.md)) prints that answer for any
+path, so the detection can be verified on a machine without running a dedupe.
 
 `dedupe --cow` clones every member from the group keeper, and the keeper is the
 first file of the group in walk order. When that keeper is uncompressed, a

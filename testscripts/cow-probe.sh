@@ -50,9 +50,9 @@ find_bin() {
 
 FIEMAP=""
 case "$OS-$ARCH" in
-Darwin-arm64) FD="$(find_bin finddupe finddupe-darwin-arm64)"; ED="$(find_bin extentdump extentdump-darwin-arm64)"; FIEMAP="$(find_bin darwinfiemap darwinfiemap-darwin-arm64 || true)" ;;
-Darwin-x86_64) FD="$(find_bin finddupe finddupe-darwin-amd64)"; ED="$(find_bin extentdump extentdump-darwin-amd64)"; FIEMAP="$(find_bin darwinfiemap darwinfiemap-darwin-amd64 || true)" ;;
-Linux-x86_64) FD="$(find_bin finddupe finddupe-linux-amd64)"; ED="$(find_bin extentdump extentdump-linux-amd64)" ;;
+Darwin-arm64) FD="$(find_bin finddupe finddupe-darwin-arm64)"; ED="$(find_bin extentdump extentdump-darwin-arm64)"; CD="$(find_bin compressdump compressdump-darwin-arm64 || true)"; FIEMAP="$(find_bin darwinfiemap darwinfiemap-darwin-arm64 || true)" ;;
+Darwin-x86_64) FD="$(find_bin finddupe finddupe-darwin-amd64)"; ED="$(find_bin extentdump extentdump-darwin-amd64)"; CD="$(find_bin compressdump compressdump-darwin-amd64 || true)"; FIEMAP="$(find_bin darwinfiemap darwinfiemap-darwin-amd64 || true)" ;;
+Linux-x86_64) FD="$(find_bin finddupe finddupe-linux-amd64)"; ED="$(find_bin extentdump extentdump-linux-amd64)"; CD="$(find_bin compressdump compressdump-linux-amd64 || true)" ;;
 *)
 	echo "unsupported platform $OS-$ARCH" >&2
 	exit 1
@@ -250,7 +250,36 @@ if [ "$OS" = "Darwin" ]; then
 	echo "--- ls -lO (look for 'compressed') ---"
 	ls -lO "$CMP" 2>&1
 else
-	echo "--- non-macOS: no transparent compression involved ---"
+	# Linux: the mount option decides compression per write, and btrfs exposes
+	# it as the FIEMAP ENCODED flag. Build one compressible file (compressed by
+	# the mount option) and one incompressible file (stored plain), so the two
+	# answers can be compared.
+	mkdir -p "$CMP/detect"
+	yes "finddupe compressible detection line" 2>/dev/null |
+		head -c 1048576 >"$CMP/detect/compressible.bin" || true
+	dd if=/dev/urandom of="$CMP/detect/incompressible.bin" bs=1048576 count=1 2>/dev/null
+
+	# btrfs can be told to store a file plain: create it, drop compression, then
+	# write the same compressible content through the notrunc path.
+	cp "$CMP/detect/compressible.bin" "$CMP/detect/forced-plain.bin"
+	if command -v btrfs >/dev/null 2>&1 && btrfs property set "$CMP/detect/forced-plain.bin" compression no 2>/dev/null; then
+		dd if="$CMP/detect/compressible.bin" of="$CMP/detect/forced-plain.bin" bs=1M conv=notrunc 2>/dev/null || true
+	fi
+
+	echo "--- transparent compression detection ---"
+	if [ -n "$CD" ]; then
+		for f in compressible incompressible forced-plain; do
+			"$CD" "$CMP/detect/$f.bin" 2>&1 || true
+		done
+	else
+		echo "compressdump not found; skipping the library answer"
+	fi
+	echo "--- raw FIEMAP flags (encoded=true means the extent is stored encoded) ---"
+	for f in compressible incompressible forced-plain; do
+		echo "[$f.bin]"
+		"$ED" "$CMP/detect/$f.bin" 2>&1 | grep -E '^  \[0\]|^  \[1\]|extents=' || true
+	done
+	echo "--- expected: compressible.bin compressed=true, incompressible.bin false ---"
 fi
 
 clone_one "$CMP/compA.bin" "$CMP/compClone.bin" 2>/dev/null || independent_copy "$CMP/compA.bin" "$CMP/compClone.bin"

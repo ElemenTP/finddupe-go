@@ -8,10 +8,11 @@
 #   ./testscripts/build-bundles.sh
 #
 # Each bundle contains:
-#   finddupe / finddupe.exe    the CLI under test
-#   extentdump / extentdump.exe platform extent diagnostics
-#   cow-probe.sh / cow-probe.ps1 the self-test to run on the target machine
-#   README.md                  short instructions
+#   finddupe / finddupe.exe          the CLI under test
+#   extentdump / extentdump.exe      platform extent diagnostics
+#   compressdump / compressdump.exe  transparent-compression detection diagnostics
+#   cow-probe.sh / cow-probe.ps1     the self-test to run on the target machine
+#   README.md                        short instructions
 
 set -euo pipefail
 
@@ -27,16 +28,17 @@ build() {
 	mkdir -p "$dir"
 	GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build -trimpath -o "$dir/$4" .
 	GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build -trimpath -o "$dir/$5" ./testtools/extentdump
+	GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build -trimpath -o "$dir/$6" ./testtools/compressdump
 }
 
 # Linux
-build linux amd64 "$OUT/linux-amd64" finddupe extentdump
+build linux amd64 "$OUT/linux-amd64" finddupe extentdump compressdump
 install -m 0755 testscripts/cow-probe.sh "$OUT/linux-amd64/cow-probe.sh"
 
 # macOS
 for arch in amd64 arm64; do
 	dir="$OUT/darwin-$arch"
-	build darwin "$arch" "$dir" finddupe extentdump
+	build darwin "$arch" "$dir" finddupe extentdump compressdump
 	GOOS=darwin GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -o "$dir/darwinfiemap" ./testtools/darwinfiemap
 	install -m 0755 testscripts/cow-probe.sh "$dir/cow-probe.sh"
 done
@@ -44,7 +46,7 @@ done
 # Windows
 for arch in amd64 arm64; do
 	dir="$OUT/windows-$arch"
-	build windows "$arch" "$dir" finddupe.exe extentdump.exe
+	build windows "$arch" "$dir" finddupe.exe extentdump.exe compressdump.exe
 	install -m 0644 testscripts/cow-probe-windows.ps1 "$dir/cow-probe.ps1"
 done
 

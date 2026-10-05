@@ -49,6 +49,8 @@ $FD = Find-Bin "finddupe.exe"
 if (-not $FD) { $FD = Find-Bin "finddupe-windows-$arch.exe" }
 $ED = Find-Bin "extentdump.exe"
 if (-not $ED) { $ED = Find-Bin "extentdump-windows-$arch.exe" }
+$CD = Find-Bin "compressdump.exe"
+if (-not $CD) { $CD = Find-Bin "compressdump-windows-$arch.exe" }
 
 if (-not $FD) { Write-Error "finddupe.exe not found next to the script or in ..\bin"; exit 1 }
 if (-not $ED) { Write-Error "extentdump.exe not found next to the script or in ..\bin"; exit 1 }
@@ -107,6 +109,50 @@ Section "binaries"
 Write-Host "finddupe:   $FD"
 & $FD version 2>&1 | Write-Host
 Write-Host "extentdump: $ED"
+Write-Host "compressdump: $(if ($CD) { $CD } else { 'not found' })"
+
+# ---------------------------------------------------------------------------
+# 0. Transparent compression detection
+#
+# The --prefer-compressed keeper preference reads FILE_ATTRIBUTE_COMPRESSED.
+# ReFS (the only volume where block cloning works) does not support NTFS
+# per-file compression, so on a ReFS volume every answer being false is the
+# expected result; the section is here to confirm that, and to show what the
+# probe reports on an NTFS volume.
+# ---------------------------------------------------------------------------
+$cmp = Join-Path $Dir "compress-detect"
+Remove-Item -Recurse -Force $cmp -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $cmp | Out-Null
+
+$compressible = Join-Path $cmp "compressible.bin"
+$line = "finddupe compressible detection line`n"
+$content = $line * 40000
+[System.IO.File]::WriteAllText($compressible, $content)
+
+$incompressible = Join-Path $cmp "incompressible.bin"
+New-RandomFile $incompressible (1MB)
+
+# Force NTFS compression on a second copy of the same content, when the volume
+# supports it.
+$forced = Join-Path $cmp "forced-compressed.bin"
+Copy-Item $compressible $forced -Force
+& compact.exe /c $forced 2>&1 | Write-Host
+
+Section "transparent compression detection"
+$fsType = if ($volume) { $volume.FileSystem } else { "" }
+if ($fsType -eq "ReFS") {
+    Write-Host "volume is ReFS: NTFS per-file compression is unavailable, all answers should be false"
+}
+foreach ($f in @($compressible, $incompressible, $forced)) {
+    $item = Get-Item $f -ErrorAction SilentlyContinue
+    $attrs = if ($item) { $item.Attributes.ToString() } else { "(missing)" }
+    if ($CD) { & $CD $f 2>&1 | Write-Host } else { Write-Host "$f : compressdump not found" }
+    Write-Host ("  attributes: " + $attrs)
+}
+Write-Host "--- fsutil file layout (compressible) ---"
+& fsutil.exe file layout $compressible 2>&1 | Select-Object -First 8 | Write-Host
+Write-Host "--- fsutil file layout (forced-compressed) ---"
+& fsutil.exe file layout $forced 2>&1 | Select-Object -First 8 | Write-Host
 
 # ---------------------------------------------------------------------------
 # 1. Independent copies
