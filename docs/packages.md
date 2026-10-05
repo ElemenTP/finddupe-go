@@ -20,9 +20,10 @@ finddupe-go/
 │   │   ├── detector.go        # Detector state machine (Insert/OnHashDone/OnCompareDone/NextFinal)
 │   │   └── stats.go           # Thread-safe statistics (+ ZeroLenCounter)
 │   ├── fswalker/              # Filesystem traversal
-│   │   ├── walker.go          # Walker, Result, WalkOptions, glob matching
-│   │   ├── walker_unix.go     # Unix: Dev/Inode/NumLinks from stat (getFileIdentity)
-│   │   └── walker_windows.go  # Windows: returns zeros — done in checksum
+│   │   └── walker.go          # Walker, Result, WalkOptions, glob matching
+│   ├── fileid/                # Dev/Inode/NumLinks from a stat result
+│   │   ├── fileid_unix.go     # Unix: read from the stat struct already in hand
+│   │   └── fileid_other.go    # Other platforms: no identity in os.FileInfo
 │   ├── checksum/              # File signature + identity computation
 │   │   ├── checksum.go        # Compute, ComputeFileInfo (returns Info), ComputeFromReader
 │   │   ├── stat_unix.go       # Unix: size/mtime/identity from one fstat
@@ -146,7 +147,11 @@ type Result struct {
 type NoMatchError struct{ Pattern string }
 ```
 
-**Platform helpers**: `getFileIdentity(path, info)` in `walker_unix.go` / `walker_windows.go`.
+**Platform helpers**: `fileid.FromFileInfo(info)` (package `internal/fileid`), shared
+by the walker and the checksum path. On Unix it reads `Dev`/`Inode`/`NumLinks` from
+the stat struct that is already in hand; on Windows `os.FileInfo` carries none of
+them, so it reports "unknown" and the scanner fills the identity from the open
+handle instead.
 
 **Features**: `**` recursive glob matching, literal paths (a pattern that names an existing path is scanned as written, so `/data/[2020] photos` is not split on its brackets), symlink following control (with per-pattern loop prevention), zero-length file filtering, `ZeroLenCounter` callback, and no-match reporting: a pattern that matches no usable file yields one `*NoMatchError` on the channel, which the pipeline turns into a failed run. Only regular files are reported: symlinks are skipped unless `FollowSymlinks` is set (then they are resolved and **reported under the target's own path**, so a later action operates on the file whose content was verified rather than on the link; links to directories are walked through the `seen` set), and devices/FIFOs/sockets are always ignored so nothing blocks on an open.
 

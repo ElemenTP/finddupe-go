@@ -487,7 +487,7 @@ func matchComponents(patParts, nameParts []string) bool {
 
 ### Integration with filepath.WalkDir
 
-The walker calls `filepath.WalkDir` to enumerate files, then filters each path against the user's patterns. For non-recursive patterns (no `**`), subdirectories are skipped via `filepath.SkipDir`. On Unix the walker also fills `Dev`/`Inode`/`NumLinks` from the already-available stat struct via `getFileIdentity`; on Windows it returns zeros and the identity is filled later by the parallel checksum path.
+The walker calls `filepath.WalkDir` to enumerate files, then filters each path against the user's patterns. For non-recursive patterns (no `**`), subdirectories are skipped via `filepath.SkipDir`. On Unix the walker also fills `Dev`/`Inode`/`NumLinks` from the already-available stat struct via `fileid.FromFileInfo`; where `os.FileInfo` exposes no identity it reports "unknown", and the scanner fills it from the open handle later.
 
 ## 6. Multi-Threading Design
 

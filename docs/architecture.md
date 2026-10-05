@@ -207,7 +207,7 @@ Results + final summary printed to stdout                    │
   │                 │ │              │ │            │ │              │
   │ - Walk()        │ │ - Compute()  │ │ - Detector │ │ - Executor   │
   │ - ** matcher    │ │ - ComputeFile│ │ - Execution│ │ - Outcome    │
-  │ - getFileIdentity│ │   Info()    │ │ - FileInfo │ │ - Delete     │
+  │ - fileid.From   │ │   Info()    │ │ - FileInfo │ │ - Delete     │
   │   (per OS)      │ │ - statFile│ │ - Stats    │ │ - Hardlink   │
   │                 │ │   (per OS)   │ │ - InodeKey │ │ - CoW clone  │
   └─────────────────┘ └──────────────┘ └────────────┘ │   (per OS)   │

@@ -12,8 +12,10 @@ internal/
 │   ├── stat_unix.go       // //go:build unix     → statFile
 │   └── stat_windows.go    // //go:build windows  → statFile
 ├── fswalker/
-│   ├── walker_unix.go     // //go:build unix     → getFileIdentity
-│   └── walker_windows.go  // //go:build windows  → getFileIdentity
+│   └── walker.go          // all platforms        → pattern matching, WalkDir
+├── fileid/
+│   ├── fileid_unix.go     // //go:build unix      → Dev/Inode/NumLinks from stat
+│   └── fileid_other.go    // //go:build !unix     → "unknown"
 ├── extent/
 │   ├── query_linux.go     // //go:build linux    → FIEMAP
 │   ├── query_darwin.go    // //go:build darwin   → getattrlist ATTR_CMNEXT_CLONEID
@@ -37,7 +39,10 @@ internal/
 Identity retrieval has two entry points with the same `(dev, inode, numLinks)` result:
 
 - `checksum.statFile(f *os.File)` — called in the **parallel worker pool** after `os.Open`.
-- `fswalker.getFileIdentity(path, info fs.FileInfo)` — called from the walker; on Unix it uses the already-available stat struct, on Windows it returns zeros.
+- `fileid.FromFileInfo(info fs.FileInfo)` — shared by the walker and the checksum
+  path; on Unix it uses the already-available stat struct, and on platforms whose
+  `os.FileInfo` exposes no identity it reports "unknown" (the scanner reads the
+  identity from the open handle on Windows instead).
 
 This split matters for performance: on Windows `GetFileInformationByHandle` requires a handle, and opening files in the walker would serialize all I/O and kill multi-threading.
 
