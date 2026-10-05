@@ -478,7 +478,24 @@ func unchanged(fi dupe.FileInfo) (os.FileInfo, bool) {
 	if fi.ModTime.IsZero() {
 		return info, true
 	}
-	return info, info.Size() == fi.Size && info.ModTime().Equal(fi.ModTime)
+	if info.Size() != fi.Size || !info.ModTime().Equal(fi.ModTime) {
+		return nil, false
+	}
+
+	// Size and modification time do not prove that the file is still the one
+	// whose content was hashed: `cp -p`, `rsync -a`, `tar -xp` and a temporary
+	// file renamed over the path all keep or restore them. Comparing the physical
+	// identity closes that hole where the platform exposes it in the stat result
+	// (Unix) or through one open (Windows); where it cannot, the comparison above
+	// is all the evidence there is. Acting on a stale verdict is what would
+	// destroy the last copy of a content group: the file that was replaced may
+	// have been the keeper, and the victim is then the only survivor.
+	if fi.Dev != 0 || fi.Inode != 0 {
+		if same, known := sameIdentity(fi.Path, fi, info); known && !same {
+			return nil, false
+		}
+	}
+	return info, true
 }
 
 // ensurePairUnchanged verifies that both files of a comparison still match the
