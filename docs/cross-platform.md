@@ -227,17 +227,22 @@ Verified on a Darwin 27.0.0 / macOS 27 ARM64 APFS data volume:
 - `afsctool -c`-compressed files (and `cp -c` clones of them) return `ENOTSUP`
   from `F_LOG2PHYS_EXT`, take the clone-ID fallback, and still report 100%/0%;
   the clone is byte-identical;
-- `clonefile(2)` preserves *the source's* compression. `dedupe --cow` clones each
-  victim from the group keeper, so when the keeper is uncompressed (which file is
-  first depends on directory order) compressed members become uncompressed clones
-  of equal content. The dedupe result is correct either way, but the compression
-  saving is lost in that case — `--prefer-compressed` is the answer;
+- `clonefile(2)` preserves *the source's* compression, and so does `dedupe --cow`:
+  cloning the compressed member of the group left **all four members compressed**
+  (2 of 3 before the run, 4 of 4 after it, 48 KiB stored for 8.4 MB of content)
+  while they share the keeper's payload. When the keeper is uncompressed — which
+  file is first depends on the keeper policy — the group ends up uncompressed
+  instead, which is why `--prefer-compressed` exists; both outcomes dedupe
+  correctly, only the compression saving differs;
 - APFS native compression is exposed through the `SF_COMPRESSED` flag (`ls -lO`
   prints `compressed`, `stat -f %Sf` lists it as a flag), not as a readable
   `com.apple.decmpfs` xattr;
 - a clone whose first 256 KiB were rewritten reports **75.0% (768 KiB of 1 MiB)**,
   and `dedupe --cow` brings it back to 100%: the partial-ratio path is exercised
   on real APFS, not just in the unit tests;
+- a compressed group survives the whole scenario: `cmp src.bin compClone.bin`
+  reports `identical`, no member is reported as zero length, and every member
+  still reports 100% shared;
 - **A clone must keep the data layout it inherited.** Cloning a compressed keeper
   over an uncompressed victim used to end in data loss: the metadata sync removed
   every attribute the victim did not have, which stripped `com.apple.decmpfs` and
