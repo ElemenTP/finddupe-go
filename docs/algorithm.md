@@ -122,7 +122,7 @@ func (d *Detector) Insert(fi FileInfo) []Execution {
 
 ### Consistency Rules
 
-- **Keeper**: the first file placed in a SHA-256 bucket is the keeper and is never a victim.
+- **Keeper**: the first file placed in a SHA-256 bucket is the keeper and is never a victim. "First" means whichever member's hash or comparison completed first, so on a multi-core scan the keeper is **not reproducible** between runs; `--ref` is the supported way to pin it (see Consistency Rules in the CLI spec).
 - **No double elimination**: a file scheduled as a victim is recorded in the `scheduled` set, so it can never be selected as a keeper or handed out again.
 - **No concurrent double hashing**: `inflight` tracks paths that already have a hash/compare task queued.
 - **Partial resume**: when a comparison stops early, `OnCompareDone` persists the more advanced `HashState`/`HashOffset` for each file, so a later comparison resumes instead of re-reading from the start.
@@ -157,9 +157,17 @@ Before acting on a DupeElim (keeper = Files[0], victim = Files[1]):
           → ResultAlreadyHardlinked      # no file is touched
   else if victim.IsRef and action != report:
       → ResultSkippedRef                 # reference files are never eliminated
+  else if action != report and (keeper or victim changed since it was hashed):
+      → ResultSkippedChanged             # the duplicate decision is stale
+  else if action == hardlink and not sameDevice(keeper, victim):
+      → ResultSkippedCrossDevice         # hard links cannot span volumes
   else:
       → execute the configured action
 ```
+
+"Changed since it was hashed" means the current `Size`/`ModTime` no longer match
+the values recorded with the content hash, so the pair is left alone rather than
+eliminated against a stale decision.
 
 This applies to **every** action: delete, hardlink, and CoW clone all refuse to
 touch a path that is already the same physical file as the keeper. Acting on such
@@ -186,17 +194,27 @@ When exactly two unhashed files share a weak-checksum bucket, compare them **inc
 Given: fileA, fileB, chunk size derived from the file size
 
 1. Open both files, restoring any saved SHA-256 state and seeking to HashOffset
-2. remaining = size - HashOffset
-3. While remaining > 0:
+2. Verify each file still has the size recorded during the scan (and, when a
+   partial digest is being resumed, the same modification time); a file that
+   changed fails with dupe.ErrFileChanged instead of producing a digest of the
+   wrong bytes
+3. remaining = size - HashOffset
+4. While remaining > 0:
    a. Read up to chunkSize bytes from each file
    b. If either read is short/zero → truncated: stop, keep partial state
+      (the bytes that were read are fed into the digests first, so HashOffset
+      never runs ahead of the hasher)
    c. Feed both chunks to their SHA-256 hashers
    d. If the accumulated hashes differ → stop early, keep partial state
    e. remaining -= bytes read
-4. End of file with equal hashes → both SHA-256 values are complete
+5. End of file with equal hashes → both SHA-256 values are complete
 ```
 
 The executor returns the updated `FileInfo` records in the `Outcome`; the detector then treats a complete hash like an `OnHashDone` result and continues matching.
+
+The signature path enforces the same rule: `checksum.ComputeFileInfo` stats the
+open file and refuses to sign it when its size is no longer the size the walker
+reported.
 
 ### Chunk Sizing
 
@@ -238,8 +256,18 @@ For a `DupeElim` execution:
       → otherwise: ResultAlreadyHardlinked (no file is touched)
 2. If the victim is a reference file and the action is not "report"
       → ResultSkippedRef (reference files are never eliminated)
-3. Otherwise execute the configured action
+3. If the action is not "report" and either file no longer matches the size and
+   modification time recorded when its content was hashed
+      → ResultSkippedChanged (the duplicate decision is stale; nothing is touched)
+4. Hardlink only: if keeper and victim are on different devices
+      → ResultSkippedCrossDevice (a hardlink can never span volumes)
+5. Otherwise execute the configured action
 ```
+
+Step 3 is the re-check that makes elimination safe on a live filesystem: the
+hashes are computed earlier in the scan, so a file that was rewritten, appended
+to, or replaced in the meantime must never be eliminated against that stale
+decision. The readers enforce the same rule while hashing (Section 3).
 
 The same-physical-file check applies to delete, hardlink, and CoW clone alike; it
 prevents an existing hardlink from being broken.
@@ -257,15 +285,26 @@ prevents an existing hardlink from being broken.
 ### Hardlink
 
 ```
-1. Check keeper.NumLinks < 1023 (Windows NTFS limit) → else ResultHardlinkLimit
+1. Re-read the keeper's link count and refuse at the NTFS limit (1023)
+   → else ResultHardlinkLimit
 2. If the victim is read-only and not --rdonly → ResultSkippedRO
-3. os.Remove(victimPath) — delete the duplicate
-4. os.Link(keeperPath, victimPath) — create a hardlink to the keeper
-5. Restore the original file mode and modification time
-6. → ResultHardlinked
+3. os.Link(keeperPath, temporaryNameNextToVictim)
+4. os.Rename / MoveFileEx(temporaryName, victimPath) — atomic replace
+5. → ResultHardlinked
 ```
 
-The sequence "delete then link" (instead of linking over the existing file) is required because `os.Link` fails if the destination exists. On Windows `os.Link` wraps `CreateHardLinkW`; cross-volume hardlinks are impossible.
+The link count is re-read instead of trusting `FileInfo.NumLinks`, which comes
+from the scan and is stale after the first link is created; on Unix the
+filesystem's own (far higher or absent) limit is left to the kernel.
+
+The link is created under a temporary name next to the victim and renamed over
+it, so the victim is either the untouched original file or the finished
+hardlink — never missing. A plain remove-then-link destroys the victim whenever
+linking fails: different devices, a filesystem without hard links, the link
+limit, or a keeper that vanished. Hard links share the keeper's inode, so the
+victim necessarily takes on the keeper's permissions and timestamps; the
+victim's own metadata is *not* restored, because restoring it would silently
+rewrite the keeper's metadata as well.
 
 ### CoW Clone
 
@@ -273,16 +312,23 @@ CoW elimination is implemented per platform. The victim is replaced with a block
 
 - **Linux** (btrfs/XFS): `FICLONE` ioctl via `golang.org/x/sys/unix` `IoctlFileClone`.
 - **macOS** (APFS): `clonefile(2)` via `unix.Clonefile`.
-- **Windows** (ReFS/Dev Drive): `FSCTL_DUPLICATE_EXTENTS_TO_FILE`, cluster-aligned with the tail copied normally and the destination preallocated.
+- **Windows** (ReFS/Dev Drive): `FSCTL_DUPLICATE_EXTENTS_TO_FILE` for the
+  cluster-aligned part, with the trailing partial cluster copied explicitly to
+  its own offset in the destination and the destination preallocated.
 
 All platforms go through `cloneReplace(src, dst)` in `internal/action/cow.go`:
 
 ```
-0. If keeper and victim are the same physical file, or their extent layouts
-   compare Equal, → ResultAlreadyShared (no clone, no file change)
+0. If keeper and victim are the same physical file, or they are on the same
+   device and their extent layouts compare Equal,
+   → ResultAlreadyShared (no clone, no file change)
 1. Create a temporary file next to the victim
 2. Clone the keeper into the temporary path (platform-specific)
-3. Preserve the victim's mode and mtime on the temporary file
+3. Restore the victim's metadata on the temporary file: ownership, mode
+   (including setuid/setgid/sticky), extended attributes (which carry POSIX
+   ACLs on Linux and resource forks on macOS), timestamps, and (macOS) BSD
+   file flags. Unlike a hardlink, a clone has its own inode, so the victim's
+   identity can be preserved instead of inheriting the keeper's
 4. Atomically replace the victim (os.Rename on Unix,
    MoveFileEx(REPLACE_EXISTING) on Windows)
 ```
@@ -292,6 +338,11 @@ established by the detector, so cloning anyway is safe and idempotent. It is
 deliberately conservative — `extent.Equal` returns false for empty lists, for
 encoded (compressed) extents, and for unknown (zero) physical addresses, and any
 uncertainty (unsupported filesystem, query failure) simply means "clone".
+Physical offsets are only meaningful within one device, so two files with
+different `Dev` values are never treated as sharing storage. Extent lengths are
+clamped to the file's size: filesystems allocate whole blocks, and without the
+clamp a fully shared 100000-byte file would report 102400 shared bytes (a ratio
+above 100%).
 
 Unsupported filesystems return `ErrCoWNotSupported` and the victim is left
 untouched. → `ResultCoWCloned` on success, `ResultAlreadyShared` when the pair

@@ -4,13 +4,12 @@ package action
 
 import (
 	"errors"
-	"io"
 	"os"
-	"path/filepath"
-	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"finddupe/internal/volinfo"
 )
 
 // duplicateExtentsData mirrors DUPLICATE_EXTENTS_DATA.
@@ -21,18 +20,11 @@ type duplicateExtentsData struct {
 	ByteCount        int64
 }
 
-var (
-	windowsClusterMu    sync.Mutex
-	windowsClusterCache = map[string]uint64{}
-
-	procGetDiskFreeSpaceW = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetDiskFreeSpaceW")
-)
-
 // clonePlatformFile creates a CoW (block) clone of src at dst. dst must not
 // exist. Windows supports this on ReFS volumes (including Dev Drive) via
 // FSCTL_DUPLICATE_EXTENTS_TO_FILE; NTFS returns ERROR_INVALID_FUNCTION.
 func clonePlatformFile(src, dst string) error {
-	cluster, err := windowsClusterSize(dst)
+	cluster, err := volinfo.ClusterSize(dst)
 	if err != nil {
 		return errors.Join(ErrCoWNotSupported, err)
 	}
@@ -107,10 +99,9 @@ func clonePlatformFile(src, dst string) error {
 	}
 
 	if tail := size - aligned; tail > 0 {
-		if _, seekErr := srcFile.Seek(aligned, io.SeekStart); seekErr != nil {
-			return seekErr
-		}
-		if _, copyErr := io.CopyN(dstFile, srcFile, tail); copyErr != nil {
+		// The clone covers whole clusters only; the trailing bytes have to be
+		// copied explicitly, at their own offset in the destination.
+		if copyErr := copyTailAt(dstFile, srcFile, aligned, aligned, tail); copyErr != nil {
 			return copyErr
 		}
 	}
@@ -124,50 +115,4 @@ func isBlockCloneUnsupported(err error) bool {
 	return errors.Is(err, windows.ERROR_INVALID_FUNCTION) ||
 		errors.Is(err, windows.ERROR_NOT_SUPPORTED) ||
 		errors.Is(err, windows.ERROR_INVALID_PARAMETER)
-}
-
-// windowsClusterSize returns the cluster size of the volume containing dst.
-func windowsClusterSize(path string) (uint64, error) {
-	abs, absErr := filepath.Abs(path)
-	if absErr != nil {
-		abs = path
-	}
-	root := filepath.VolumeName(abs) + `\`
-
-	windowsClusterMu.Lock()
-	cached, ok := windowsClusterCache[root]
-	windowsClusterMu.Unlock()
-	if ok {
-		return cached, nil
-	}
-
-	p, err := windows.UTF16PtrFromString(root)
-	if err != nil {
-		return 0, err
-	}
-
-	var sectorsPerCluster, bytesPerSector, freeClusters, totalClusters uint32
-	r1, _, callErr := procGetDiskFreeSpaceW.Call(
-		uintptr(unsafe.Pointer(p)),
-		uintptr(unsafe.Pointer(&sectorsPerCluster)),
-		uintptr(unsafe.Pointer(&bytesPerSector)),
-		uintptr(unsafe.Pointer(&freeClusters)),
-		uintptr(unsafe.Pointer(&totalClusters)),
-	)
-	if r1 == 0 {
-		if callErr != nil {
-			return 0, callErr
-		}
-		return 0, errors.New("GetDiskFreeSpaceW failed")
-	}
-
-	size := uint64(sectorsPerCluster) * uint64(bytesPerSector)
-	if size == 0 {
-		return 0, errors.New("unknown cluster size")
-	}
-
-	windowsClusterMu.Lock()
-	windowsClusterCache[root] = size
-	windowsClusterMu.Unlock()
-	return size, nil
 }

@@ -105,13 +105,20 @@ func extentsFcntl(path string) ([]Extent, error) {
 	var extents []Extent
 	offset := int64(0)
 
+	// The request/response record lives on the heap on purpose: fcntl takes its
+	// argument as a plain int, so the address handed to the kernel has no
+	// pointer semantics and a stack-allocated record could be moved by stack
+	// growth between the conversion and the call. Heap objects are not moved by
+	// the garbage collector, and KeepAlive keeps this one reachable across the
+	// call. One record is reused for every step of the walk.
+	rec := new([l2pSize]byte)
+
 	for offset < size {
-		var rec [l2pSize]byte
 		binary.LittleEndian.PutUint64(rec[l2pContigOff:l2pDevOff], uint64(size-offset))
 		binary.LittleEndian.PutUint64(rec[l2pDevOff:l2pSize], uint64(offset))
 
 		_, err := unix.FcntlInt(f.Fd(), unix.F_LOG2PHYS_EXT, int(uintptr(unsafe.Pointer(&rec[0]))))
-		runtime.KeepAlive(&rec)
+		runtime.KeepAlive(rec)
 
 		if err != nil {
 			var errno syscall.Errno

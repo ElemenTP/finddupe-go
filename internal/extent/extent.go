@@ -20,18 +20,50 @@ var ErrUnsupported = errors.New("extent query not supported on this filesystem")
 // decmpfs-compressed files; see Extent.Physical). A non-empty file for which the
 // platform reports no extents is treated as unsupported rather than as "shares
 // nothing", so callers can distinguish "0% shared" from "cannot tell".
+//
+// Extent lengths are clamped to the file's size: filesystems report whole
+// allocated blocks, so a 100000-byte file can come back as one 102400-byte
+// extent. Left alone, that makes a fully shared file report more shared bytes
+// than it has (and a ratio above 100%).
 func Query(path string) ([]Extent, error) {
 	extents, err := query(path)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(extents) == 0 {
-		if info, statErr := os.Stat(path); statErr == nil && info.Size() > 0 {
-			return nil, ErrUnsupported
-		}
+	info, statErr := os.Stat(path)
+	if statErr == nil {
+		extents = clampToSize(extents, info.Size())
+	}
+
+	if len(extents) == 0 && statErr == nil && info.Size() > 0 {
+		return nil, ErrUnsupported
 	}
 	return extents, nil
+}
+
+// clampToSize drops extents that start at or beyond the end of the file and
+// truncates the one that crosses it.
+func clampToSize(extents []Extent, size int64) []Extent {
+	if size < 0 {
+		return extents
+	}
+	limit := uint64(size)
+
+	out := extents[:0]
+	for _, e := range extents {
+		if e.Logical >= limit {
+			continue
+		}
+		if e.Length > limit-e.Logical {
+			e.Length = limit - e.Logical
+		}
+		if e.Length == 0 {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // Extent is one run of a file's data.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"finddupe/internal/config"
@@ -25,7 +26,6 @@ func TestRun_CancelledContext(t *testing.T) {
 	cancel()
 
 	cfg := &config.Config{
-		Mode:         config.ModeFind,
 		Action:       config.ActionReport,
 		Paths:        []string{dir},
 		ShowProgress: false,
@@ -43,13 +43,33 @@ func TestRun_EmptyPatterns(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.Config{
-		Mode:         config.ModeFind,
 		Action:       config.ActionReport,
 		ShowProgress: false,
 	}
 
 	if err := pipeline.Run(context.Background(), cfg); err != nil {
 		t.Fatalf("Run() = %v, want nil", err)
+	}
+}
+
+// TestRun_NoMatchFails verifies that a pattern which matches nothing fails the
+// run instead of reporting a successful scan of zero files.
+func TestRun_NoMatchFails(t *testing.T) {
+	t.Parallel()
+
+	empty := t.TempDir()
+	cfg := &config.Config{
+		Action:       config.ActionReport,
+		Paths:        []string{empty},
+		ShowProgress: false,
+	}
+
+	err := pipeline.Run(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("Run() = nil, want a no-match error")
+	}
+	if !strings.Contains(err.Error(), "no files matched") || !strings.Contains(err.Error(), empty) {
+		t.Fatalf("Run() = %v, want it to name the unmatched pattern %s", err, empty)
 	}
 }
 
@@ -67,7 +87,6 @@ func TestRun_ListLink(t *testing.T) {
 	}
 
 	cfg := &config.Config{
-		Mode:         config.ModeFind,
 		Paths:        []string{dir},
 		ListLink:     true,
 		ShowProgress: false,

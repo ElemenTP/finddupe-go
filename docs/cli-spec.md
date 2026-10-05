@@ -32,7 +32,7 @@ Scans the specified paths/patterns for duplicate files and reports them. No file
 | `--verbose` | `-v` | bool | false | Verbose output: show hardlink skip details, file index information |
 | `--zero` | `-z` | bool | false | Include zero-length files (skipped by default) |
 | `--no-progress` | `-p` | bool | false | Hide the progress indicator |
-| `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points |
+| `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points (resolved to their target) |
 | `--threads` | `-t` | int | `0` (→ `runtime.NumCPU() × 2`) | Number of scanner workers |
 | `--ref` | — | string (repeatable) | — | Consume the following path/pattern as a reference (compare against, but never act on). Can be repeated. |
 
@@ -47,14 +47,30 @@ There is no `--sigs`/`-s` flag: signature printing was removed as dead code and 
 ### Arguments
 
 One or more path/pattern arguments. Each can be:
-- A directory path → scan recursively (equivalent to `dir/**`)
-- A glob pattern → scan matching files
+- An existing file or directory path → scanned as written (a directory
+  recursively, equivalent to `dir/**`). This wins over glob interpretation, so a
+  path whose name contains glob characters (`/data/[2020] photos`) works.
+- A glob pattern (when nothing exists at the literal path) → matching files are
+  scanned. `**` matches zero or more directory components.
 
 ### `--ref` Behavior
 
 `--ref <path/pattern>` marks the following argument as a reference path. Reference paths are:
 - Walked **first**, and their whole checksum phase is drained before any normal file is submitted, so reference files are inserted first and become the **keeper** of their content group.
 - Never eliminated: the executor returns `ResultSkippedRef` when a duplicate victim is a reference file (unless the action is `find`'s report-only mode). They are counted in `SkippedRefFiles`.
+
+`--ref` is also the only way to control **which** of several identical files
+survives. Without it the keeper is whichever member's hash completes first, which
+depends on how the parallel workers were scheduled and is therefore not
+reproducible from one run to the next. Reports list the members of a group in a
+canonical order (references first, then by path), but that ordering does not
+change which file is kept.
+
+This differs from the original Windows finddupe, where `-ref` was a terminator
+("everything after this argument is a reference") and references were walked
+last, so a normal file matching a reference was never eliminated and the file
+*outside* the reference set survived. In the Go version the reference path holds
+the surviving file.
 
 ### Output (Normal Mode)
 
@@ -155,7 +171,7 @@ Exactly one action flag must be specified for `dedupe` mode:
 | `--verbose` | `-v` | bool | false | Verbose output |
 | `--zero` | `-z` | bool | false | Include zero-length files |
 | `--no-progress` | `-p` | bool | false | Hide the progress indicator |
-| `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points |
+| `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points (resolved to their target) |
 | `--threads` | `-t` | int | `0` (→ `runtime.NumCPU() × 2`) | Number of scanner workers |
 | `--rdonly` | `-r` | bool | false | Also operate on read-only files (Windows) |
 | `--ref` | — | string (repeatable) | — | Consume the following path/pattern as a reference (compare against, but never act on) |
@@ -174,7 +190,29 @@ Dupes:     100 MB in   234 files
   1 files replaced with CoW clones
 ```
 
-Read-only victims that are skipped print `Skipping duplicate readonly file '<path>'.` and increment `SkippedROFiles`. Reference victims increment `SkippedRefFiles` and print nothing. Pairs that are already the same physical file (a hardlink) are never touched: `--delete` and `--hardlink` return `ResultAlreadyHardlinked`, and `--cow` returns `ResultAlreadyHardlinked` for the same physical file or `ResultAlreadyShared` when the two extent layouts are provably identical; in verbose mode these are logged (`already hardlinked` / `already shared`) and nothing is printed otherwise.
+Results and the summary are printed on **stdout**; warnings, errors and the
+progress line go to **stderr**. Paths are enclosed in single quotes, and control
+characters in a path are escaped, so a crafted file name cannot forge extra
+result lines.
+
+Read-only victims that are skipped print `Skipping duplicate readonly file '<path>'.` and increment `SkippedROFiles`. Reference victims increment `SkippedRefFiles` and print nothing. Pairs that are already the same physical file (a hardlink) are never touched: `--delete` and `--hardlink` return `ResultAlreadyHardlinked`, and `--cow` returns `ResultAlreadyHardlinked` for the same physical file or `ResultAlreadyShared` when the two extent layouts are provably identical on the same device; in verbose mode these are logged (`already hardlinked` / `already shared`) and nothing is printed otherwise.
+
+Two safety skips protect a live filesystem:
+
+- A pair whose keeper or victim no longer matches the size and modification time recorded when its content was hashed prints `Skipping '<victim>' (original '<keeper>'): one of them changed during the scan.` and increments `SkippedChangedFiles` (summarized as `N files skipped (changed during the scan)`). The same check runs inside the readers: a file that changed size (or, when resuming a partial digest, was modified) fails with `dupe.ErrFileChanged` and is counted as unreadable instead of being hashed.
+- `dedupe --hardlink` refuses a pair on two different devices (a hardlink cannot span volumes) and logs `hardlink not possible across devices`, leaving both files untouched (`ResultSkippedCrossDevice`).
+
+An action that fails logs `action failed` with both paths and the underlying error, for example the `ErrCoWNotSupported` message when `--cow` meets a filesystem without reflink support.
+
+A pattern that matches no files at all fails the run: the walker reports
+`no files matched "<pattern>"` and the process exits non-zero, after printing the
+summary for whatever did match. An empty directory, a glob with no hits and a
+misspelled path all behave this way, so a typo cannot pass for a successful
+cleanup.
+
+The progress line is only drawn when stderr is a terminal; redirected output gets
+no escape sequences and no "Scanned N files..." chatter, and the line is cleared
+before the summary is printed.
 
 ## `finddupe version`
 
@@ -216,7 +254,7 @@ CPUs: 16
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| Non-zero (1) | Error (invalid arguments, I/O failure) or interruption via SIGINT/SIGTERM |
+| Non-zero (1) | Error (invalid arguments, I/O failure, a pattern that matched no files) or interruption via SIGINT/SIGTERM |
 
 On SIGINT/SIGTERM the context is cancelled, `pipeline.Run` returns the context error, and `cmd.Execute` exits non-zero.
 
@@ -231,7 +269,7 @@ On SIGINT/SIGTERM the context is cancelled, `pipeline.Run` returns the context e
 | `-v` | `-v, --verbose` | `-v, --verbose` | |
 | `-sigs` | N/A | N/A | Removed; future work |
 | `-rdonly` | N/A | `-r, --rdonly` | |
-| `-ref` | `--ref` | `--ref` | Changed from a flag to a repeatable value flag |
+| `-ref` | `--ref` | `--ref` | Changed from a terminator to a repeatable value flag, and the surviving file is now the reference (see [`--ref` Behavior](#ref-behavior)) |
 | `-z` | `-z, --zero` | `-z, --zero` | |
 | `-u` | N/A | N/A | C: suppress warnings. Go: use `-v` |
 | `-p` | `-p, --no-progress` | `-p, --no-progress` | |

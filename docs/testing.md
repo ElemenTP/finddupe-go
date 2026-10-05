@@ -12,14 +12,14 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 ## Test Requirements (from .golangci.yml)
 
 - **`paralleltest`**: All test functions must call `t.Parallel()`
-- **`testpackage`**: Tests use a separate `_test` package
+- **`testpackage`**: Tests use a separate `_test` package. An in-package test file is allowed with an explanatory `//nolint:testpackage` comment when the behavior under test is unexported (`internal/pipeline/coordinator_test.go`, `internal/action/action_internal_test.go`).
 - **`tparallel`**: Detects inappropriate `t.Parallel()` usage
 
 `exhaustruct` is present in the config file but **disabled** (commented out in the enabled-linters list), so tests do not have to initialize every struct field.
 
 ## Unit Tests by Package
 
-### `internal/checksum` (9 tests)
+### `internal/checksum` (11 tests)
 
 | Test | Description |
 |------|-------------|
@@ -32,6 +32,8 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestComputeFromReader` | Reader-based computation |
 | `TestCompute_NonExistentFile` | Non-existent path → error |
 | `TestCompute_CRCAndSumComponents` | Signature packs crc and sum correctly |
+| `TestComputeFileInfo_SizeChanged` | File no longer the scanned size → `dupe.ErrFileChanged` instead of a misleading signature |
+| `TestComputeFileInfo_ModTime` | `Info.ModTime` reports the file's modification time |
 
 ### `internal/dupe` (Detector, 14 tests)
 
@@ -52,7 +54,7 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDetector_Empty` | Zero state: `Len()==0`, no inode groups, non-nil stats |
 | `TestDetector_SamePathInsertedTwice` | Inserting one path twice is ignored (overlapping patterns cannot self-eliminate) |
 
-### `internal/action` (14 tests)
+### `internal/action` (25 tests)
 
 | Test | Description |
 |------|-------------|
@@ -70,8 +72,19 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDoExecution_SamePhysicalFile_NoAction` | Delete/hardlink/CoW all return `ResultAlreadyHardlinked` for a hardlinked pair and leave the victim intact |
 | `TestDoExecution_CoWClone_SkipsAlreadyShared` | A second clone of an already-shared pair is a no-op (`ResultAlreadyShared`) |
 | `TestDoExecution_CoWDetect_GroupRatios` | `FileShared` for `[original, clone, independent copy]` is `[size, size, 0]` |
+| `TestDoExecution_DupeElim_Hardlink_LinkFailureKeepsVictim` | Regression: a failed link leaves the victim (and its content) untouched and no temp file behind |
+| `TestDoExecution_DupeElim_Hardlink_PreservesKeeperMetadata` | Hardlinking does not rewrite the keeper's mode/mtime |
+| `TestDoExecution_DupeElim_CrossDeviceSkipsHardlink` | Different `Dev` → `ResultSkippedCrossDevice`, both files preserved |
+| `TestDoExecution_DupeElim_ChangedFileSkipped` | A file changed after hashing → `ResultSkippedChanged` for delete/hardlink/CoW |
+| `TestDoExecution_DupeElim_UnchangedFileIsActedOn` | A matching size/mtime does not block the action |
+| `TestDoExecution_CoWClone_CrossDeviceNotShared` | Identical extent layouts on different devices are not treated as shared |
+| `TestCopyTailAt_DestinationOffset` | Regression: the unaligned clone tail lands at its own offset, not at 0 |
+| `TestSameDevice` | Unknown (zero) `Dev` is accepted; differing devices are not |
+| `TestHardlinkLimitReached` | The fresh limit check never refuses a normal or missing file |
+| `TestDoExecution_CoWClone_PreservesVictimMetadata` | A clone keeps the victim's mode, mtime and (where supported) extended attributes instead of the keeper's |
+| `TestDoExecution_SamePhysicalFile_UnknownIdentity` | Without a file index from the scan, two names for one file are still recognized (via `os.SameFile`) and left alone |
 
-### `internal/fswalker` (11 tests)
+### `internal/fswalker` (27 tests)
 
 | Test | Description |
 |------|-------------|
@@ -86,6 +99,21 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestWalk_ContextCancellation` | Cancelled context stops walk |
 | `TestWalk_FileInfoFields` | FileInfo populated correctly |
 | `TestWalk_MultiplePatterns` | Multiple patterns combined |
+| `TestWalk_SymlinkToFile_SkippedWithoutFollow` | Links are not reported unless `-j` |
+| `TestWalk_SymlinkToFile_FollowedUsesTargetMetadata` | Regression: a followed link reports the target's size, not the link length |
+| `TestWalk_SymlinkToDir_Followed` | `-j` walks a directory link exactly once, even when the target is in the tree |
+| `TestWalk_SymlinkDir_SkippedWithoutFollow` | A directory link is not descended into by default |
+| `TestWalk_SymlinkLoop_Terminates` | A link to an ancestor terminates |
+| `TestWalk_BrokenSymlink_FollowedIsIgnored` | Dangling links are skipped without errors |
+| `TestWalk_ExplicitSymlinkArgument` | A link named directly resolves to its target |
+| `TestWalk_FileInfoCarriesModTime` | `FileInfo.ModTime` is populated by the walker |
+| `TestWalk_Fifo_NotOpened` / `TestWalk_ExplicitFifoArgument` | Regression: a FIFO is never opened (it used to block the scan with `--zero`) |
+| `TestWalk_NoMatchError` | Missing path, empty directory and a glob with no hits each report exactly one no-match error |
+| `TestWalk_MatchingPatternIsNotReported` | A pattern that matched a (skipped) zero-length file is not reported as a miss |
+| `TestWalk_LiteralPathWithGlobCharacters` | A directory named `[2020] photos` is scanned as written instead of split on its brackets |
+| `TestWalk_GlobInsideGlobNamedDir` | `[2020] photos/*.txt` is split at the existing directory, not at the first bracket |
+| `TestWalk_GlobClassStillMatches` | `[ab].txt` is still treated as a character class |
+| `TestSendResult` | The walker abandons a result send once the walk is cancelled, so it cannot park forever |
 
 ### `internal/worker` (5 tests)
 
@@ -97,12 +125,14 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestPool_WaitBlocks` | `Wait()` blocks until completion |
 | `TestPool_ZeroSize` | Size 0 → defaults to `runtime.NumCPU()` |
 
-### `internal/extent` (8 tests)
+### `internal/extent` (10 tests)
 
 | Test | Description |
 |------|-------------|
 | `TestSharedBytes` | Table test: partial/identical/disjoint/multiple overlaps, encoded extents ignored, shared-logical fallback |
 | `TestQuery_HardlinksShareExtents` | Two hardlinked 64KB files share every byte; skips if `ErrUnsupported` |
+| `TestQuery_LengthsClampedToFileSize` | Regression: extent lengths never run past EOF, so a sharing ratio cannot exceed 100% |
+| `TestAppendBatch` (linux only) | FIEMAP batch bookkeeping: which offset the next request starts from, so a non-advancing response cannot loop forever |
 | `TestQuery_IndependentCopiesShareNothing` | Two independent copies share nothing; skips if `ErrUnsupported` |
 | `TestEqual` | Equal layouts compare true; length/order/physical differences, empty lists, encoded extents, and zero physical addresses compare false |
 | `TestSharedFlagBytes` | Only extents flagged `Shared` contribute their lengths |
@@ -118,7 +148,8 @@ The CoW and extent tests need a filesystem that supports reflinks / extent
 queries. `t.TempDir()` uses `$TMPDIR`, which on many Linux systems is `tmpfs` and
 therefore reports neither extents nor clones. So `TestQuery_*`,
 `TestDoExecution_CoWClone`, `TestDoExecution_CoWClone_SkipsAlreadyShared`,
-`TestDoExecution_CoWDetect_GroupRatios`, `TestDedupeCoW_CreateAndDetect` and
+`TestDoExecution_CoWDetect_GroupRatios`,
+`TestDoExecution_CoWClone_PreservesVictimMetadata`, `TestDedupeCoW_CreateAndDetect` and
 `TestFind_CoW_IndependentCopiesZeroShared` probe the default temp dir first and
 then fall back to a temporary directory inside the package working directory
 (normally the repository, which is often on the developer's real btrfs/XFS/APFS
@@ -131,19 +162,36 @@ To force a specific filesystem explicitly:
 TMPDIR=/path/on/btrfs go test ./... -count=1
 ```
 
-### `internal/pipeline` (3 tests)
+### `internal/volinfo` (0 tests)
+
+`ClusterSize` is the Windows-only volume probe shared by the CoW clone and the
+extent query; it is covered by the Windows cross-build and exercised on real
+hardware by the CoW probe scripts.
+
+### `internal/progress` (1 test)
+
+| Test | Description |
+|------|-------------|
+| `TestIsTerminal` | A regular file is not a terminal, so redirected output never gets escape sequences |
+
+### `internal/pipeline` (5 tests)
 
 | Test | Description |
 |------|-------------|
 | `TestRun_CancelledContext` | A pre-cancelled context returns `context.Canceled` without deadlocking |
 | `TestRun_EmptyPatterns` | No patterns completes cleanly |
+| `TestRun_NoMatchFails` | A pattern that matched nothing fails the run and names the pattern |
 | `TestRun_ListLink` | `--listlink` mode runs end to end |
+| `TestCoordinateSaturatedChannels` | Regression: the coordinator does not deadlock when the execution and outcome channels are saturated |
 
 ## System Tests (`test/system_test.go`)
 
 System tests build the `finddupe` binary once in `TestMain` and run it against real temp directories. The package is split: `test/doc.go` declares `package test` while the tests use `package test_test`.
 
-There are **52 test functions** plus the `TestMain` harness — `grep -c '^func Test' test/system_test.go` reports **53** because it also matches `TestMain`.
+There are **53 test functions** in `test/system_test.go` plus the `TestMain`
+harness — `grep -c '^func Test' test/system_test.go` reports **54** because it
+also matches `TestMain` — and one more in `test/output_unix_test.go` (Unix only,
+because the crafted file name needs a control character that Windows forbids).
 
 ### Find Mode (18 tests)
 
@@ -169,9 +217,9 @@ Hardlink creation, content preservation, same-inode verification, read-only hand
 
 `TestFind_ListLink` — lists the group, prints both paths, does not run duplicate detection, and reports the group count.
 
-### Edge Cases / Error Handling (8 tests)
+### Edge Cases / Error Handling (11 tests)
 
-No paths error, nonexistent path, no subcommand error, zero threads, many threads, version output, help output, subcommand help.
+No paths error, nonexistent path (fails with a no-match error), no subcommand error, zero threads, many threads, version output, help output, subcommand help, `TestOutputStreams` (results and summary on stdout, diagnostics on stderr, no escape sequences on a non-terminal stderr), and `TestOutput_EscapesControlCharactersInPaths` (a file name containing a newline cannot forge a result line).
 
 ### Nested Directories and Complex Trees (2 tests)
 

@@ -93,8 +93,11 @@ func query(path string) ([]Extent, error) {
 		}
 
 		extents := unsafe.Slice((*fiemapExtent)(unsafe.Pointer(&buf[fiemapHeaderSize])), n)
-		last, next, progressed := appendBatch(&out, extents)
-		if !progressed {
+		last, next := appendBatch(&out, extents)
+
+		// The kernel must move past the offset that was asked for; a batch that
+		// does not would otherwise be requested again forever.
+		if next <= start {
 			break
 		}
 		if last {
@@ -107,13 +110,12 @@ func query(path string) ([]Extent, error) {
 }
 
 // appendBatch appends the parsed extents of one FIEMAP response and reports
-// whether the last extent was seen, the offset to continue from, and whether
-// progress was made (guards against a non-advancing kernel response).
-func appendBatch(out *[]Extent, extents []fiemapExtent) (bool, uint64, bool) {
+// whether the last extent was seen and the offset to continue from (the end of
+// the furthest extent in the batch).
+func appendBatch(out *[]Extent, extents []fiemapExtent) (bool, uint64) {
 	var (
-		last       bool
-		nextStart  uint64
-		progressed bool
+		last      bool
+		nextStart uint64
 	)
 
 	for i := range extents {
@@ -133,10 +135,9 @@ func appendBatch(out *[]Extent, extents []fiemapExtent) (bool, uint64, bool) {
 		}
 		if end := e.Logical + e.Length; end > nextStart {
 			nextStart = end
-			progressed = true
 		}
 	}
-	return last, nextStart, progressed
+	return last, nextStart
 }
 
 // isUnsupportedErrno reports whether the ioctl failed because the filesystem

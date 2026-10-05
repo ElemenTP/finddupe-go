@@ -2,16 +2,6 @@
 // It holds all CLI-driven settings in a single struct passed to the pipeline.
 package config
 
-// Mode specifies the operation mode.
-type Mode int
-
-const (
-	// ModeFind scans and reports duplicates without taking action.
-	ModeFind Mode = iota
-	// ModeDedupe scans and eliminates duplicates.
-	ModeDedupe
-)
-
 // Action specifies what to do with confirmed duplicate files.
 type Action int
 
@@ -27,10 +17,10 @@ const (
 )
 
 // Config holds all runtime configuration parsed from CLI flags.
+//
+// What the run does is expressed by Action plus the mode flags (ListLink,
+// CoWDetect); there is no separate mode enum to keep in sync with them.
 type Config struct {
-	// Mode is the operation mode (find or dedupe).
-	Mode Mode
-
 	// Action specifies what to do with duplicates (dedupe mode only).
 	Action Action
 

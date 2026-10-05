@@ -72,7 +72,7 @@ The NTFS file index serves the same role as the Unix inode, and the volume seria
 
 ### Device Matters
 
-`Dev` is part of the identity because inode numbers are only unique per device. Both hardlink detection (`--hardlink`, `--listlink`) and CoW extent comparison compare `(Dev, Inode)` / `Dev`, so files on different volumes are never confused.
+`Dev` is part of the identity because inode numbers are only unique per device. Hardlink detection (`--hardlink`, `--listlink`) and CoW extent comparison both compare `(Dev, Inode)` / `Dev`, so files on different volumes are never confused: `--hardlink` refuses a pair whose `Dev` differs (`ResultSkippedCrossDevice`) instead of removing a victim it cannot link, and `alreadyShared` refuses to call two layouts identical across devices because physical offsets only mean something within one volume.
 
 ### Fallback
 
@@ -97,13 +97,36 @@ func createPlatformHardlink(linkPath, targetPath string) error {
 }
 ```
 Go's `os.Link` wraps `CreateHardLinkW`. Additional considerations:
-- **NTFS hardlink limit**: 1023 links per file. Checked against `NumLinks` before linking (`ResultHardlinkLimit`).
+- **NTFS hardlink limit**: 1023 links per file. The count is re-read from the keeper
+  immediately before linking (`hardlinkLimitReached`), because `NumLinks` in the
+  file listing is from the scan and every link created since then has raised the
+  real one (`ResultHardlinkLimit`). Unix filesystems enforce their own limit
+  (ext4: 65000; XFS/btrfs: effectively none), so no count is guessed there — a
+  refused link is harmless now that it is created under a temporary name.
 - **Administrator privileges**: May be required (caller's responsibility).
-- **Cross-drive**: Impossible. Hardlinks must be on the same volume.
+- **Cross-drive**: Impossible. Hardlinks must be on the same volume, so a pair
+  whose `Dev` differs is skipped before anything is created or removed
+  (`ResultSkippedCrossDevice`). Even when the check cannot run (unknown device),
+  the link is created next to the victim and renamed over it, so a failed link
+  leaves the victim in place.
 
 ## 3. CoW (Copy-on-Write) Clone
 
-CoW elimination is implemented for each platform. `cloneReplace` in `internal/action/cow.go` clones the keeper into a temporary file next to the victim, preserves the victim's mode/mtime, and atomically replaces it. Unsupported filesystems return `ErrCoWNotSupported` and the victim is left untouched.
+CoW elimination is implemented for each platform. `cloneReplace` in `internal/action/cow.go` clones the keeper into a temporary file next to the victim, restores the victim's metadata on it, and atomically replaces it. Unsupported filesystems return `ErrCoWNotSupported` and the victim is left untouched.
+
+A clone has its own inode, so `preserveMetadata` can restore the victim's
+identity rather than inheriting the keeper's:
+
+| Platform | Restored |
+|---|---|
+| Linux / other Unix | ownership (only when it differs, so setuid/setgid are not cleared needlessly), permissions including setuid/setgid/sticky, extended attributes (which carry POSIX ACLs), access and modification times |
+| macOS | the above, plus BSD file flags (`chflags`); `clonefile(2)` copies the *source's* attributes, so attributes the victim does not have are removed |
+| Windows | file attributes, the security descriptor (owner, primary group, DACL) and creation/access/write times |
+
+Metadata that needs privileges the caller does not have is skipped rather than
+failing the replacement; the content is already in place. Hard links and deletion
+are different by nature: the victim path becomes the keeper's inode (hardlink) or
+loses the file entirely, so the keeper's metadata is what remains.
 
 ### Linux — `FICLONE`
 
@@ -116,10 +139,14 @@ CoW elimination is implemented for each platform. `cloneReplace` in `internal/ac
 ### Windows — `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
 
 `clone_windows.go` implements block cloning on **ReFS** (including Dev Drive):
-1. Determine the volume cluster size with `GetDiskFreeSpaceW` (cached per volume root).
+1. Determine the volume cluster size with `GetDiskFreeSpaceW`, through the
+   `internal/volinfo` helper that the extent query shares (cached per volume
+   root).
 2. Create the destination and preallocate it with `SetFileInformationByHandle(FileAllocationInfo)`.
 3. Duplicate whole clusters with `DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)`.
-4. Copy the unaligned tail with a normal read/write.
+4. Copy the unaligned tail with a normal read/write at its own offset in the
+   destination (the clone covers whole clusters only; writing the tail at
+   offset 0 would corrupt the result).
 
 NTFS returns `ERROR_INVALID_FUNCTION`; unsupported errors are joined with `ErrCoWNotSupported`.
 
@@ -132,7 +159,9 @@ NTFS returns `ERROR_INVALID_FUNCTION`; unsupported errors are joined with `ErrCo
 
 `find --cow` uses `internal/extent` to measure how much of each member of an
 identical-content group is already shared. `Query(path) ([]Extent, error)` is
-implemented per platform; `Supported()` reports whether the platform has an
+implemented per platform; extent lengths are clamped to the file's size (whole
+allocated blocks make the last extent of a non-block-aligned file run past EOF,
+which would report more shared bytes than the file has); `Supported()` reports whether the platform has an
 implementation, and `ErrUnsupported` is returned when the filesystem cannot
 report extents.
 
@@ -216,7 +245,7 @@ site can switch to it.
 
 ### Windows — `FSCTL_GET_RETRIEVAL_POINTERS`
 
-`query_windows.go` calls `DeviceIoControl(FSCTL_GET_RETRIEVAL_POINTERS)` with a `STARTING_VCN_INPUT_BUFFER`, growing the buffer on `ERROR_MORE_DATA`. The returned VCN→LCN pairs are converted to byte offsets using the volume cluster size from `GetDiskFreeSpaceW` (cached), and `Logical` is the VCN-derived byte offset. ReFS block clones make two files reference the same LCNs, so overlapping mappings reveal shared extents.
+`query_windows.go` calls `DeviceIoControl(FSCTL_GET_RETRIEVAL_POINTERS)` with a `STARTING_VCN_INPUT_BUFFER`, growing the buffer on `ERROR_MORE_DATA`. The returned VCN→LCN pairs are converted to byte offsets using the volume cluster size from `internal/volinfo` (cached per volume root), and `Logical` is the VCN-derived byte offset. ReFS block clones make two files reference the same LCNs, so overlapping mappings reveal shared extents.
 
 Verified on a ReFS 3.14 Dev Drive (Windows 11, 4 KiB cluster): independent copies
 map to different LCNs and report 0%; after `dedupe --cow` both files map to the
@@ -347,13 +376,35 @@ Read-only is determined by `FILE_ATTRIBUTE_READONLY`; Go normalizes this to the 
 
 ## 6. Symlinks and Reparse Points
 
-### Unix
+Links are detected via `d.Type()&os.ModeSymlink` and skipped unless `-j` is
+given. (A pattern that names a link directly is always resolved: the user asked
+for that path.) Following a link never uses the link's own metadata: `DirEntry.Info` is
+an `lstat`, so its `Size` is the length of the target path. With `-j` the link is
+resolved (`EvalSymlinks`) and classified by its target:
 
-Symbolic links are detected via `d.Type()&os.ModeSymlink`. The `-j` flag controls whether the walker follows them (with a `seen` set to prevent loops).
+- a link to a regular file is reported under the link's path with the target's
+  size and physical identity, so it dedupes against the target instead of being
+  treated as a tiny file;
+- a link to a directory is walked through the `seen` set, which is keyed by the
+  resolved path and also records plain directories, so a target that is already
+  part of the tree is not walked twice and a loop (a link to an ancestor)
+  terminates.
+
+Broken links are ignored silently rather than reported as read failures.
 
 ### Windows
 
-Reparse points (junctions, symlinks, mount points) are not followed by default. The `-j` flag enables following.
+Reparse points (junctions, symlinks, mount points) are not followed by default;
+`-j` enables following. A junction reports `ModeDir|ModeSymlink`, so the walk
+returns `filepath.SkipDir` after walking its target to keep `WalkDir` from
+descending into it a second time.
+
+### Non-regular files
+
+Only regular files are reported, on every platform: devices, sockets and FIFOs
+have no content to compare. This also prevents a named pipe from blocking the
+scan — with `--zero` a FIFO has size 0, and `os.Open` on it would wait for a
+writer forever.
 
 ## 7. Filesystem Feature Matrix
 

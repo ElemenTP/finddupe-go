@@ -44,8 +44,3 @@ func isReadOnly(path string) bool {
 	// On Windows, check if the read-only attribute is set.
 	return info.Mode().Perm()&0200 == 0
 }
-
-// DeletePath removes a file at the given path (used by hardlink to delete before linking).
-func DeletePath(path string) error {
-	return os.Remove(path)
-}

@@ -5,11 +5,11 @@ package extent
 import (
 	"errors"
 	"os"
-	"path/filepath"
-	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"finddupe/internal/volinfo"
 )
 
 // Supported reports whether extent querying is implemented on this platform.
@@ -28,25 +28,12 @@ type startingVcnInput struct {
 	StartingVcn int64
 }
 
-var (
-	clusterMu    sync.Mutex
-	clusterCache = map[string]uint64{}
-
-	procGetDiskFreeSpaceW = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetDiskFreeSpaceW")
-)
-
 // query returns the physical extents of path using FSCTL_GET_RETRIEVAL_POINTERS,
 // which reports the VCN→LCN mapping on both NTFS and ReFS. ReFS block clones
 // make two files reference the same LCNs, so comparing the mappings reveals
 // extent sharing.
 func query(path string) ([]Extent, error) {
-	abs, absErr := filepath.Abs(path)
-	if absErr != nil {
-		abs = path
-	}
-	root := filepath.VolumeName(abs) + `\`
-
-	cluster, err := clusterSize(root)
+	cluster, err := volinfo.ClusterSize(path)
 	if err != nil {
 		return nil, ErrUnsupported
 	}
@@ -114,47 +101,6 @@ func query(path string) ([]Extent, error) {
 		}
 		return out, nil
 	}
-}
-
-// clusterSize returns the volume cluster size for the given volume root,
-// caching results per root.
-func clusterSize(root string) (uint64, error) {
-	clusterMu.Lock()
-	cached, ok := clusterCache[root]
-	clusterMu.Unlock()
-	if ok {
-		return cached, nil
-	}
-
-	p, err := windows.UTF16PtrFromString(root)
-	if err != nil {
-		return 0, err
-	}
-
-	var sectorsPerCluster, bytesPerSector, freeClusters, totalClusters uint32
-	r1, _, callErr := procGetDiskFreeSpaceW.Call(
-		uintptr(unsafe.Pointer(p)),
-		uintptr(unsafe.Pointer(&sectorsPerCluster)),
-		uintptr(unsafe.Pointer(&bytesPerSector)),
-		uintptr(unsafe.Pointer(&freeClusters)),
-		uintptr(unsafe.Pointer(&totalClusters)),
-	)
-	if r1 == 0 {
-		if callErr != nil {
-			return 0, callErr
-		}
-		return 0, errors.New("GetDiskFreeSpaceW failed")
-	}
-
-	size := uint64(sectorsPerCluster) * uint64(bytesPerSector)
-	if size == 0 {
-		return 0, errors.New("unknown cluster size")
-	}
-
-	clusterMu.Lock()
-	clusterCache[root] = size
-	clusterMu.Unlock()
-	return size, nil
 }
 
 // isUnsupportedWindowsErr reports whether the ioctl failed because the

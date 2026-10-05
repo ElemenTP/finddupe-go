@@ -58,7 +58,7 @@ func init() {
 	findCmd.Flags().IntVarP(&findFlags.threads, "threads", "t", 0,
 		"Number of scanner workers (default: number of CPUs)")
 	findCmd.Flags().StringArrayVar(&findFlags.refPaths, "ref", nil,
-		"Mark following path as reference (compare against but never act upon); repeatable")
+		"Protect this path: its files become the keeper of their content group and are never eliminated; repeatable")
 }
 
 // runFind builds the config and runs the pipeline in find mode.
@@ -78,7 +78,6 @@ func runFind(cmd *cobra.Command, args []string) error {
 	}
 
 	cfg := &config.Config{
-		Mode:           config.ModeFind,
 		Action:         config.ActionReport,
 		Paths:          args,
 		RefPaths:       findFlags.refPaths,

@@ -9,6 +9,7 @@ Produced by the filesystem walker and completed by the checksum workers, then st
 type FileInfo struct {
     Path       string   // Absolute path to the file
     Size       int64    // File size in bytes
+    ModTime    time.Time // Modification time when the content was read
     Signature  uint64   // 64-bit composite checksum (CRC32 << 32 | Sum32)
     SHA256     [32]byte // Full-content SHA-256; zero means "not yet computed"
     HashState  []byte   // Marshaled in-progress SHA-256 state (nil = not started)
@@ -23,6 +24,7 @@ type FileInfo struct {
 **Field rationale**:
 - `Path`: string for maximum compatibility with Go's `os` package
 - `Size`: int64 matches `os.FileInfo.Size()` return type
+- `ModTime`: the modification time observed while the file's content was read (or scanned). Re-checked together with `Size` immediately before a file is eliminated, so a file that changed after its hash was computed is never acted upon
 - `Signature`: uint64 — the C version uses two uint32 values (`Checksum_t`), packed into one uint64 for efficient map key usage
 - `SHA256`: `[32]byte` — the zero value doubles as the "hash not yet computed" sentinel, so no separate flag is needed
 - `HashState` / `HashOffset`: allow a partial SHA-256 to be resumed after an early-stopped comparison or an interrupted read instead of re-reading the file from the start
@@ -40,6 +42,7 @@ FileIndex.High + FileIndex.Low → Inode (packed uint64)
 VolumeSerialNumber           →   Dev
 NumLinks                      →  NumLinks
 FileSize                      →  Size
+(mtime re-check)              →  ModTime
 FileName (WCHAR*)             →  Path (string)
 (implicit via ref flag)       →  IsRef
 ```
@@ -97,7 +100,7 @@ type Execution struct {
 **File ordering contract**:
 - `HashCalc`: `Files[0]` is the file to hash fully; it may carry a partial `HashState`/`HashOffset` to resume from.
 - `HashComp`: `Files[0]` and `Files[1]` are the pair to compare.
-- `DupeElim`: `Files[0]` is the keeper (never modified) and `Files[1]` is the victim.
+- `DupeElim`: `Files[0]` is the keeper and `Files[1]` is the victim. The keeper is never written to; hardlinking a victim links it to the keeper's inode and therefore also gives it the keeper's permissions and timestamps.
 - `CoWDetect`: `Files` holds every member of one identical-content group (one path per `(Dev, Inode)`; hardlinked aliases collapse to a single representative), and the outcome's `FileShared` slice has one entry per member.
 
 ## `Stats` — Statistics Accumulator
@@ -120,6 +123,7 @@ type Stats struct {
     CoWSharedBytes  atomic.Int64 // Per-file sum of already-shared bytes (each range once per file)
     SkippedROFiles  atomic.Int64 // Read-only files skipped
     SkippedRefFiles atomic.Int64 // Reference files skipped
+    SkippedChangedFiles atomic.Int64 // Files whose pair changed after hashing
 }
 ```
 
@@ -135,12 +139,6 @@ func (s *Stats) AddZeroLen(delta int64) {
 Constructed by `cmd/find.go` or `cmd/dedupe.go` from CLI flags.
 
 ```go
-type Mode int
-const (
-    ModeFind   Mode = iota // find — scan and report only
-    ModeDedupe             // dedupe — scan and take action
-)
-
 type Action int
 const (
     ActionReport   Action = iota // No action (find mode default)
@@ -150,7 +148,6 @@ const (
 )
 
 type Config struct {
-    Mode            Mode
     Action          Action
     Paths           []string
     RefPaths        []string
@@ -234,6 +231,7 @@ type Outcome struct {
     Key        dupe.GroupKey      // Composite key the execution belonged to
     Files      []dupe.FileInfo    // Updated hash progress or participating files
     Result     Result             // Set for DupeElim outcomes
+    Err        error              // Failure behind ResultError, reported by the coordinator
     FileShared []int64            // CoWDetect: already-shared bytes per Files entry
 }
 
@@ -250,6 +248,8 @@ const (
     ResultNotDuplicate                    // Files differ (CRC collision)
     ResultError                           // Action failed
     ResultAlreadyShared                   // dedupe --cow: pair already shares all storage
+    ResultSkippedChanged                  // A file changed after its content was hashed
+    ResultSkippedCrossDevice              // Hardlink refused: the files are on different devices
 )
 ```
 

@@ -1,6 +1,17 @@
 // Package dupe provides core types and duplicate detection logic.
 package dupe
 
+import (
+	"errors"
+	"time"
+)
+
+// ErrFileChanged reports that a file no longer matches the size (or, when a
+// partial digest is being resumed, the modification time) recorded when it was
+// scanned. A stale hash must never be used to eliminate a file, so readers
+// return this instead of a digest computed from the wrong bytes.
+var ErrFileChanged = errors.New("file changed since it was scanned")
+
 // FileInfo holds all metadata needed for duplicate detection on a single file.
 type FileInfo struct {
 	// Path is the absolute path to the file.
@@ -8,6 +19,12 @@ type FileInfo struct {
 
 	// Size is the file size in bytes.
 	Size int64
+
+	// ModTime is the file's modification time when its content was read (or,
+	// for files that were never read, when they were scanned). Together with
+	// Size it is re-checked immediately before a file is eliminated, so a file
+	// that changed after its hash was computed is never acted upon.
+	ModTime time.Time
 
 	// Signature is the 64-bit composite checksum (CRC32 << 32 | Sum32).
 	Signature uint64

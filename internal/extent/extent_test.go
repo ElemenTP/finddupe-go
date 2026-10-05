@@ -185,6 +185,40 @@ func TestQuery_IndependentCopiesShareNothing(t *testing.T) {
 	}
 }
 
+// TestQuery_LengthsClampedToFileSize is the regression test for a reported
+// sharing ratio above 100%: filesystems allocate whole blocks, so the last
+// extent of a file whose size is not block-aligned extends past the end of the
+// file unless it is clamped.
+func TestQuery_LengthsClampedToFileSize(t *testing.T) {
+	t.Parallel()
+
+	// Deliberately not a multiple of any common block size.
+	data := randomData(t, 100*1024+1234)
+	dir := extentCapableDir(t, data)
+
+	path := filepath.Join(dir, "odd.bin")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	extents := queryOrSkip(t, path)
+
+	var total uint64
+	for _, e := range extents {
+		if end := e.Logical + e.Length; end > uint64(info.Size()) {
+			t.Errorf("extent %+v extends past the %d-byte file", e, info.Size())
+		}
+		total += e.Length
+	}
+	if total > uint64(info.Size()) {
+		t.Errorf("extents cover %d bytes of a %d-byte file", total, info.Size())
+	}
+}
+
 func TestEqual(t *testing.T) {
 	t.Parallel()
 

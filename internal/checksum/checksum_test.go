@@ -2,11 +2,13 @@ package checksum_test
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"finddupe/internal/checksum"
+	"finddupe/internal/dupe"
 )
 
 func TestCompute_EmptyFile(t *testing.T) {
@@ -83,19 +85,60 @@ func TestCompute_DifferentFiles(t *testing.T) {
 
 func TestCompute_FileSizeFoldedIn(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	// Same content but different sizes → different signatures.
-	a := filepath.Join(dir, "a.bin")
-	b := filepath.Join(dir, "b.bin")
-	os.WriteFile(a, []byte("abc"), 0644)
-	os.WriteFile(b, []byte("abc"), 0644)
+	// Same content, different reported sizes → different signatures. The
+	// reader-based path takes the size as given, which is where the folding
+	// itself is exercised; ComputeFileInfo requires the size to be accurate.
+	data := []byte("abc")
 
-	// Report different sizes.
-	sigA, _ := checksum.Compute(a, 3)
-	sigB, _ := checksum.Compute(b, 1000)
+	sigA, err := checksum.ComputeFromReader(bytes.NewReader(data), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigB, err := checksum.ComputeFromReader(bytes.NewReader(data), 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if sigA == sigB {
 		t.Errorf("expected different signatures when file sizes differ")
+	}
+}
+
+func TestComputeFileInfo_SizeChanged(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "small.bin")
+	if err := os.WriteFile(path, []byte("abc"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The file is 3 bytes but the scan saw 1000: hashing the first 3 bytes and
+	// calling it a 1000-byte file would let a later elimination act on content
+	// that was never compared.
+	_, err := checksum.ComputeFileInfo(path, 1000)
+	if !errors.Is(err, dupe.ErrFileChanged) {
+		t.Fatalf("ComputeFileInfo with a stale size: err = %v, want ErrFileChanged", err)
+	}
+}
+
+func TestComputeFileInfo_ModTime(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stamped.bin")
+	if err := os.WriteFile(path, []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := checksum.ComputeFileInfo(path, info.Size())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ModTime.Equal(info.ModTime()) {
+		t.Errorf("ModTime = %v, want %v", got.ModTime, info.ModTime())
 	}
 }
 

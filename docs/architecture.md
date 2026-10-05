@@ -95,7 +95,7 @@ This replaces the older design in which the detector and executor were each a si
 | Worker pool | N (`--threads`) | pool.Submit | fileInfoCh | Opens files, computes checksums and `(Dev, Inode, NumLinks)` |
 | Coordinator | 1 | fileInfoCh, outcomeCh | executionCh, stats | Sole owner/writer of the `Detector`; decides termination |
 | Executor | N (`--threads`) | executionCh | outcomeCh | Stateless; hashing, comparison, elimination, CoW detection |
-| Progress | 1 | stats (atomics) | stderr | Runs on a ticker, no channel |
+| Progress | 1 | stats (atomics) | stderr (terminal only) | Runs on a ticker, no channel; stopped before the summary |
 | Signal handler | 1 | OS signals | cancel() | `signal.NotifyContext` side channel |
 
 ## Channel Buffer Sizing
@@ -154,14 +154,14 @@ pipeline.Run(ctx, cfg)                                      │
   │           └── DupeElim → report / act:                  │
   │                 ├── report:  "Duplicate: / With:"       │
   │                 ├── delete:  os.Remove                  │
-  │                 ├── hardlink: os.Remove + os.Link       │
+  │                 ├── hardlink: os.Link + atomic rename   │
   │                 └── cow:      cloneReplace (FICLONE/…)  │
   │                                                         │
   │   CoWDetect → extent.Query + SharedFlagBytes/           │
   │              SharedWithOthers → "shared: N%" per member │
   │                                                         │
   ▼                                                         │
-Final summary (stats + results) printed to stderr           │
+Results + final summary printed to stdout                    │
 ```
 
 ## Component Diagram

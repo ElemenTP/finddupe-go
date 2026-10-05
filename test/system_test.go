@@ -143,22 +143,22 @@ func TestFind_BasicDuplicates(t *testing.T) {
 	makeFile(t, dir, "b.txt", "hello world")
 	makeFile(t, dir, "c.txt", "different")
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, stderr, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 
 	// Should report 3 files, 1 duplicate.
-	if !strings.Contains(stderr, "Files:") {
+	if !strings.Contains(stdout, "Files:") {
 		t.Error("expected 'Files:' in output")
 	}
-	if !strings.Contains(stderr, "Dupes:") {
+	if !strings.Contains(stdout, "Dupes:") {
 		t.Error("expected 'Dupes:' in output")
 	}
 
 	// Should show "Duplicate: / With:" lines.
-	hasDup := strings.Contains(stderr, "Duplicate:") && strings.Contains(stderr, "With:")
+	hasDup := strings.Contains(stdout, "Duplicate:") && strings.Contains(stdout, "With:")
 	if !hasDup {
 		t.Errorf("expected 'Duplicate:' and 'With:' lines, got:\n%s", stderr)
 	}
@@ -171,12 +171,12 @@ func TestFind_NoDuplicates(t *testing.T) {
 	makeFile(t, dir, "b.txt", "bbb")
 	makeFile(t, dir, "c.txt", "ccc")
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, _, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
-	if strings.Contains(stderr, "Duplicate:") {
+	if strings.Contains(stdout, "Duplicate:") {
 		t.Error("expected no duplicate lines for unique files")
 	}
 }
@@ -185,17 +185,19 @@ func TestFind_EmptyDirectory(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, stderr, code := run(t, "find", dir, "--no-progress")
 
-	// Empty dir should succeed but report 0 files (the directory itself
-	// contains no files, though filepath.WalkDir will process the root dir
-	// which is skipped as it's a directory).
-	if code != 0 {
-		t.Fatalf("expected exit 0, got %d", code)
+	// A pattern that matches nothing (here: an empty directory) fails the run
+	// instead of reporting a successful scan of zero files, so a typo cannot be
+	// mistaken for an empty tree.
+	if code == 0 {
+		t.Fatal("expected a non-zero exit for a pattern that matched nothing")
 	}
-	// Should not crash.
-	if !strings.Contains(stderr, "Files:") {
-		t.Error("expected summary output even for empty dir")
+	if !strings.Contains(stderr, "no files matched") {
+		t.Errorf("expected a no-match error, got:\n%s", stderr)
+	}
+	if !strings.Contains(stdout, "Files:") {
+		t.Errorf("expected the summary even when a pattern is empty, got:\n%s", stdout)
 	}
 }
 
@@ -205,13 +207,13 @@ func TestFind_ZeroLengthFiles_Skipped(t *testing.T) {
 	makeFile(t, dir, "empty.txt", "")
 	makeFile(t, dir, "full.txt", "content")
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, _, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 	// Zero-length file should be skipped.
-	if !strings.Contains(stderr, "files of zero length were skipped") {
+	if !strings.Contains(stdout, "files of zero length were skipped") {
 		t.Error("expected zero-length skip message")
 	}
 }
@@ -223,7 +225,7 @@ func TestFind_ZeroLengthFiles_Included(t *testing.T) {
 	makeFile(t, dir, "empty2.txt", "")
 	makeFile(t, dir, "full.txt", "content")
 
-	_, stderr, code := run(t, "find", dir, "--no-progress", "-z")
+	stdout, _, code := run(t, "find", dir, "--no-progress", "-z")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
@@ -232,7 +234,7 @@ func TestFind_ZeroLengthFiles_Included(t *testing.T) {
 	// matching checksums (both are 0 bytes, checksum = 0 for both).
 	// But actually, checksum of empty file is 0, so they match.
 	// Verify duplicates are reported.
-	if !strings.Contains(stderr, "Dupes:") {
+	if !strings.Contains(stdout, "Dupes:") {
 		t.Error("expected Dupes in output")
 	}
 }
@@ -243,12 +245,12 @@ func TestFind_Verbose(t *testing.T) {
 	makeFile(t, dir, "a.txt", "hello")
 	makeFile(t, dir, "b.txt", "hello")
 
-	_, stderr, code := run(t, "find", dir, "--no-progress", "-v")
+	stdout, _, code := run(t, "find", dir, "--no-progress", "-v")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
-	if !strings.Contains(stderr, "Duplicate:") {
+	if !strings.Contains(stdout, "Duplicate:") {
 		t.Error("expected duplicate output in verbose mode")
 	}
 }
@@ -260,12 +262,12 @@ func TestFind_ThreadsFlag(t *testing.T) {
 		makeFile(t, dir, fmt.Sprintf("file%d.txt", i), "data")
 	}
 
-	_, stderr, code := run(t, "find", dir, "--no-progress", "-t", "2")
+	stdout, _, code := run(t, "find", dir, "--no-progress", "-t", "2")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0 with --threads 2, got %d", code)
 	}
-	if !strings.Contains(stderr, "Files:") {
+	if !strings.Contains(stdout, "Files:") {
 		t.Error("expected summary output")
 	}
 }
@@ -277,13 +279,13 @@ func TestFind_MultiplePaths(t *testing.T) {
 	makeFile(t, dir1, "a.txt", "same content")
 	makeFile(t, dir2, "b.txt", "same content")
 
-	_, stderr, code := run(t, "find", dir1, dir2, "--no-progress")
+	stdout, stderr, code := run(t, "find", dir1, dir2, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 	// Should find the duplicate across two directories.
-	if !strings.Contains(stderr, "Duplicate:") {
+	if !strings.Contains(stdout, "Duplicate:") {
 		t.Errorf("expected cross-directory duplicate detection, got:\n%s", stderr)
 	}
 }
@@ -297,13 +299,13 @@ func TestFind_GlobPattern(t *testing.T) {
 	makeFile(t, dir, "d.jpg", "same")
 
 	// Only scan .txt files.
-	_, stderr, code := run(t, "find", filepath.Join(dir, "*.txt"), "--no-progress")
+	stdout, _, code := run(t, "find", filepath.Join(dir, "*.txt"), "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 	// Should only find duplicates among .txt files (2 files, 1 dupe).
-	if !strings.Contains(stderr, "Dupes:") {
+	if !strings.Contains(stdout, "Dupes:") {
 		t.Error("expected Dupes in glob-filtered output")
 	}
 }
@@ -318,13 +320,13 @@ func TestFind_RecursiveGlob(t *testing.T) {
 	makeFile(t, deep, "deep.jpg", "photo")
 	makeFile(t, deep, "deep.txt", "text")
 
-	_, stderr, code := run(t, "find", filepath.Join(dir, "**", "*.jpg"), "--no-progress")
+	stdout, stderr, code := run(t, "find", filepath.Join(dir, "**", "*.jpg"), "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 	// Should find 3 .jpg files, 2 of which are duplicates.
-	if !strings.Contains(stderr, "Duplicate:") {
+	if !strings.Contains(stdout, "Duplicate:") {
 		t.Errorf("expected duplicates in recursive glob, got:\n%s", stderr)
 	}
 }
@@ -347,12 +349,12 @@ func TestFind_LargeFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, _, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
-	if !strings.Contains(stderr, "Duplicate:") {
+	if !strings.Contains(stdout, "Duplicate:") {
 		t.Error("expected duplicate detection for large files")
 	}
 }
@@ -375,13 +377,13 @@ func TestFind_SameFirstChunkDifferentAfter(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "a.bin"), dataA, 0644)
 	os.WriteFile(filepath.Join(dir, "b.bin"), dataB, 0644)
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, _, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 	// Should NOT report as duplicates because full comparison will find differences.
-	if strings.Contains(stderr, "Duplicate:") {
+	if strings.Contains(stdout, "Duplicate:") {
 		t.Error("expected NO duplicate for files differing after 32KB")
 	}
 }
@@ -394,12 +396,12 @@ func TestFind_BinaryFiles(t *testing.T) {
 	makeFile(t, dir, "b.bin", string(data))
 	makeFile(t, dir, "c.bin", string([]byte{0x00, 0x01, 0x03}))
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, _, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
-	if !strings.Contains(stderr, "Duplicate:") {
+	if !strings.Contains(stdout, "Duplicate:") {
 		t.Error("expected duplicate detection for binary files")
 	}
 }
@@ -417,13 +419,13 @@ func TestFind_ManyDuplicates(t *testing.T) {
 	makeFile(t, dir, "unique2.txt", "yet another")
 	makeFile(t, dir, "unique3.txt", "different here")
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, _, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 	// Should find 9 duplicates (10 identical files = 9 duplicates, one kept as original).
-	if !strings.Contains(stderr, "Duplicate:") {
+	if !strings.Contains(stdout, "Duplicate:") {
 		t.Error("expected duplicate lines for many duplicates")
 	}
 }
@@ -433,12 +435,12 @@ func TestFind_SingleFile(t *testing.T) {
 	dir := t.TempDir()
 	makeFile(t, dir, "only.txt", "just one file")
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, _, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
-	if strings.Contains(stderr, "Duplicate:") {
+	if strings.Contains(stdout, "Duplicate:") {
 		t.Error("expected no duplicates with single file")
 	}
 }
@@ -456,13 +458,13 @@ func TestFind_MultipleDuplicateGroups(t *testing.T) {
 	// Unique
 	makeFile(t, dir, "unique.txt", "content CCCC")
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, stderr, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 	// Should find duplicates in both groups.
-	dupCount := strings.Count(stderr, "Duplicate:")
+	dupCount := strings.Count(stdout, "Duplicate:")
 	if dupCount < 3 {
 		t.Errorf("expected at least 3 duplicates (2 in group A + 1 in group B), got %d\n%s",
 			dupCount, stderr)
@@ -480,12 +482,12 @@ func TestDedupeDelete_Basic(t *testing.T) {
 	makeFile(t, dir, "copy.txt", "delete test content")
 	makeFile(t, dir, "unique.txt", "keep this")
 
-	_, stderr, code := run(t, "dedupe", "--delete", dir, "--no-progress")
+	stdout, stderr, code := run(t, "dedupe", "--delete", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d\nstderr: %s", code, stderr)
 	}
-	if !strings.Contains(stderr, "files deleted") {
+	if !strings.Contains(stdout, "files deleted") {
 		t.Errorf("expected 'files deleted' message, got:\n%s", stderr)
 	}
 
@@ -645,12 +647,12 @@ func TestDedupeHardlink_Basic(t *testing.T) {
 	makeFile(t, dir, "copy.txt", content)
 	makeFile(t, dir, "unique.txt", "different data")
 
-	_, stderr, code := run(t, "dedupe", "--hardlink", dir, "--no-progress")
+	stdout, stderr, code := run(t, "dedupe", "--hardlink", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d\nstderr: %s", code, stderr)
 	}
-	if !strings.Contains(stderr, "files replaced with hardlinks") {
+	if !strings.Contains(stdout, "files replaced with hardlinks") {
 		t.Errorf("expected hardlink success message, got:\n%s", stderr)
 	}
 
@@ -780,12 +782,43 @@ func TestError_NoPaths(t *testing.T) {
 
 func TestError_NonexistentPath(t *testing.T) {
 	t.Parallel()
-	_, _, code := run(t, "find", "/nonexistent/path/that/does/not/exist", "--no-progress")
+	_, stderr, code := run(t, "find", "/nonexistent/path/that/does/not/exist", "--no-progress")
 
-	// The walker should handle non-existent paths gracefully.
-	// It should either succeed (just find no files) or fail.
-	// Either behavior is acceptable as long as it doesn't panic.
-	t.Logf("nonexistent path exit code: %d", code)
+	if code == 0 {
+		t.Error("expected non-zero exit for a non-existent path")
+	}
+	if !strings.Contains(stderr, "no files matched") {
+		t.Errorf("expected a no-match error naming the path, got:\n%s", stderr)
+	}
+}
+
+// TestOutputStreams verifies the split between the two streams: results and the
+// summary go to stdout (so redirection and pipes carry the report), while
+// diagnostics stay on stderr and never contain escape sequences when stderr is
+// not a terminal.
+func TestOutputStreams(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	makeFile(t, dir, "a.txt", "duplicate content")
+	makeFile(t, dir, "b.txt", "duplicate content")
+
+	stdout, stderr, code := run(t, "find", dir, "--no-progress")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
+	}
+
+	for _, want := range []string{"Duplicate:", "Files:", "Dupes:"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("expected %q on stdout, got:\n%s", want, stdout)
+		}
+		if strings.Contains(stderr, want) {
+			t.Errorf("%q must not be on stderr, got:\n%s", want, stderr)
+		}
+	}
+	if strings.Contains(stderr, "\033") {
+		t.Errorf("progress escape sequences leaked into a non-terminal stderr: %q", stderr)
+	}
 }
 
 func TestError_NoSubcommand(t *testing.T) {
@@ -880,13 +913,13 @@ func TestNestedDirectories(t *testing.T) {
 	makeFile(t, subB, "b_unique.txt", "nested unique b")
 	makeFile(t, subC, "c_unique.txt", "nested unique c")
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, _, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 	// Should find the duplicate across nested dirs.
-	if !strings.Contains(stderr, "Duplicate:") {
+	if !strings.Contains(stdout, "Duplicate:") {
 		t.Error("expected duplicate detection across nested dirs")
 	}
 }
@@ -902,12 +935,12 @@ func TestDedupe_NestedDirectories(t *testing.T) {
 	makeFile(t, subB, "b.txt", "nested dedupe content")
 	makeFile(t, subB, "unique.txt", "unique nested content")
 
-	_, stderr, code := run(t, "dedupe", "--delete", dir, "--no-progress")
+	stdout, stderr, code := run(t, "dedupe", "--delete", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
-	if !strings.Contains(stderr, "files deleted") {
+	if !strings.Contains(stdout, "files deleted") {
 		t.Errorf("expected deletion across nested dirs, got:\n%s", stderr)
 	}
 
@@ -939,12 +972,12 @@ func TestGlob_StarExtension(t *testing.T) {
 	makeFile(t, dir, "b.txt", "glob test")
 	makeFile(t, dir, "c.jpg", "glob test")
 
-	_, stderr, code := run(t, "find", filepath.Join(dir, "*.txt"), "--no-progress")
+	stdout, _, code := run(t, "find", filepath.Join(dir, "*.txt"), "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
-	if !strings.Contains(stderr, "Duplicate:") {
+	if !strings.Contains(stdout, "Duplicate:") {
 		t.Error("expected duplicate in .txt-only glob")
 	}
 }
@@ -955,12 +988,12 @@ func TestGlob_CurrentDirPattern(t *testing.T) {
 	makeFile(t, dir, "test.jpg", "current dir glob test")
 
 	// Test with ** pattern.
-	_, stderr, code := run(t, "find", filepath.Join(dir, "**", "*.jpg"), "--no-progress")
+	stdout, _, code := run(t, "find", filepath.Join(dir, "**", "*.jpg"), "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
-	if !strings.Contains(stderr, "Files:") {
+	if !strings.Contains(stdout, "Files:") {
 		t.Error("expected file summary for current dir glob")
 	}
 }
@@ -976,18 +1009,18 @@ func TestStats_Find(t *testing.T) {
 	makeFile(t, dir, "b.txt", "stats test content")
 	makeFile(t, dir, "c.txt", "unique stats test content")
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, stderr, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 
 	// Parse the stats. Look for "Files: ... in 3 files".
-	if !strings.Contains(stderr, "in     3 files") {
+	if !strings.Contains(stdout, "in     3 files") {
 		t.Errorf("expected 3 files in stats, got:\n%s", stderr)
 	}
 	// Expect 1 duplicate file.
-	if !strings.Contains(stderr, "in     1 files") {
+	if !strings.Contains(stdout, "in     1 files") {
 		t.Errorf("expected 1 duplicate in stats, got:\n%s", stderr)
 	}
 }
@@ -1002,13 +1035,13 @@ func TestStats_FileSizes(t *testing.T) {
 	makeFile(t, dir, "a.txt", content)
 	makeFile(t, dir, "b.txt", content)
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, stderr, code := run(t, "find", dir, "--no-progress")
 
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 	// 2 files × 32 bytes = 64 bytes total.
-	if !strings.Contains(stderr, "64 B") {
+	if !strings.Contains(stdout, "64 B") {
 		t.Errorf("expected '64 B' in stats, got:\n%s", stderr)
 	}
 }
@@ -1056,15 +1089,15 @@ func TestFind_ThreeOrMoreIdenticalFiles(t *testing.T) {
 	}
 	makeFile(t, dir, "other.txt", "something else")
 
-	_, stderr, code := run(t, "find", dir, "--no-progress")
+	stdout, stderr, code := run(t, "find", dir, "--no-progress")
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
 	}
 
-	if got := countLinesContaining(stderr, "Duplicate:"); got != 3 {
+	if got := countLinesContaining(stdout, "Duplicate:"); got != 3 {
 		t.Errorf("expected 3 duplicate reports for 4 identical files, got %d:\n%s", got, stderr)
 	}
-	if !strings.Contains(stderr, "Dupes:") {
+	if !strings.Contains(stdout, "Dupes:") {
 		t.Errorf("expected summary, got:\n%s", stderr)
 	}
 }
@@ -1078,7 +1111,7 @@ func TestDedupeDelete_ThreeIdenticalFiles(t *testing.T) {
 		makeFile(t, dir, name, content)
 	}
 
-	_, stderr, code := run(t, "dedupe", "--delete", dir, "--no-progress")
+	stdout, stderr, code := run(t, "dedupe", "--delete", dir, "--no-progress")
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
 	}
@@ -1087,7 +1120,7 @@ func TestDedupeDelete_ThreeIdenticalFiles(t *testing.T) {
 	if len(remaining) != 1 {
 		t.Errorf("expected 1 file remaining, got %d: %v", len(remaining), remaining)
 	}
-	if got := countLinesContaining(stderr, "Deleted:"); got != 2 {
+	if got := countLinesContaining(stdout, "Deleted:"); got != 2 {
 		t.Errorf("expected 2 deletes, got %d:\n%s", got, stderr)
 	}
 }
@@ -1135,21 +1168,21 @@ func TestFind_ListLink(t *testing.T) {
 	}
 	makeFile(t, dir, "other.txt", "unrelated content")
 
-	_, stderr, code := run(t, "find", "--listlink", dir, "--no-progress")
+	stdout, stderr, code := run(t, "find", "--listlink", dir, "--no-progress")
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
 	}
 
-	if !strings.Contains(stderr, "Hardlink group") {
+	if !strings.Contains(stdout, "Hardlink group") {
 		t.Errorf("expected a hardlink group, got:\n%s", stderr)
 	}
-	if !strings.Contains(stderr, "a.txt") || !strings.Contains(stderr, "b.txt") {
+	if !strings.Contains(stdout, "a.txt") || !strings.Contains(stdout, "b.txt") {
 		t.Errorf("expected both hardlinked paths, got:\n%s", stderr)
 	}
-	if countLinesContaining(stderr, "Duplicate:") != 0 {
+	if countLinesContaining(stdout, "Duplicate:") != 0 {
 		t.Errorf("--listlink must not run duplicate detection:\n%s", stderr)
 	}
-	if !strings.Contains(stderr, "1 hardlink groups found") {
+	if !strings.Contains(stdout, "1 hardlink groups found") {
 		t.Errorf("expected hardlink group summary, got:\n%s", stderr)
 	}
 }
@@ -1222,8 +1255,8 @@ func extentsProbe(t *testing.T, dir string) bool {
 		return false
 	}
 
-	_, stderr, code := run(t, "find", "--cow", probe, "--no-progress")
-	return code == 0 && strings.Contains(stderr, "CoW group")
+	stdout, _, code := run(t, "find", "--cow", probe, "--no-progress")
+	return code == 0 && strings.Contains(stdout, "CoW group")
 }
 
 // cloneProbe reports whether dedupe --cow can create a clone inside dir.
@@ -1241,8 +1274,8 @@ func cloneProbe(t *testing.T, dir string) bool {
 	makeFile(t, probe, "a.bin", content)
 	makeFile(t, probe, "b.bin", content)
 
-	_, stderr, code := run(t, "dedupe", "--cow", probe, "--no-progress")
-	return code == 0 && strings.Contains(stderr, "CoW cloned:")
+	stdout, _, code := run(t, "dedupe", "--cow", probe, "--no-progress")
+	return code == 0 && strings.Contains(stdout, "CoW cloned:")
 }
 
 // =============================================================================
@@ -1257,11 +1290,11 @@ func TestDedupeCoW_CreateAndDetect(t *testing.T) {
 	a := makeFile(t, dir, "a.bin", content)
 	b := makeFile(t, dir, "b.bin", content)
 
-	_, stderr, code := run(t, "dedupe", "--cow", dir, "--no-progress")
+	stdout, stderr, code := run(t, "dedupe", "--cow", dir, "--no-progress")
 	if code != 0 {
 		t.Fatalf("dedupe --cow exited %d\n%s", code, stderr)
 	}
-	if strings.Contains(stderr, "CoW clone not supported") || !strings.Contains(stderr, "CoW cloned:") {
+	if strings.Contains(stdout, "CoW clone not supported") || !strings.Contains(stdout, "CoW cloned:") {
 		t.Skipf("CoW cloning not available on this filesystem:\n%s", stderr)
 	}
 
@@ -1282,17 +1315,17 @@ func TestDedupeCoW_CreateAndDetect(t *testing.T) {
 	}
 
 	// find --cow must now report the group with both files fully shared.
-	_, stderr, code = run(t, "find", "--cow", dir, "--no-progress")
+	stdout, stderr, code = run(t, "find", "--cow", dir, "--no-progress")
 	if code != 0 {
 		t.Fatalf("find --cow exited %d\n%s", code, stderr)
 	}
-	if !strings.Contains(stderr, "CoW candidate group") {
+	if !strings.Contains(stdout, "CoW candidate group") {
 		t.Errorf("expected a CoW candidate group after cloning, got:\n%s", stderr)
 	}
-	if !strings.Contains(stderr, "shared: 100.0%") {
+	if !strings.Contains(stdout, "shared: 100.0%") {
 		t.Errorf("expected the cloned pair to be reported as 100%% shared, got:\n%s", stderr)
 	}
-	if !strings.Contains(stderr, "1 CoW groups found") {
+	if !strings.Contains(stdout, "1 CoW groups found") {
 		t.Errorf("expected CoW group summary, got:\n%s", stderr)
 	}
 }
@@ -1307,18 +1340,18 @@ func TestFind_CoW_IndependentCopiesZeroShared(t *testing.T) {
 	makeFile(t, dir, "a.bin", content)
 	makeFile(t, dir, "b.bin", content)
 
-	_, stderr, code := run(t, "find", "--cow", dir, "--no-progress")
+	stdout, stderr, code := run(t, "find", "--cow", dir, "--no-progress")
 	if code != 0 {
 		t.Fatalf("find --cow exited %d\n%s", code, stderr)
 	}
 
-	if !strings.Contains(stderr, "CoW candidate group") {
+	if !strings.Contains(stdout, "CoW candidate group") {
 		t.Errorf("expected the identical copies to be listed as a candidate group:\n%s", stderr)
 	}
-	if !strings.Contains(stderr, "0.0%") {
+	if !strings.Contains(stdout, "0.0%") {
 		t.Errorf("expected independent copies to be reported as 0%% shared:\n%s", stderr)
 	}
-	if strings.Contains(stderr, "100.0%") {
+	if strings.Contains(stdout, "100.0%") {
 		t.Errorf("independent copies must not be reported as fully shared:\n%s", stderr)
 	}
 }
@@ -1336,12 +1369,12 @@ func TestDedupe_CoW_PreservesHardlink(t *testing.T) {
 		t.Fatalf("link: %v", err)
 	}
 
-	_, stderr, code := run(t, "dedupe", "--cow", dir, "--no-progress")
+	stdout, stderr, code := run(t, "dedupe", "--cow", dir, "--no-progress")
 	if code != 0 {
 		t.Fatalf("dedupe --cow exited %d\n%s", code, stderr)
 	}
 
-	if strings.Contains(stderr, "CoW cloned:") {
+	if strings.Contains(stdout, "CoW cloned:") {
 		t.Errorf("an existing hardlink must not be replaced by a clone:\n%s", stderr)
 	}
 	if !sameInode(t, a, b) {
@@ -1360,7 +1393,7 @@ func TestDedupeDelete_DuplicatePathArgs_NoDataLoss(t *testing.T) {
 	makeFile(t, dir, "a.txt", "precious content")
 	makeFile(t, dir, "b.txt", "precious content")
 
-	_, stderr, code := run(t, "dedupe", "--delete", "--no-progress", dir, dir)
+	stdout, stderr, code := run(t, "dedupe", "--delete", "--no-progress", dir, dir)
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
 	}
@@ -1371,7 +1404,7 @@ func TestDedupeDelete_DuplicatePathArgs_NoDataLoss(t *testing.T) {
 	if len(remaining) != 1 {
 		t.Fatalf("expected exactly 1 file to remain, got %d: %v\n%s", len(remaining), remaining, stderr)
 	}
-	if got := countLinesContaining(stderr, "Deleted:"); got != 1 {
+	if got := countLinesContaining(stdout, "Deleted:"); got != 1 {
 		t.Errorf("expected exactly 1 delete, got %d:\n%s", got, stderr)
 	}
 }
@@ -1383,12 +1416,12 @@ func TestFind_DuplicatePathArgs_NoSelfDuplicate(t *testing.T) {
 	makeFile(t, dir, "a.txt", "content")
 	makeFile(t, dir, "b.txt", "content")
 
-	_, stderr, code := run(t, "find", "--no-progress", dir, dir)
+	stdout, stderr, code := run(t, "find", "--no-progress", dir, dir)
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
 	}
 
-	if got := countLinesContaining(stderr, "Duplicate:"); got != 1 {
+	if got := countLinesContaining(stdout, "Duplicate:"); got != 1 {
 		t.Errorf("expected 1 duplicate report, got %d:\n%s", got, stderr)
 	}
 }

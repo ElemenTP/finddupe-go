@@ -14,7 +14,7 @@ finddupe-go/
 │   └── version.go             # version subcommand
 ├── internal/
 │   ├── config/                # Configuration
-│   │   └── config.go          # Config struct, Mode, Action types
+│   │   └── config.go          # Config struct, Action type
 │   ├── dupe/                  # Core types and duplicate-detection state machine
 │   │   ├── fileinfo.go        # FileInfo, InodeKey, GroupKey, Execution, ExecutionType
 │   │   ├── detector.go        # Detector state machine (Insert/OnHashDone/OnCompareDone)
@@ -84,7 +84,7 @@ finddupe-go/
 
 **Purpose**: Define the `Config` struct and related types. Pure data — no behavior.
 
-**Key fields**: `Mode`, `Action`, `Paths`, `RefPaths`, `Threads`, `Verbose`, `ListLink`, `CoWDetect`, `ShowProgress`, `FollowSymlinks`, `IncludeZeroLen`, `IncludeReadonly`, `SkipHardlinked`
+**Key fields**: `Action`, `Paths`, `RefPaths`, `Threads`, `Verbose`, `ListLink`, `CoWDetect`, `ShowProgress`, `FollowSymlinks`, `IncludeZeroLen`, `IncludeReadonly`, `SkipHardlinked`
 
 **Dependencies**: None (std types only)
 
@@ -132,11 +132,14 @@ type Result struct {
     Info dupe.FileInfo
     Err  error
 }
+
+// NoMatchError travels Err when a pattern matched nothing (see below).
+type NoMatchError struct{ Pattern string }
 ```
 
 **Platform helpers**: `getFileIdentity(path, info)` in `walker_unix.go` / `walker_windows.go`.
 
-**Features**: `**` recursive glob matching, symlink following control (with loop prevention), zero-length file filtering, `ZeroLenCounter` callback.
+**Features**: `**` recursive glob matching, literal paths (a pattern that names an existing path is scanned as written, so `/data/[2020] photos` is not split on its brackets), symlink following control (with loop prevention), zero-length file filtering, `ZeroLenCounter` callback, and no-match reporting: a pattern that matches no usable file yields one `*NoMatchError` on the channel, which the pipeline turns into a failed run. Only regular files are reported: symlinks are skipped unless `FollowSymlinks` is set (then they are resolved and reported with the target's size/identity, and links to directories are walked through the `seen` set), and devices/FIFOs/sockets are always ignored so nothing blocks on an open.
 
 **Dependencies**: `internal/dupe` (for `FileInfo`)
 
@@ -154,6 +157,7 @@ type Info struct {
     Inode     uint64
     NumLinks  uint64
     SHA256    [32]byte
+    ModTime   time.Time
 }
 
 func Compute(path string, size int64) (uint64, error)
@@ -165,9 +169,9 @@ func ComputeFromReader(r io.Reader, size int64) (uint64, error)
 - `inode_unix.go`: `fileIdentity(f *os.File)` reads `Dev`/`Inode`/`NumLinks` from `f.Stat().Sys().(*syscall.Stat_t)`
 - `inode_windows.go`: `fileIdentity(f *os.File)` calls `GetFileInformationByHandle` on `f.Fd()`
 
-`ComputeFileInfo` is the primary function used by the pipeline — it opens the file once and returns all metadata, keeping I/O in the parallel worker-pool path. For files ≤ 32KB it also returns the full SHA-256 at no extra I/O cost.
+`ComputeFileInfo` is the primary function used by the pipeline — it opens the file once and returns all metadata, keeping I/O in the parallel worker-pool path. For files ≤ 32KB it also returns the full SHA-256 at no extra I/O cost. It stats the open file and returns `dupe.ErrFileChanged` when its size is no longer the size the walker reported, so a file that grew or shrank cannot be signed as if it had the scanned content.
 
-**Dependencies**: None (stdlib + platform syscalls)
+**Dependencies**: `internal/dupe` (the `ErrFileChanged` sentinel), stdlib, platform syscalls
 
 ### `internal/action` — Stateless Action Executor
 
@@ -189,6 +193,7 @@ type Outcome struct {
     Key        dupe.GroupKey
     Files      []dupe.FileInfo
     Result     Result
+    Err        error   // failure behind ResultError, reported by the coordinator
     FileShared []int64 // CoWDetect: already-shared bytes per Files entry
 }
 ```
@@ -196,14 +201,35 @@ type Outcome struct {
 **Behavior by execution type**:
 - `HashCalc`: full SHA-256 of one file, resuming from `HashState`/`HashOffset`.
 - `HashComp`: chunked comparison of two files with early-stop; partial state is preserved for resume.
-- `DupeElim`: delete / hardlink / CoW-clone the victim, or report it. Before anything else it refuses to act on the same physical file (`samePhysicalFile`: same non-zero `Dev` + `Inode`): report mode still reports the pair unless `SkipHardlinked` (`--hardlink`), every other action returns `ResultAlreadyHardlinked`. Reference victims are never eliminated.
+- `DupeElim`: delete / hardlink / CoW-clone the victim, or report it. Before anything else it refuses to act on the same physical file (`samePhysicalFile`: same non-zero `Dev` + `Inode`): report mode still reports the pair unless `SkipHardlinked` (`--hardlink`), every other action returns `ResultAlreadyHardlinked`. Reference victims are never eliminated. Before a destructive action it re-checks that both files still match the size and modification time recorded with their hash (`ResultSkippedChanged` otherwise), and a hardlink pair on different devices is refused (`ResultSkippedCrossDevice`).
 - `CoWDetect`: query every member of one identical-content group and report `FileShared`, one already-shared byte count per member. The Linux `FIEMAP_EXTENT_SHARED` flag is used when any group extent carries it, otherwise physical-start identity is compared within the same device; `FileShared` is nil when extents are unavailable for the whole group.
 
-**CoW clone helpers**: `cloneReplace` (shared orchestration), `alreadyShared` (same physical file or `extent.Equal` fast path → `ResultAlreadyShared`), `clonePlatformFile` (per OS), `replaceFile` (per OS), `ErrCoWNotSupported`.
+**Link/clone helpers**: `linkReplace` (hardlink under a temporary name, then atomic rename), `hardlinkLimitReached` (per OS: re-reads the link count on Windows, defers to the filesystem on Unix), `cloneReplace` (shared orchestration), `alreadyShared` (same physical file or, on the same device, `extent.Equal` → `ResultAlreadyShared`), `copyTailAt` (the unaligned tail of a block clone), `clonePlatformFile` (per OS), `replaceFile` (per OS), `preserveMetadata` (per OS: restores as much of the victim's metadata as the platform allows), `ErrCoWNotSupported`.
 
-**Action results**: `ResultVerifiedDuplicate`, `ResultAlreadyHardlinked`, `ResultDeleted`, `ResultHardlinked`, `ResultCoWCloned`, `ResultSkippedRO`, `ResultSkippedRef`, `ResultHardlinkLimit`, `ResultNotDuplicate`, `ResultError`, `ResultAlreadyShared`
+**Action results**: `ResultVerifiedDuplicate`, `ResultAlreadyHardlinked`, `ResultDeleted`, `ResultHardlinked`, `ResultCoWCloned`, `ResultSkippedRO`, `ResultSkippedRef`, `ResultSkippedChanged`, `ResultSkippedCrossDevice`, `ResultHardlinkLimit`, `ResultNotDuplicate`, `ResultError`, `ResultAlreadyShared`
 
 **Dependencies**: `internal/dupe`, `internal/config`, `internal/extent`, `golang.org/x/sys` (CoW ioctls)
+
+### `internal/progress` — Progress Line
+
+**Purpose**: draw a live "Scanned N files..." line on stderr while the scan runs.
+
+**API**: `New(stats) *Reporter`, `(*Reporter).Run(ctx)`, and
+`IsTerminal(f *os.File) bool` — a dependency-free terminal check (character
+device). The pipeline only starts the reporter when stderr is a terminal and
+stops it, waiting for the line to be cleared, before printing the summary, so
+redirected output never collects escape sequences and no stale progress line
+sits next to a result.
+
+### `internal/volinfo` — Volume Facts
+
+**Purpose**: report filesystem-level facts about the volume a path lives on, so
+the CoW clone and the extent query share one implementation and one cache.
+
+**API**: `ClusterSize(path string) (uint64, error)` — the volume's allocation
+unit, cached per volume root. Windows-only: other platforms return
+`ErrUnsupported`, which callers translate into "CoW/extents are unavailable
+here" rather than a hard failure.
 
 ### `internal/extent` — Physical Extent Query
 

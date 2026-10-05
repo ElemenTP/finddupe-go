@@ -27,8 +27,24 @@ func New(stats *dupe.Stats) *Reporter {
 	}
 }
 
-// Run displays the progress indicator until ctx is cancelled.
+// IsTerminal reports whether the progress line may be drawn on f. The check is
+// deliberately dependency-free: a character device is treated as a terminal
+// (which also accepts /dev/null, where a stray escape sequence is harmless),
+// while a pipe or a regular file is not, so redirected output never collects
+// escape sequences or a stream of "Scanned N files..." lines.
+func IsTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+// Run displays the progress indicator until ctx is cancelled. It returns
+// immediately when stderr is not a terminal, so escape sequences can never end
+// up in a redirected log.
 func (r *Reporter) Run(ctx context.Context) {
+	if !IsTerminal(os.Stderr) {
+		return
+	}
+
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 

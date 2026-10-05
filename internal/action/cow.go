@@ -49,6 +49,12 @@ func alreadyShared(keeper, victim dupe.FileInfo) bool {
 		return true
 	}
 
+	// Physical offsets are only comparable within one device, so two files on
+	// different volumes must never be declared identical from their layouts.
+	if !sameDevice(keeper, victim) {
+		return false
+	}
+
 	keeperExtents, err := extent.Query(keeper.Path)
 	if err != nil {
 		return false
@@ -189,21 +195,23 @@ func cloneReplace(src, dst string) error {
 	return nil
 }
 
-// preserveVictimMetadata copies the victim's mode and modification time onto the
-// clone and clears write-protection on the victim, which Windows requires before
-// it can be replaced.
+// preserveVictimMetadata gives the clone the victim's metadata — as much of it
+// as the platform can restore, see preserveMetadata — and clears write
+// protection on the victim, which Windows requires before it can be replaced.
+//
+// Unlike hardlinking, cloning does not share an inode with the keeper, so the
+// victim's identity can be preserved instead of inheriting the keeper's.
 func preserveVictimMetadata(tmpPath, dst string) error {
 	info, err := os.Stat(dst)
 	if err != nil {
-		return nil //nolint:nilerr // the victim vanished; nothing left to preserve
+		// The victim vanished: do not resurrect it from the keeper's content.
+		return err
 	}
 
-	if chmodErr := os.Chmod(tmpPath, info.Mode().Perm()); chmodErr != nil {
-		return chmodErr
+	if metaErr := preserveMetadata(tmpPath, dst); metaErr != nil {
+		return metaErr
 	}
-	if chtimesErr := os.Chtimes(tmpPath, info.ModTime(), info.ModTime()); chtimesErr != nil {
-		return chtimesErr
-	}
+
 	if info.Mode().Perm()&0o200 == 0 {
 		return os.Chmod(dst, info.Mode().Perm()|0o200)
 	}

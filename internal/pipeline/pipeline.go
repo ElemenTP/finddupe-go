@@ -3,14 +3,18 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
+	"unicode"
 
 	"finddupe/internal/action"
 	"finddupe/internal/checksum"
@@ -49,13 +53,17 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	logger := newLogger(cfg)
 
 	stats := dupe.NewStats()
-	if cfg.ShowProgress {
-		prog := progress.New(stats)
-		go prog.Run(ctx)
-	}
+
+	// The progress line lives on stderr and is cleared before any result is
+	// printed, so it can never mix into the (stdout) result stream.
+	stopProgress := startProgress(ctx, cfg, stats)
+	defer stopProgress()
 
 	if cfg.ListLink {
-		return runListLink(ctx, cfg, stats, logger)
+		err := runListLink(ctx, cfg, stats, logger)
+		stopProgress()
+		printSummary(stats)
+		return err
 	}
 
 	walkResultCh := make(chan fswalker.Result, threads*channelBufferFactor)
@@ -77,7 +85,8 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	go walkAll(ctx, cfg, stats, walkResultCh)
 
 	// Checksum workers → fileInfoCh.
-	go scanChecksums(ctx, stats, logger, pool, walkResultCh, fileInfoCh, false)
+	misses := &patternMisses{}
+	go scanChecksums(ctx, stats, logger, pool, walkResultCh, fileInfoCh, false, misses)
 
 	// Executor workers: executionCh → outcomeCh.
 	var executors sync.WaitGroup
@@ -101,14 +110,101 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	err := coordinate(ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh, final)
 
+	stopProgress()
 	printSummary(stats)
-	return err
+
+	if err != nil {
+		return err
+	}
+	return misses.err()
+}
+
+// startProgress draws the progress line while the scan runs and returns a stop
+// function. The line is only drawn when the reporter is enabled and stderr is a
+// terminal: escape sequences written into a pipe or a log file are garbage. The
+// returned function is idempotent and waits for the line to be cleared, so
+// results never appear next to a stale progress line.
+func startProgress(ctx context.Context, cfg *config.Config, stats *dupe.Stats) func() {
+	if !cfg.ShowProgress || !progress.IsTerminal(os.Stderr) {
+		return func() {}
+	}
+
+	progCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		progress.New(stats).Run(progCtx)
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			cancel()
+			<-done
+		})
+	}
+}
+
+// patternMisses collects the patterns that matched no files at all. A run where
+// nothing matched (a typo, an empty directory, a glob that no longer hits) must
+// fail loudly instead of reporting success and doing nothing.
+type patternMisses struct {
+	mu       sync.Mutex
+	patterns []string
+}
+
+// add records a pattern that matched nothing.
+func (p *patternMisses) add(pattern string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.patterns = append(p.patterns, pattern)
+}
+
+// err returns an error naming every pattern that matched nothing, or nil.
+func (p *patternMisses) err() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.patterns) == 0 {
+		return nil
+	}
+	quoted := make([]string, len(p.patterns))
+	for i, pattern := range p.patterns {
+		quoted[i] = strconv.Quote(pattern)
+	}
+	return fmt.Errorf("no files matched: %s", strings.Join(quoted, ", "))
+}
+
+// fileOrder is the canonical order used wherever file order must not depend on
+// how the parallel hash workers happened to be scheduled: --ref files first
+// (they are the files the user marked as originals), then by path. It does not
+// decide which file becomes the keeper during elimination — that is still
+// whichever member's hash completes first — but it makes every report
+// reproducible and gives the user a way to pin the keeper for a run by naming
+// paths deliberately.
+func fileOrder(a, b dupe.FileInfo) bool {
+	if a.IsRef != b.IsRef {
+		return a.IsRef
+	}
+	return a.Path < b.Path
+}
+
+// resultPath renders a path for the single-quoted result lines. Control
+// characters are escaped, so a crafted file name cannot forge extra result lines
+// that a reader (or a script parsing the report) would attribute to other files.
+func resultPath(path string) string {
+	if !strings.ContainsFunc(path, unicode.IsControl) {
+		return path
+	}
+	quoted := strconv.Quote(path)
+	return quoted[1 : len(quoted)-1]
 }
 
 // cowGroupExecutions turns the detector's identical-content groups into
-// CoWDetect executions, one per group.
+// CoWDetect executions, one per group, in canonical order.
 func cowGroupExecutions(detector *dupe.Detector) []dupe.Execution {
 	groups := detector.CoWGroups()
+	sortGroups(groups)
 	execs := make([]dupe.Execution, 0, len(groups))
 
 	for _, group := range groups {
@@ -191,6 +287,7 @@ func scanChecksums(
 	walkResultCh <-chan fswalker.Result,
 	fileCh chan<- dupe.FileInfo,
 	inodeOnly bool,
+	misses *patternMisses,
 ) {
 	defer close(fileCh)
 
@@ -215,6 +312,12 @@ func scanChecksums(
 		}
 
 		if result.Err != nil {
+			// A pattern that matched nothing is a usage error, not an
+			// unreadable file; it is reported once the scan has finished.
+			if noMatch, ok := errors.AsType[*fswalker.NoMatchError](result.Err); ok {
+				misses.add(noMatch.Pattern)
+				continue
+			}
 			stats.CantReadFiles.Add(1)
 			logger.WarnContext(ctx, "cannot read file", "path", result.Info.Path, "error", result.Err)
 			continue
@@ -274,6 +377,9 @@ func submitChecksum(
 		fi.Inode = info.Inode
 		fi.NumLinks = info.NumLinks
 		fi.SHA256 = info.SHA256
+		// Bind the digest to the modification time observed while reading it, so
+		// a later change is detected before the file is eliminated.
+		fi.ModTime = info.ModTime
 
 		select {
 		case fileCh <- fi:
@@ -484,32 +590,40 @@ func reportElimination(ctx context.Context, out action.Outcome, stats *dupe.Stat
 
 	switch out.Result {
 	case action.ResultVerifiedDuplicate:
-		fmt.Fprintf(os.Stderr, "Duplicate: '%s'\n", keeper.Path)
-		fmt.Fprintf(os.Stderr, "With:      '%s'\n", victim.Path)
+		fmt.Fprintf(os.Stdout, "Duplicate: '%s'\n", resultPath(keeper.Path))
+		fmt.Fprintf(os.Stdout, "With:      '%s'\n", resultPath(victim.Path))
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 	case action.ResultDeleted:
-		fmt.Fprintf(os.Stderr, "Deleted:    '%s'\n", victim.Path)
+		fmt.Fprintf(os.Stdout, "Deleted:    '%s'\n", resultPath(victim.Path))
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 		stats.DeletedFiles.Add(1)
 	case action.ResultHardlinked:
-		fmt.Fprintf(os.Stderr, "Hardlinked: '%s'\n", victim.Path)
+		fmt.Fprintf(os.Stdout, "Hardlinked: '%s'\n", resultPath(victim.Path))
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 		stats.HardlinkedFiles.Add(1)
 	case action.ResultCoWCloned:
-		fmt.Fprintf(os.Stderr, "CoW cloned: '%s'\n", victim.Path)
+		fmt.Fprintf(os.Stdout, "CoW cloned: '%s'\n", resultPath(victim.Path))
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 		stats.CoWClonedFiles.Add(1)
 	case action.ResultSkippedRO:
-		fmt.Fprintf(os.Stderr, "Skipping duplicate readonly file '%s'.\n", victim.Path)
+		fmt.Fprintf(os.Stdout, "Skipping duplicate readonly file '%s'.\n", resultPath(victim.Path))
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 		stats.SkippedROFiles.Add(1)
 	case action.ResultSkippedRef:
 		stats.SkippedRefFiles.Add(1)
+	case action.ResultSkippedChanged:
+		fmt.Fprintf(os.Stdout,
+			"Skipping '%s' (original '%s'): one of them changed during the scan.\n",
+			resultPath(victim.Path), resultPath(keeper.Path))
+		stats.SkippedChangedFiles.Add(1)
+	case action.ResultSkippedCrossDevice:
+		logger.WarnContext(ctx, "hardlink not possible across devices",
+			"keeper", keeper.Path, "victim", victim.Path)
 	case action.ResultAlreadyHardlinked:
 		// Silently skipped; verbose mode logs the pair.
 		logger.InfoContext(ctx, "already hardlinked",
@@ -522,7 +636,8 @@ func reportElimination(ctx context.Context, out action.Outcome, stats *dupe.Stat
 		logger.WarnContext(ctx, "hardlink limit reached",
 			"keeper", keeper.Path, "victim", victim.Path)
 	case action.ResultError:
-		logger.ErrorContext(ctx, "action error", "victim", victim.Path)
+		logger.ErrorContext(ctx, "action failed",
+			"keeper", keeper.Path, "victim", victim.Path, "error", out.Err)
 	case action.ResultNotDuplicate:
 		// Nothing to report.
 	}
@@ -540,12 +655,12 @@ func reportCoW(out action.Outcome, stats *dupe.Stats) {
 	stats.DuplicateFiles.Add(int64(len(out.Files) - 1))
 	stats.DuplicateBytes.Add(int64(len(out.Files)-1) * out.Files[0].Size)
 
-	fmt.Fprintf(os.Stderr, "CoW candidate group (%d files, identical content):\n", len(out.Files))
+	fmt.Fprintf(os.Stdout, "CoW candidate group (%d files, identical content):\n", len(out.Files))
 
 	if out.FileShared == nil {
-		fmt.Fprintln(os.Stderr, "    extent information unavailable on this filesystem; listing members only")
+		fmt.Fprintln(os.Stdout, "    extent information unavailable on this filesystem; listing members only")
 		for _, fi := range out.Files {
-			fmt.Fprintf(os.Stderr, "    '%s'\n", fi.Path)
+			fmt.Fprintf(os.Stdout, "    '%s'\n", resultPath(fi.Path))
 		}
 		return
 	}
@@ -561,8 +676,8 @@ func reportCoW(out action.Outcome, stats *dupe.Stats) {
 		if fi.Size > 0 {
 			percent = float64(shared) / float64(fi.Size) * percentScale
 		}
-		fmt.Fprintf(os.Stderr, "    '%s'  shared: %5.1f%% (%s of %s)\n",
-			fi.Path, percent, formatSize(shared), formatSize(fi.Size))
+		fmt.Fprintf(os.Stdout, "    '%s'  shared: %5.1f%% (%s of %s)\n",
+			resultPath(fi.Path), percent, formatSize(shared), formatSize(fi.Size))
 	}
 }
 
@@ -579,8 +694,9 @@ func runListLink(ctx context.Context, cfg *config.Config, stats *dupe.Stats, log
 
 	detector := dupe.NewDetector(stats)
 
+	misses := &patternMisses{}
 	go walkAll(ctx, cfg, stats, walkResultCh)
-	go scanChecksums(ctx, stats, logger, pool, walkResultCh, fileInfoCh, true)
+	go scanChecksums(ctx, stats, logger, pool, walkResultCh, fileInfoCh, true, misses)
 
 	for fi := range fileInfoCh {
 		stats.TotalFiles.Add(1)
@@ -589,18 +705,29 @@ func runListLink(ctx context.Context, cfg *config.Config, stats *dupe.Stats, log
 	}
 
 	groups := detector.InodeGroups()
-	sort.Slice(groups, func(i, j int) bool { return groups[i][0].Path < groups[j][0].Path })
+	sortGroups(groups)
 
 	for _, group := range groups {
-		fmt.Fprintf(os.Stderr, "Hardlink group, %d hardlinked instances found:\n", len(group))
+		fmt.Fprintf(os.Stdout, "Hardlink group, %d hardlinked instances found:\n", len(group))
 		for _, fi := range group {
-			fmt.Fprintf(os.Stderr, "    '%s'\n", fi.Path)
+			fmt.Fprintf(os.Stdout, "    '%s'\n", resultPath(fi.Path))
 		}
 		stats.HardlinkGroups.Add(1)
 	}
 
-	printSummary(stats)
-	return nil
+	return misses.err()
+}
+
+// sortGroups orders groups and their members by the canonical file order. The
+// detector hands groups out in map order and members in arrival order, both of
+// which are scheduling artifacts; sorting keeps the report reproducible.
+func sortGroups(groups [][]dupe.FileInfo) {
+	for _, group := range groups {
+		sort.Slice(group, func(i, j int) bool { return fileOrder(group[i], group[j]) })
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		return fileOrder(groups[i][0], groups[j][0])
+	})
 }
 
 // printSummary outputs the final statistics.
@@ -611,42 +738,45 @@ func printSummary(stats *dupe.Stats) {
 	dupFiles := stats.DuplicateFiles.Load()
 	dupBytes := stats.DuplicateBytes.Load()
 
-	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintf(os.Stderr, "Files: %8s in %5d files\n",
+	fmt.Fprintln(os.Stdout, "")
+	fmt.Fprintf(os.Stdout, "Files: %8s in %5d files\n",
 		formatSize(totalBytes), totalFiles)
-	fmt.Fprintf(os.Stderr, "Dupes: %8s in %5d files\n",
+	fmt.Fprintf(os.Stdout, "Dupes: %8s in %5d files\n",
 		formatSize(dupBytes), dupFiles)
 
 	if n := stats.ZeroLengthFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stderr, "  %d files of zero length were skipped\n", n)
+		fmt.Fprintf(os.Stdout, "  %d files of zero length were skipped\n", n)
 	}
 	if n := stats.CantReadFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stderr, "  %d files could not be opened\n", n)
+		fmt.Fprintf(os.Stdout, "  %d files could not be opened\n", n)
 	}
 	if n := stats.DeletedFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stderr, "  %d files deleted\n", n)
+		fmt.Fprintf(os.Stdout, "  %d files deleted\n", n)
 	}
 	if n := stats.HardlinkedFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stderr, "  %d files replaced with hardlinks\n", n)
+		fmt.Fprintf(os.Stdout, "  %d files replaced with hardlinks\n", n)
 	}
 	if n := stats.CoWClonedFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stderr, "  %d files replaced with CoW clones\n", n)
+		fmt.Fprintf(os.Stdout, "  %d files replaced with CoW clones\n", n)
 	}
 	if n := stats.HardlinkGroups.Load(); n > 0 {
-		fmt.Fprintf(os.Stderr, "  %d hardlink groups found\n", n)
+		fmt.Fprintf(os.Stdout, "  %d hardlink groups found\n", n)
 	}
 	if n := stats.CoWGroups.Load(); n > 0 {
 		// CoWSharedBytes is a per-file sum and would double-count storage, so
 		// only the group count is shown here; per-file ratios are printed with
 		// each group.
-		fmt.Fprintf(os.Stderr, "  %d CoW groups found (%s of file bytes already shared)\n",
+		fmt.Fprintf(os.Stdout, "  %d CoW groups found (%s of file bytes already shared)\n",
 			n, formatSize(stats.CoWSharedBytes.Load()))
 	}
 	if n := stats.SkippedROFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stderr, "  %d read-only files skipped\n", n)
+		fmt.Fprintf(os.Stdout, "  %d read-only files skipped\n", n)
 	}
 	if n := stats.SkippedRefFiles.Load(); n > 0 {
-		fmt.Fprintf(os.Stderr, "  %d reference files skipped\n", n)
+		fmt.Fprintf(os.Stdout, "  %d reference files skipped\n", n)
+	}
+	if n := stats.SkippedChangedFiles.Load(); n > 0 {
+		fmt.Fprintf(os.Stdout, "  %d files skipped (changed during the scan)\n", n)
 	}
 }
 

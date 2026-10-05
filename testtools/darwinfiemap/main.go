@@ -174,6 +174,11 @@ func enumerate(f *os.File, size, blksize int64, v variant, byContig bool) []step
 	steps := make([]step, 0, 64)
 	offset := int64(0)
 
+	// The record is heap-allocated once and reused: fcntl takes its argument as
+	// a plain int, so a stack-allocated record could be moved by stack growth
+	// between the conversion and the call.
+	rec := new(log2phys)
+
 	for offset < size && len(steps) < maxSteps {
 		if v.seek {
 			if _, err := f.Seek(offset, 0); err != nil {
@@ -181,9 +186,9 @@ func enumerate(f *os.File, size, blksize int64, v variant, byContig bool) []step
 			}
 		}
 
-		rec := v.input(offset, size-offset)
+		*rec = v.input(offset, size-offset)
 		ret, err := unix.FcntlInt(f.Fd(), v.cmd, int(uintptr(unsafe.Pointer(&rec.raw[0]))))
-		runtime.KeepAlive(&rec)
+		runtime.KeepAlive(rec)
 
 		var errno syscall.Errno
 		if err != nil {

@@ -19,7 +19,19 @@ Examples:
   finddupe dedupe --delete /data
   finddupe dedupe --hardlink /backup
   finddupe dedupe --cow --threads 8 /btrfs-volume
-  finddupe dedupe --delete --ref /originals -- /copies`,
+  finddupe dedupe --delete --ref /originals -- /copies
+
+Keeper selection: when several files have identical content, one of them (the
+keeper) keeps its data and the others are eliminated. Which file becomes the
+keeper is not deterministic - it is whichever file finishes hashing first on a
+multi-core scan. Use --ref to mark the files that must be kept: a reference file
+is never eliminated and always becomes the keeper of its content group, so its
+duplicates elsewhere are the ones removed.
+
+Note for users of the original Windows finddupe: there, -ref was a terminator
+("everything after it is a reference") and references were never preferred over
+a normal copy, so the copy outside the reference set was the one kept. Here the
+reference path holds the file that is kept.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runDedupe,
 }
@@ -59,7 +71,7 @@ func init() {
 	dedupeCmd.Flags().IntVarP(&dedupeFlags.threads, "threads", "t", 0,
 		"Number of scanner workers (default: number of CPUs)")
 	dedupeCmd.Flags().StringArrayVar(&dedupeFlags.refPaths, "ref", nil,
-		"Mark following path as reference (compare against but never act upon); repeatable")
+		"Protect this path: its files become the keeper of their content group and are never eliminated; repeatable")
 }
 
 // runDedupe builds the config and runs the pipeline in dedupe mode.
@@ -71,7 +83,6 @@ func runDedupe(cmd *cobra.Command, args []string) error {
 	}
 
 	cfg := &config.Config{
-		Mode:            config.ModeDedupe,
 		Action:          action,
 		Paths:           args,
 		RefPaths:        dedupeFlags.refPaths,

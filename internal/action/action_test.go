@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"finddupe/internal/action"
 	"finddupe/internal/config"
@@ -308,6 +309,242 @@ func TestDoExecution_DupeElim_Hardlink(t *testing.T) {
 	}
 }
 
+// TestDoExecution_DupeElim_Hardlink_LinkFailureKeepsVictim is the regression
+// test for the data loss that remove-then-link caused: when the link failed
+// (different device, filesystem without hard links, missing keeper), the
+// victim had already been deleted.
+func TestDoExecution_DupeElim_Hardlink_LinkFailureKeepsVictim(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const content = "precious content"
+	victim := writeFile(t, dir, "victim.bin", []byte(content))
+
+	// The keeper no longer exists, so os.Link must fail.
+	keeper := dupe.FileInfo{Path: filepath.Join(dir, "gone.bin"), Size: int64(len(content))}
+
+	exec := action.New(action.Options{Action: config.ActionHardlink})
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{keeper, fileInfo(t, victim)},
+	})
+	if err == nil {
+		t.Fatal("expected the hardlink to fail")
+	}
+	if out.Result != action.ResultError {
+		t.Fatalf("Result = %v, want ResultError", out.Result)
+	}
+
+	data, readErr := os.ReadFile(victim)
+	if readErr != nil {
+		t.Fatalf("victim was destroyed by a failed hardlink: %v", readErr)
+	}
+	if string(data) != content {
+		t.Fatalf("victim content = %q, want %q", data, content)
+	}
+
+	// The temporary link name must not be left behind either.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected only the victim to remain, got %d entries", len(entries))
+	}
+}
+
+// TestDoExecution_DupeElim_Hardlink_PreservesKeeperMetadata verifies that
+// hardlinking never rewrites the keeper's permissions or timestamps: the
+// victim's metadata cannot be preserved on a shared inode, so it is not
+// restored at all.
+func TestDoExecution_DupeElim_Hardlink_PreservesKeeperMetadata(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	data := []byte("hardlink metadata")
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
+
+	if err := os.Chmod(keeper, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(victim, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keeperTime := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	victimTime := time.Date(2021, 6, 7, 8, 9, 10, 0, time.UTC)
+	if err := os.Chtimes(keeper, keeperTime, keeperTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(victim, victimTime, victimTime); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := action.New(action.Options{Action: config.ActionHardlink})
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, keeper), fileInfo(t, victim)},
+	})
+	if err != nil {
+		t.Fatalf("hardlink: %v", err)
+	}
+	if out.Result != action.ResultHardlinked {
+		t.Fatalf("Result = %v, want ResultHardlinked", out.Result)
+	}
+
+	ki, err := os.Stat(keeper)
+	if err != nil {
+		t.Fatalf("stat keeper: %v", err)
+	}
+	vi, err := os.Stat(victim)
+	if err != nil {
+		t.Fatalf("stat victim: %v", err)
+	}
+	if !os.SameFile(ki, vi) {
+		t.Fatal("victim is not hardlinked to the keeper")
+	}
+	if got := ki.Mode().Perm(); got != 0o640 {
+		t.Errorf("keeper mode = %o, want 640 (the keeper must not be rewritten)", got)
+	}
+	if !ki.ModTime().Equal(keeperTime) {
+		t.Errorf("keeper mtime = %v, want %v", ki.ModTime(), keeperTime)
+	}
+}
+
+// TestDoExecution_DupeElim_CrossDeviceSkipsHardlink verifies that a pair on two
+// different devices is skipped before anything is created or removed.
+func TestDoExecution_DupeElim_CrossDeviceSkipsHardlink(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const content = "cross device"
+	keeper := writeFile(t, dir, "a.bin", []byte(content))
+	victim := writeFile(t, dir, "b.bin", []byte(content))
+
+	kp := fileInfo(t, keeper)
+	vp := fileInfo(t, victim)
+	kp.Dev, vp.Dev = 1, 2
+
+	exec := action.New(action.Options{Action: config.ActionHardlink})
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{kp, vp},
+	})
+	if err != nil {
+		t.Fatalf("cross-device hardlink: %v", err)
+	}
+	if out.Result != action.ResultSkippedCrossDevice {
+		t.Fatalf("Result = %v, want ResultSkippedCrossDevice", out.Result)
+	}
+
+	for _, path := range []string{keeper, victim} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Errorf("%s must be preserved: %v", path, statErr)
+		}
+	}
+}
+
+// TestDoExecution_DupeElim_ChangedFileSkipped verifies that a file which
+// changed after its hash was computed is never eliminated.
+func TestDoExecution_DupeElim_ChangedFileSkipped(t *testing.T) {
+	t.Parallel()
+
+	actions := []struct {
+		name string
+		kind config.Action
+	}{
+		{name: "delete", kind: config.ActionDelete},
+		{name: "hardlink", kind: config.ActionHardlink},
+		{name: "cow", kind: config.ActionCoWClone},
+	}
+
+	for _, tc := range actions {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			kind := tc.kind
+			dir := t.TempDir()
+			data := []byte("changed after hashing")
+			keeper := writeFile(t, dir, "a.bin", data)
+			victim := writeFile(t, dir, "b.bin", data)
+
+			kp := fileInfo(t, keeper)
+			vp := fileInfo(t, victim)
+			kp.ModTime, vp.ModTime = statModTime(t, keeper), statModTime(t, victim)
+
+			// The victim is rewritten after being hashed.
+			changedTime := vp.ModTime.Add(time.Hour)
+			if err := os.Chtimes(victim, changedTime, changedTime); err != nil {
+				t.Fatal(err)
+			}
+
+			exec := action.New(action.Options{Action: kind})
+			out, err := exec.DoExecution(context.Background(), dupe.Execution{
+				Key:   testKey,
+				Type:  dupe.DupeElim,
+				Files: []dupe.FileInfo{kp, vp},
+			})
+			if err != nil {
+				t.Fatalf("action %v: %v", kind, err)
+			}
+			if out.Result != action.ResultSkippedChanged {
+				t.Fatalf("action %v: Result = %v, want ResultSkippedChanged", kind, out.Result)
+			}
+
+			got, readErr := os.ReadFile(victim)
+			if readErr != nil {
+				t.Fatalf("victim must be preserved: %v", readErr)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatal("victim content changed")
+			}
+		})
+	}
+}
+
+// TestDoExecution_DupeElim_UnchangedFileIsActedOn verifies the happy path: a
+// recorded modification time that still matches does not block the action.
+func TestDoExecution_DupeElim_UnchangedFileIsActedOn(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	data := []byte("unchanged")
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
+
+	kp := fileInfo(t, keeper)
+	vp := fileInfo(t, victim)
+	kp.ModTime, vp.ModTime = statModTime(t, keeper), statModTime(t, victim)
+
+	exec := action.New(action.Options{Action: config.ActionDelete})
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{kp, vp},
+	})
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if out.Result != action.ResultDeleted {
+		t.Fatalf("Result = %v, want ResultDeleted", out.Result)
+	}
+	if _, statErr := os.Stat(victim); !os.IsNotExist(statErr) {
+		t.Fatalf("victim should have been deleted: %v", statErr)
+	}
+}
+
+// statModTime returns the modification time of path.
+func statModTime(t *testing.T, path string) time.Time {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return info.ModTime()
+}
+
 func TestDoExecution_DupeElim_ReadOnly(t *testing.T) {
 	t.Parallel()
 
@@ -502,6 +739,50 @@ func TestDoExecution_SamePhysicalFile_NoAction(t *testing.T) {
 	}
 }
 
+// TestDoExecution_SamePhysicalFile_UnknownIdentity verifies the identity
+// fallback: when the scan could not report a file index, two names for one
+// physical file must still be recognized instead of being eliminated against
+// each other.
+func TestDoExecution_SamePhysicalFile_UnknownIdentity(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	data := []byte("hardlinked without an index")
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := filepath.Join(dir, "b.bin")
+	if err := os.Link(keeper, victim); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+
+	// fileInfo leaves Dev/Inode at zero, as a filesystem without identity would.
+	kp := fileInfo(t, keeper)
+	vp := fileInfo(t, victim)
+	if kp.Inode != 0 || vp.Inode != 0 {
+		t.Fatal("test setup expects an unknown identity")
+	}
+
+	for _, actionKind := range []config.Action{
+		config.ActionDelete, config.ActionHardlink, config.ActionCoWClone,
+	} {
+		exec := action.New(action.Options{Action: actionKind})
+		out, err := exec.DoExecution(context.Background(), dupe.Execution{
+			Key:   testKey,
+			Type:  dupe.DupeElim,
+			Files: []dupe.FileInfo{kp, vp},
+		})
+		if err != nil {
+			t.Fatalf("action %v: %v", actionKind, err)
+		}
+		if out.Result != action.ResultAlreadyHardlinked {
+			t.Fatalf("action %v: Result = %v, want ResultAlreadyHardlinked", actionKind, out.Result)
+		}
+	}
+
+	if _, err := os.Stat(victim); err != nil {
+		t.Fatalf("victim must be preserved: %v", err)
+	}
+}
+
 // TestDoExecution_CoWClone_SkipsAlreadyShared verifies the skip fast path: a
 // second clone of an already-shared pair is a no-op.
 func TestDoExecution_CoWClone_SkipsAlreadyShared(t *testing.T) {
@@ -534,6 +815,60 @@ func TestDoExecution_CoWClone_SkipsAlreadyShared(t *testing.T) {
 	}
 	if out.Result != action.ResultAlreadyShared {
 		t.Fatalf("second clone: Result = %v, want ResultAlreadyShared", out.Result)
+	}
+}
+
+// TestDoExecution_CoWClone_CrossDeviceNotShared verifies that files whose
+// extent layouts match are never assumed to share storage when they live on
+// different devices: physical offsets are only comparable within one volume.
+func TestDoExecution_CoWClone_CrossDeviceNotShared(t *testing.T) {
+	t.Parallel()
+
+	dir := cloneCapableDir(t)
+	data := randomBytes(t)
+	keeper := writeFile(t, dir, "a.bin", data)
+	victim := writeFile(t, dir, "b.bin", data)
+
+	exec := action.New(action.Options{Action: config.ActionCoWClone})
+
+	// First pass creates a real clone, so the two layouts are identical.
+	if out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{fileInfo(t, keeper), fileInfo(t, victim)},
+	}); err != nil || out.Result != action.ResultCoWCloned {
+		t.Fatalf("clone setup: result=%v err=%v", out.Result, err)
+	}
+
+	// Same device: the identical layouts are recognized as already shared.
+	kp := fileInfo(t, keeper)
+	vp := fileInfo(t, victim)
+	kp.Dev, vp.Dev = 1, 1
+	out, err := exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{kp, vp},
+	})
+	if err != nil {
+		t.Fatalf("same-device clone: %v", err)
+	}
+	if out.Result != action.ResultAlreadyShared {
+		t.Fatalf("same device: Result = %v, want ResultAlreadyShared", out.Result)
+	}
+
+	// Different devices: the same layout must not be trusted, so the pair is
+	// cloned instead of being silently skipped.
+	kp.Dev, vp.Dev = 1, 2
+	out, err = exec.DoExecution(context.Background(), dupe.Execution{
+		Key:   testKey,
+		Type:  dupe.DupeElim,
+		Files: []dupe.FileInfo{kp, vp},
+	})
+	if err != nil {
+		t.Fatalf("cross-device clone: %v", err)
+	}
+	if out.Result != action.ResultCoWCloned {
+		t.Fatalf("different devices: Result = %v, want ResultCoWCloned", out.Result)
 	}
 }
 

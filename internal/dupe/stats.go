@@ -46,6 +46,10 @@ type Stats struct {
 
 	// SkippedRefFiles is the number of reference files skipped.
 	SkippedRefFiles atomic.Int64
+
+	// SkippedChangedFiles is the number of duplicate pairs left alone because
+	// one of the files changed after its content had been hashed.
+	SkippedChangedFiles atomic.Int64
 }
 
 // NewStats creates a new zero-initialized Stats.

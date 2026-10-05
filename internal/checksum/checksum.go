@@ -4,8 +4,12 @@ package checksum
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"io"
 	"os"
+	"time"
+
+	"finddupe/internal/dupe"
 )
 
 // BytesToChecksum is the number of bytes to read from the beginning of a file.
@@ -42,6 +46,11 @@ type Info struct {
 	// SHA256 is the full-content hash when it was computed at no extra cost
 	// (files <= BytesToChecksum); the zero value means "not yet computed".
 	SHA256 [32]byte
+
+	// ModTime is the file's modification time as observed while the checksum
+	// was computed. It is the reference the executor re-checks before acting
+	// on the file.
+	ModTime time.Time
 }
 
 // Compute opens the file at path and returns its 64-bit composite checksum.
@@ -57,6 +66,11 @@ func Compute(path string, size int64) (uint64, error) {
 // GetFileInformationByHandle on the already-open handle — avoiding a
 // second CreateFile call in the single-threaded walker.
 //
+// The file's current size must still equal size (the size observed by the
+// walker): reading a different number of bytes would produce a signature for
+// content other than the file that was grouped, which could later make an
+// elimination act on a file that is no longer a duplicate.
+//
 // When size <= BytesToChecksum (32KB), the entire file is read for CRC so
 // SHA-256 is also computed at zero additional cost. For larger files,
 // SHA-256 is returned as zero (not yet computed).
@@ -67,7 +81,16 @@ func ComputeFileInfo(path string, size int64) (Info, error) {
 	}
 	defer f.Close()
 
+	stat, err := f.Stat()
+	if err != nil {
+		return Info{}, err
+	}
+	if stat.Size() != size {
+		return Info{}, fmt.Errorf("%w: size is %d, scanned %d", dupe.ErrFileChanged, stat.Size(), size)
+	}
+
 	var out Info
+	out.ModTime = stat.ModTime()
 
 	// Get the physical identity from the open file handle (platform-specific).
 	out.Dev, out.Inode, out.NumLinks = fileIdentity(f)

@@ -52,6 +52,15 @@ const (
 	// storage (same physical file, or identical CoW extents), so no action was
 	// needed.
 	ResultAlreadyShared
+
+	// ResultSkippedChanged means the keeper or the victim changed after its
+	// content was hashed, so the duplicate decision is stale and nothing was
+	// touched.
+	ResultSkippedChanged
+
+	// ResultSkippedCrossDevice means the pair can never be hardlinked because
+	// the two files live on different devices.
+	ResultSkippedCrossDevice
 )
 
 // Options configures the executor's behavior.
@@ -86,6 +95,11 @@ type Outcome struct {
 
 	// Result is set for DupeElim outcomes.
 	Result Result
+
+	// Err is the failure that produced ResultError, if any. It is carried in
+	// the outcome because the reporting path runs in the coordinator, which
+	// otherwise has no access to the executor's error.
+	Err error
 
 	// FileShared is set for CoWDetect outcomes: the number of already-shared
 	// bytes for each entry of Files. It is nil when extent information is not
@@ -138,7 +152,7 @@ func (e *Executor) DoExecution(ctx context.Context, ex dupe.Execution) (Outcome,
 		return Outcome{Kind: ex.Type, Key: ex.Key, Files: []dupe.FileInfo{a, b}}, err
 	case dupe.DupeElim:
 		result, err := e.execute(ctx, ex)
-		return Outcome{Kind: ex.Type, Key: ex.Key, Files: ex.Files, Result: result}, err
+		return Outcome{Kind: ex.Type, Key: ex.Key, Files: ex.Files, Result: result, Err: err}, err
 	case dupe.CoWDetect:
 		return e.detectCoW(ctx, ex)
 	default:
@@ -155,6 +169,10 @@ func (e *Executor) hashCalc(ctx context.Context, fi dupe.FileInfo) (dupe.FileInf
 		return fi, err
 	}
 	defer f.Close()
+
+	if changedErr := ensureUnchanged(f, fi); changedErr != nil {
+		return fi, changedErr
+	}
 
 	h, err := restoreHasher(fi.HashState)
 	if err != nil {
@@ -221,6 +239,10 @@ func hashCompare(
 	}
 	defer fCand.Close()
 
+	if changedErr := ensurePairUnchanged(fOrig, orig, fCand, cand); changedErr != nil {
+		return orig, cand, changedErr
+	}
+
 	hOrig, err := restoreHasher(orig.HashState)
 	if err != nil {
 		return orig, cand, err
@@ -254,11 +276,13 @@ func hashCompare(
 		nCand, _ := io.ReadFull(fCand, bufCand[:toRead])
 
 		if nOrig == 0 || nCand == 0 || nOrig != nCand {
-			// Truncated file(s) — not a duplicate. Keep whatever was read.
-			orig.HashOffset += int64(nOrig)
-			cand.HashOffset += int64(nCand)
-			storeHashState(&orig, hOrig)
-			storeHashState(&cand, hCand)
+			// Truncated file(s) — not a duplicate. Feed whatever was read into
+			// the digests before recording the offsets: advancing HashOffset
+			// without the matching bytes would make a later resume compute a
+			// digest of the wrong content.
+			hOrig.Write(bufOrig[:nOrig])
+			hCand.Write(bufCand[:nCand])
+			orig, cand = storePartialState(orig, hOrig, int64(nOrig), cand, hCand, int64(nCand))
 			return orig, cand, nil
 		}
 
@@ -266,10 +290,7 @@ func hashCompare(
 		hCand.Write(bufCand[:nCand])
 
 		if !hashesEqual(hOrig, hCand) {
-			orig.HashOffset += int64(nOrig)
-			cand.HashOffset += int64(nCand)
-			storeHashState(&orig, hOrig)
-			storeHashState(&cand, hCand)
+			orig, cand = storePartialState(orig, hOrig, int64(nOrig), cand, hCand, int64(nCand))
 			return orig, cand, nil
 		}
 
@@ -314,12 +335,24 @@ func (e *Executor) execute(ctx context.Context, ex dupe.Execution) (Result, erro
 		return ResultSkippedRef, nil
 	}
 
+	if e.opts.Action != config.ActionReport {
+		// The duplicate decision was made from metadata captured during the
+		// scan; re-check it before touching anything, so a file that changed
+		// (or was replaced) since is never eliminated against a stale hash.
+		if !unchanged(keeper) || !unchanged(victim) {
+			return ResultSkippedChanged, nil
+		}
+	}
+
 	switch e.opts.Action {
 	case config.ActionReport:
 		return ResultVerifiedDuplicate, nil
 	case config.ActionDelete:
 		return e.deleteFile(ex)
 	case config.ActionHardlink:
+		if !sameDevice(keeper, victim) {
+			return ResultSkippedCrossDevice, nil
+		}
 		return e.createHardlink(ex)
 	case config.ActionCoWClone:
 		return e.cloneFile(ex)
@@ -328,10 +361,88 @@ func (e *Executor) execute(ctx context.Context, ex dupe.Execution) (Result, erro
 	}
 }
 
+// sameDevice reports whether two files live on the same device. A zero device
+// (identity unavailable) is treated as unknown, so the action layer decides for
+// itself instead of refusing a pair that may well be linkable.
+func sameDevice(a, b dupe.FileInfo) bool {
+	return a.Dev == 0 || b.Dev == 0 || a.Dev == b.Dev
+}
+
+// unchanged reports whether a file still has the size and modification time
+// recorded when its content was hashed. A record without a modification time
+// (for example a FileInfo built by a caller that never read the file) cannot be
+// verified and is accepted as-is.
+func unchanged(fi dupe.FileInfo) bool {
+	if fi.ModTime.IsZero() {
+		return true
+	}
+	info, err := os.Stat(fi.Path)
+	if err != nil {
+		return false
+	}
+	return info.Size() == fi.Size && info.ModTime().Equal(fi.ModTime)
+}
+
+// ensurePairUnchanged verifies that both files of a comparison still match the
+// metadata recorded during the scan.
+func ensurePairUnchanged(origFile *os.File, orig dupe.FileInfo, candFile *os.File, cand dupe.FileInfo) error {
+	if err := ensureUnchanged(origFile, orig); err != nil {
+		return err
+	}
+	return ensureUnchanged(candFile, cand)
+}
+
+// storePartialState records how much of each file has been fed into its digest
+// so a later attempt can resume, and returns them.
+func storePartialState(
+	orig dupe.FileInfo, hOrig hash.Hash, nOrig int64,
+	cand dupe.FileInfo, hCand hash.Hash, nCand int64,
+) (dupe.FileInfo, dupe.FileInfo) {
+	orig.HashOffset += nOrig
+	cand.HashOffset += nCand
+	storeHashState(&orig, hOrig)
+	storeHashState(&cand, hCand)
+	return orig, cand
+}
+
+// ensureUnchanged verifies that an already-open file still matches the size
+// recorded during the scan. When a partial digest is being resumed it also
+// checks the modification time, because the saved state is only valid for the
+// bytes that were hashed when it was stored.
+func ensureUnchanged(f *os.File, fi dupe.FileInfo) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() != fi.Size {
+		return fmt.Errorf("%w: size is %d, scanned %d", dupe.ErrFileChanged, info.Size(), fi.Size)
+	}
+	if fi.HashOffset > 0 && !fi.ModTime.IsZero() && !info.ModTime().Equal(fi.ModTime) {
+		return fmt.Errorf("%w: modified since it was partially hashed", dupe.ErrFileChanged)
+	}
+	return nil
+}
+
 // samePhysicalFile reports whether two FileInfo records describe the same
 // physical file (a hardlink of each other, or the same path).
+//
+// When the scan could not determine physical identity for one of the records
+// (a zero Inode, which happens on filesystems that report none), the operating
+// system is asked directly: eliminating a file against itself would destroy the
+// only remaining copy of its content.
 func samePhysicalFile(a, b dupe.FileInfo) bool {
-	return a.Inode != 0 && a.Dev == b.Dev && a.Inode == b.Inode
+	if a.Inode != 0 && b.Inode != 0 {
+		return a.Dev == b.Dev && a.Inode == b.Inode
+	}
+	return sameFileByStat(a.Path, b.Path)
+}
+
+// sameFileByStat compares two paths as the operating system sees them, by
+// device and inode (Unix) or volume serial and file index (Windows).
+func sameFileByStat(a, b string) bool {
+	infoA, errA := os.Stat(a)
+	infoB, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(infoA, infoB)
 }
 
 // restoreHasher creates a new SHA-256 hasher. If state is non-nil, it restores
