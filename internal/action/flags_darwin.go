@@ -25,11 +25,8 @@ const (
 // append-only, ...) that have no Linux equivalent, keeping the storage flags the
 // clone inherited from the data it was cloned from. Flags are applied last
 // because an immutable file refuses further metadata changes.
-func preservePlatformFlags(dst, src string) error {
-	srcFlags, srcErr := fileFlags(src)
-	if srcErr != nil {
-		return srcErr
-	}
+func preservePlatformFlags(dst string, srcInfo os.FileInfo) error {
+	srcFlags := flagsOf(srcInfo)
 	dstFlags, dstErr := fileFlags(dst)
 	if dstErr != nil {
 		return dstErr

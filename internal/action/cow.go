@@ -30,7 +30,7 @@ var ErrCrossDevice = errors.New("cannot clone across volumes")
 // already established by the detector, so cloning anyway is safe and
 // idempotent. Uncertainty (unsupported filesystem, compressed extents) simply
 // results in a clone.
-func (e *Executor) cloneFile(ex dupe.Execution, victimInfo os.FileInfo) (Result, error) {
+func (e *Executor) cloneFile(ex dupe.Execution, keeperInfo, victimInfo os.FileInfo) (Result, error) {
 	keeper := ex.Files[0]
 	victim := ex.Files[1]
 
@@ -46,7 +46,7 @@ func (e *Executor) cloneFile(ex dupe.Execution, victimInfo os.FileInfo) (Result,
 		return ResultAlreadyShared, nil
 	}
 
-	if err := cloneReplace(keeper.Path, victim.Path); err != nil {
+	if err := cloneReplace(keeper.Path, victim.Path, keeperInfo); err != nil {
 		// A volume boundary can also surface here when the device of one side was
 		// unknown before the attempt; that is a skip, not a failure.
 		if errors.Is(err, ErrCrossDevice) {
@@ -247,7 +247,7 @@ func groupSharedBytes(files []dupe.FileInfo, groupExtents [][]extent.Extent) []i
 
 // cloneReplace writes a CoW clone of src to a free temporary name next to dst and
 // atomically replaces dst with it. On any failure dst is left untouched.
-func cloneReplace(src, dst string) error {
+func cloneReplace(src, dst string, srcInfo os.FileInfo) error {
 	return withTemporaryName(dst, func(tmpPath string) error {
 		if cloneErr := clonePlatformFile(src, tmpPath); cloneErr != nil {
 			// A clone that failed after creating (part of) the file leaves it
@@ -262,7 +262,7 @@ func cloneReplace(src, dst string) error {
 		// bytes live belongs to src as well; the victim's metadata must not decide
 		// it (see preserveDataLayout). It goes first so that the victim's file flags,
 		// which are applied after, cannot block the attribute writes.
-		if layoutErr := preserveDataLayout(tmpPath, src); layoutErr != nil {
+		if layoutErr := preserveDataLayout(tmpPath, src, srcInfo); layoutErr != nil {
 			_ = os.Remove(tmpPath)
 			return layoutErr
 		}
@@ -286,7 +286,7 @@ func cloneReplace(src, dst string) error {
 		// what stands between a filesystem that silently produced an unusable clone
 		// and the victim being replaced by it: the victim is left untouched and the
 		// action is reported as failed instead.
-		if sizeErr := requireSameSize(tmpPath, src); sizeErr != nil {
+		if sizeErr := requireSameSize(tmpPath, src, srcInfo); sizeErr != nil {
 			return abandon(sizeErr)
 		}
 		return nil
@@ -294,13 +294,10 @@ func cloneReplace(src, dst string) error {
 }
 
 // requireSameSize checks that a clone holds as many bytes as the file it was
-// cloned from.
-func requireSameSize(clonePath, sourcePath string) error {
+// cloned from. The source's stat is the one the freshness check already made, so
+// only the clone is read here.
+func requireSameSize(clonePath, sourcePath string, sourceInfo os.FileInfo) error {
 	cloneInfo, err := os.Stat(clonePath)
-	if err != nil {
-		return err
-	}
-	sourceInfo, err := os.Stat(sourcePath)
 	if err != nil {
 		return err
 	}
@@ -329,7 +326,7 @@ func preserveVictimMetadata(tmpPath, dst string) (os.FileInfo, bool, error) {
 	// The metadata is applied before the victim's mode is touched, so the clone
 	// inherits the mode the user gave the victim even where making the victim
 	// writable is unavoidable.
-	if metaErr := preserveMetadata(tmpPath, dst); metaErr != nil {
+	if metaErr := preserveMetadata(tmpPath, dst, info); metaErr != nil {
 		return nil, false, metaErr
 	}
 

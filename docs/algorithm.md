@@ -369,6 +369,11 @@ All platforms go through `cloneReplace(src, dst)` in `internal/action/cow.go`:
    action is reported as failed
 6. Atomically replace the victim (os.Rename on Unix,
    MoveFileEx(REPLACE_EXISTING) on Windows)
+
+The statistics these steps need are the ones already taken: the keeper's and the
+victim's stat come from the freshness check (`unchanged`), and the metadata is applied
+from that value instead of re-reading the source, so a clone costs one stat of the
+victim (existence and mode) and one of the clone it just created.
 ```
 
 The extent check is only a "skip the work" fast path: content equality was already

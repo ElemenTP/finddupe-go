@@ -24,11 +24,10 @@ const listXattrGrowth = 2
 // failing the replacement: the clone's content is already in place and correct,
 // and a partial metadata restore is closer to the victim than the keeper's
 // metadata would be.
-func preserveMetadata(dst, src string) error {
-	srcInfo, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
+//
+// srcInfo is the stat the caller already made of src, so the source is not read
+// again; only the destination (the just-created clone) is stat'ed here.
+func preserveMetadata(dst, src string, srcInfo os.FileInfo) error {
 	dstInfo, err := os.Stat(dst)
 	if err != nil {
 		return err
@@ -63,7 +62,7 @@ func preserveMetadata(dst, src string) error {
 	}
 
 	// File flags last: an immutable flag would block the calls above.
-	return preservePlatformFlags(dst, src)
+	return preservePlatformFlags(dst, srcInfo)
 }
 
 // copyXattrs makes dst's extended attributes match src's: the victim's are

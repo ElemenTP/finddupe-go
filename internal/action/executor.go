@@ -423,13 +423,14 @@ func (e *Executor) execute(ctx context.Context, ex dupe.Execution) (Result, erro
 	// handed to the actions below, which need the victim's mode for the
 	// read-only decision.
 	var victimInfo os.FileInfo
+	var keeperInfo os.FileInfo
 	if e.opts.Action != config.ActionReport {
-		_, keeperOK := unchanged(keeper)
+		keeperStat, keeperOK := unchanged(keeper)
 		victimStat, victimOK := unchanged(victim)
 		if !keeperOK || !victimOK {
 			return ResultSkippedChanged, nil
 		}
-		victimInfo = victimStat
+		keeperInfo, victimInfo = keeperStat, victimStat
 	}
 
 	switch e.opts.Action {
@@ -443,7 +444,7 @@ func (e *Executor) execute(ctx context.Context, ex dupe.Execution) (Result, erro
 		}
 		return e.createHardlink(ex, victimInfo)
 	case config.ActionCoWClone:
-		return e.cloneFile(ex, victimInfo)
+		return e.cloneFile(ex, keeperInfo, victimInfo)
 	default:
 		return ResultError, fmt.Errorf("unknown action %v", e.opts.Action)
 	}

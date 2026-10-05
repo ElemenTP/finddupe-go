@@ -16,8 +16,9 @@ import (
 //
 // Restoring a security descriptor needs the right to change permissions, so
 // that step is best-effort; attributes and timestamps are applied afterwards so
-// they cannot be blocked by an inherited access control entry.
-func preserveMetadata(dst, src string) error {
+// they cannot be blocked by an inherited access control entry. The caller's stat
+// of src is not used here: attributes and timestamps are read through the path.
+func preserveMetadata(dst, src string, _ os.FileInfo) error {
 	copySecurityInfo(dst, src)
 	copyFileTimes(dst, src)
 

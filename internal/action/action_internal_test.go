@@ -208,6 +208,10 @@ func TestCloneFile_CrossDeviceIsSkipped(t *testing.T) {
 		}
 	}
 
+	keeperInfo, err := os.Lstat(keeperPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	victimInfo, err := os.Lstat(victimPath)
 	if err != nil {
 		t.Fatal(err)
@@ -220,7 +224,7 @@ func TestCloneFile_CrossDeviceIsSkipped(t *testing.T) {
 			{Path: keeperPath, Size: int64(len(content)), Dev: 7, Inode: 1},
 			{Path: victimPath, Size: int64(len(content)), Dev: 8, Inode: 2},
 		},
-	}, victimInfo)
+	}, keeperInfo, victimInfo)
 	if cloneErr != nil {
 		t.Fatalf("cloneFile() error = %v, want a skip", cloneErr)
 	}

@@ -32,17 +32,13 @@ func dataLayoutXattr(name string) bool {
 // usually not compressed), and a clone whose payload went missing is a
 // zero-length file. When they are absent they are copied from the keeper, in the
 // order the filesystem expects them: payload, then header, then flag.
-func preserveDataLayout(dst, keeper string) error {
+func preserveDataLayout(dst, keeper string, keeperInfo os.FileInfo) error {
 	if xattrSize(keeper, xattrDecmpfs) <= 0 {
 		// The keeper is not stored compressed: nothing describes its bytes beyond
 		// the data fork the clone already has.
 		return nil
 	}
 
-	keeperInfo, err := os.Stat(keeper)
-	if err != nil {
-		return err
-	}
 	dstInfo, err := os.Stat(dst)
 	if err != nil {
 		return err
