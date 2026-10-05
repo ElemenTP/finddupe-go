@@ -3,6 +3,7 @@
 package extent
 
 import (
+	"fmt"
 	"os"
 	"syscall"
 	"unsafe"
@@ -86,7 +87,7 @@ func query(path string) ([]Extent, error) {
 			if isUnsupportedErrno(errno) {
 				return nil, ErrUnsupported
 			}
-			return nil, errno
+			return nil, fmt.Errorf("FIEMAP request rejected: %w", errno)
 		}
 
 		n := int(hdr.MappedExtents)
@@ -154,9 +155,13 @@ func appendBatch(out *[]Extent, extents []fiemapExtent) (bool, uint64) {
 }
 
 // isUnsupportedErrno reports whether the ioctl failed because the filesystem
-// cannot report extents.
+// cannot report extents at all. EINVAL is deliberately not in this list: the
+// kernel answers it for a request it considers malformed, so folding it in would
+// hide a wrong ioctl number, argument size or structure layout behind "this
+// filesystem does not support extents". Callers treat any query error as
+// "unavailable", so a rejected request still degrades gracefully.
 func isUnsupportedErrno(errno syscall.Errno) bool {
 	return errno == syscall.ENOTTY ||
-		errno == syscall.EINVAL ||
-		errno == syscall.EOPNOTSUPP
+		errno == syscall.EOPNOTSUPP ||
+		errno == syscall.ENOSYS
 }

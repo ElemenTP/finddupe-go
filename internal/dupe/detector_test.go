@@ -2,6 +2,7 @@ package dupe_test
 
 import (
 	"crypto/sha256"
+	"sync"
 	"testing"
 
 	"finddupe/internal/dupe"
@@ -384,6 +385,60 @@ func TestDetector_CustomKeeperPolicy(t *testing.T) {
 	}
 	if got := execs[0].Files[0].Path; got != "/b" {
 		t.Fatalf("keeper = %q, want /b with the custom policy", got)
+	}
+}
+
+// TestDetector_CompressionPreference verifies that a compressed member is kept
+// when the preference is enabled, ahead of the path order that would otherwise
+// win, and that the probe is consulted once per member.
+func TestDetector_CompressionPreference(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats(), dupe.WithCompressionPreference(func(fi dupe.FileInfo) bool {
+		return fi.Path == "/z-compressed"
+	}))
+	d.Insert(fiSha("/a", 100, 5))
+	d.Insert(fiSha("/z-compressed", 100, 5))
+
+	execs := finalAll(t, d)
+	if len(execs) != 1 {
+		t.Fatalf("final work = %v, want one DupeElim", execTypes(execs))
+	}
+	if got := execs[0].Files[0].Path; got != "/z-compressed" {
+		t.Fatalf("keeper = %q, want the compressed member", got)
+	}
+	if got := execs[0].Files[1].Path; got != "/a" {
+		t.Fatalf("victim = %q, want /a", got)
+	}
+}
+
+// TestDetector_CompressionPreferenceIsNotProbedPerComparison verifies that the
+// probe runs once per member, not once per comparison: a sort that probed on
+// every comparison would open and query the same files O(n log n) times.
+func TestDetector_CompressionPreferenceIsNotProbedPerComparison(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	calls := make(map[string]int)
+	d := dupe.NewDetector(dupe.NewStats(), dupe.WithCompressionPreference(func(fi dupe.FileInfo) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		calls[fi.Path]++
+		return false
+	}))
+
+	paths := []string{"/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h"}
+	for _, path := range paths {
+		d.Insert(fiSha(path, 100, 5))
+	}
+	finalAll(t, d)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, path := range paths {
+		if calls[path] != 1 {
+			t.Errorf("probe called %d times for %s, want 1", calls[path], path)
+		}
 	}
 }
 

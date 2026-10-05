@@ -163,6 +163,7 @@ Scans the specified paths/patterns for duplicate files and takes action on them.
 Exactly one action flag must be specified for `dedupe` mode:
 - none → `no action specified: use --delete, --hardlink, or --cow`
 - more than one → `only one action flag allowed: --delete, --hardlink, or --cow`
+- `--prefer-compressed` without `--cow` → `--prefer-compressed only applies to --cow: the clone source is what decides the layout`
 
 ### Other Flags
 
@@ -173,8 +174,16 @@ Exactly one action flag must be specified for `dedupe` mode:
 | `--no-progress` | `-p` | bool | false | Hide the progress indicator |
 | `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points: they are resolved and scanned as their target, under the target's own path |
 | `--threads` | `-t` | int | `0` (→ `runtime.NumCPU() × 2`, capped at 1024) | Number of scanner workers |
-| `--rdonly` | `-r` | bool | false | Also operate on read-only files (Windows) |
+| `--rdonly` | `-r` | bool | false | Also operate on read-only files (skipped by default on every platform) |
+| `--prefer-compressed` | `-C` | bool | false | `--cow` only: keep a compressed member as the clone source (see below) |
 | `--ref` | — | string (repeatable) | — | Consume the following path/pattern as a reference (compare against, but never act on) |
+
+**Keeper order** (which of several identical files is kept): reference files first,
+then `--prefer-compressed` (when given), then the file with more hardlinks, then the
+smallest path. A CoW clone inherits the **source's** extent layout, so keeping a
+compressed member keeps the whole group compressed, while keeping an uncompressed
+member spreads its uncompressed layout to every victim. `--hardlink` and `--delete`
+do not change the data layout, which is why the flag is limited to `--cow`.
 
 ### Output
 

@@ -132,8 +132,10 @@ func (d *Detector) Insert(fi FileInfo) []Execution {
   victims (one `DupeElim` each). The default policy is
   `DefaultKeeperPolicy` — reference files first, then the file with more hardlinks
   (deleting or replacing a file that still has other links frees no storage), then the
-  smallest path. The choice no longer depends on which hash finished first, so a run
-  is reproducible; `--ref` remains the way to force a specific original.
+  smallest path. With `--prefer-compressed` a compressed member is preferred ahead of
+  the hardlink and path rules (the probe runs once per member of a content group).
+  The choice no longer depends on which hash finished first, so a run is
+  reproducible; `--ref` remains the way to force a specific original.
 - **No double elimination**: each bucket's plan is built once (one task per victim) and
   drained in bounded batches. Hardlinked aliases are collapsed *after* the policy
   ordering, so the surviving path of an inode is the preferred one and a path can

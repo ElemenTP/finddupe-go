@@ -129,7 +129,8 @@ dedupe mode (exactly one action is required):
 | `-d, --delete` | Delete duplicate files (conflicts with `-H` and `-c`) |
 | `-H, --hardlink` | Create hardlinks to eliminate duplicates (conflicts with `-d` and `-c`) |
 | `-c, --cow` | Create CoW clones to eliminate duplicates (conflicts with `-d` and `-H`) |
-| `-r, --rdonly` | Also operate on readonly files (for Windows) |
+| `-r, --rdonly` | Also operate on read-only files (skipped by default) |
+| `-C, --prefer-compressed` | Keep a compressed member as the CoW clone source (`--cow` only) |
 | `-v, --verbose` | Verbose output |
 | `-z, --zero` | Include zero length files |
 | `-p, --no-progress` | Hide progress indicator |

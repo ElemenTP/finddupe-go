@@ -37,16 +37,17 @@ reference path holds the file that is kept.`,
 }
 
 var dedupeFlags struct {
-	delete         bool
-	hardlink       bool
-	cow            bool
-	verbose        bool
-	zero           bool
-	noProgress     bool
-	followSymlinks bool
-	rdonly         bool
-	threads        int
-	refPaths       []string
+	delete           bool
+	hardlink         bool
+	cow              bool
+	verbose          bool
+	zero             bool
+	noProgress       bool
+	followSymlinks   bool
+	rdonly           bool
+	preferCompressed bool
+	threads          int
+	refPaths         []string
 }
 
 func init() {
@@ -68,6 +69,8 @@ func init() {
 		"Follow symbolic links and reparse points")
 	dedupeCmd.Flags().BoolVarP(&dedupeFlags.rdonly, "rdonly", "r", false,
 		"Also operate on read-only files (skipped by default on every platform)")
+	dedupeCmd.Flags().BoolVarP(&dedupeFlags.preferCompressed, "prefer-compressed", "C", false,
+		"Keep a compressed member as the CoW clone source (--cow only)")
 	dedupeCmd.Flags().IntVarP(&dedupeFlags.threads, "threads", "t", 0,
 		"Number of scanner workers (default: 2 x CPUs, max 1024)")
 	dedupeCmd.Flags().StringArrayVar(&dedupeFlags.refPaths, "ref", nil,
@@ -83,15 +86,16 @@ func runDedupe(cmd *cobra.Command, args []string) error {
 	}
 
 	cfg := &config.Config{
-		Action:          action,
-		Paths:           args,
-		RefPaths:        dedupeFlags.refPaths,
-		Threads:         dedupeFlags.threads,
-		Verbose:         dedupeFlags.verbose,
-		ShowProgress:    !dedupeFlags.noProgress,
-		FollowSymlinks:  dedupeFlags.followSymlinks,
-		IncludeZeroLen:  dedupeFlags.zero,
-		IncludeReadonly: dedupeFlags.rdonly,
+		Action:           action,
+		Paths:            args,
+		RefPaths:         dedupeFlags.refPaths,
+		Threads:          dedupeFlags.threads,
+		Verbose:          dedupeFlags.verbose,
+		ShowProgress:     !dedupeFlags.noProgress,
+		FollowSymlinks:   dedupeFlags.followSymlinks,
+		IncludeZeroLen:   dedupeFlags.zero,
+		IncludeReadonly:  dedupeFlags.rdonly,
+		PreferCompressed: dedupeFlags.preferCompressed,
 	}
 
 	return pipeline.Run(cmd.Context(), cfg)
@@ -119,6 +123,11 @@ func validateDedupeFlags() (config.Action, error) {
 	}
 	if count > 1 {
 		return config.ActionReport, errors.New("only one action flag allowed: --delete, --hardlink, or --cow")
+	}
+	if dedupeFlags.preferCompressed && action != config.ActionCoWClone {
+		return config.ActionReport, errors.New(
+			"--prefer-compressed only applies to --cow: the clone source is what decides the layout",
+		)
 	}
 
 	return action, nil

@@ -58,6 +58,11 @@ type Config struct {
 	// skipped, on every platform, because replacing one is not always permitted.
 	IncludeReadonly bool
 
+	// PreferCompressed keeps a member whose content is stored compressed as the
+	// CoW clone source, so the whole group keeps the compressed layout. It only
+	// applies to --cow.
+	PreferCompressed bool
+
 	// SkipHardlinked skips already-hardlinked duplicate pairs in find mode (--hardlink).
 	// When set, files that share the same inode (already hardlinked) are not reported
 	// or counted as duplicates. Only content-duplicates with different inodes are shown.

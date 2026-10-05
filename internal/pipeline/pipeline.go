@@ -20,6 +20,7 @@ import (
 
 	"finddupe/internal/action"
 	"finddupe/internal/checksum"
+	"finddupe/internal/compress"
 	"finddupe/internal/config"
 	"finddupe/internal/dupe"
 	"finddupe/internal/fswalker"
@@ -260,10 +261,18 @@ func newLogger(cfg *config.Config) *slog.Logger {
 
 // detectorOptions translates the config into detector options.
 func detectorOptions(cfg *config.Config) []dupe.Option {
+	var opts []dupe.Option
 	if cfg.CoWDetect {
-		return []dupe.Option{dupe.WithCoWDetect()}
+		opts = append(opts, dupe.WithCoWDetect())
 	}
-	return nil
+	// The compression preference is about the clone source: a CoW clone inherits
+	// the keeper's extent layout, so keeping a compressed member keeps the group
+	// compressed. Other actions do not change the data layout, and the CLI
+	// rejects the combination anyway.
+	if cfg.PreferCompressed && cfg.Action == config.ActionCoWClone {
+		opts = append(opts, dupe.WithCompressionPreference(compress.IsCompressed))
+	}
+	return opts
 }
 
 // walkAll walks cfg.RefPaths first and then cfg.Paths, sending every result on

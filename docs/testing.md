@@ -52,6 +52,8 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDetector_KeeperPolicyPrefersMoreHardlinks` | The victim is the file whose removal actually frees storage |
 | `TestDetector_KeeperPolicyIsStableRegardlessOfInsertOrder` | Same keeper for either insertion order |
 | `TestDetector_CustomKeeperPolicy` | `WithKeeperPolicy` replaces the built-in order |
+| `TestDetector_CompressionPreference` | `WithCompressionPreference` keeps the compressed member ahead of the path order |
+| `TestDetector_CompressionPreferenceIsNotProbedPerComparison` | The probe runs once per member, not once per comparison |
 | `TestDetector_FinalBatchesAreBounded` | A large group is emitted over several bounded `NextFinal` calls |
 | `TestDetector_PartialProgressKeepsLargerOffset` | The most advanced partial offset wins |
 | `TestDetector_CRCCollisionSeparatesBuckets` | Different sizes stay separate groups |
@@ -232,6 +234,13 @@ Hardlink creation, content preservation, same-inode verification, read-only hand
 ### Symlinks (2 tests)
 
 `TestDedupe_SymlinksResolvedToTarget` (a followed link is scanned and acted upon as its target: `--hardlink` links the real inode and leaves the link alone) and `TestDedupe_DeleteSymlinkTargetNotLink` (the duplicate file is removed, never the link).
+
+### Compression Preference (0 tests)
+
+`--prefer-compressed` is covered by the detector unit tests and by the CLI
+validation test (`--prefer-compressed` without `--cow` fails); producing a mixed
+compressed/uncompressed group needs a filesystem that compresses, so it is not
+part of the portable system suite.
 
 ### Keeper Determinism (1 test)
 

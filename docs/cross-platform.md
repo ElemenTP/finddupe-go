@@ -306,6 +306,13 @@ is decided when the data is written), and an APFS decmpfs-compressed file's data
 lives in a compressed container. Cloning an uncompressed source over a compressed
 member therefore yields a byte-identical but **uncompressed** clone.
 
+`dedupe --cow --prefer-compressed` (`-C`) exists precisely for this: it keeps a
+compressed member as the clone source, so the whole group ends up compressed
+instead of inheriting an uncompressed member's layout. Detection is per platform:
+btrfs/most Linux filesystems use the FIEMAP `Encoded` flag, APFS uses
+`UF_COMPRESSED`, NTFS uses `FILE_ATTRIBUTE_COMPRESSED`; an inconclusive answer
+means "not compressed", which only restores the default order.
+
 `dedupe --cow` clones every member from the group keeper, and the keeper is the
 first file of the group in walk order. When that keeper is uncompressed, a
 compressed member comes out uncompressed: content and sharing are correct, the

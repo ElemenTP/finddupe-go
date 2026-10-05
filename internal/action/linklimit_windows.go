@@ -4,7 +4,10 @@ package action
 
 import (
 	"os"
-	"syscall"
+
+	"golang.org/x/sys/windows"
+
+	"finddupe/internal/wininfo"
 )
 
 // maxHardlinks is the hardlink limit per file on NTFS. It is checked because the
@@ -24,9 +27,9 @@ func hardlinkLimitReached(path string) bool {
 	}
 	defer f.Close()
 
-	var info syscall.ByHandleFileInformation
-	if err := syscall.GetFileInformationByHandle(syscall.Handle(f.Fd()), &info); err != nil {
+	info, infoErr := wininfo.FromHandle(windows.Handle(f.Fd()))
+	if infoErr != nil {
 		return false
 	}
-	return uint64(info.NumberOfLinks) >= maxHardlinks
+	return info.NumLinks >= maxHardlinks
 }

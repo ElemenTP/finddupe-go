@@ -4,7 +4,10 @@ package checksum
 
 import (
 	"os"
-	"syscall"
+
+	"golang.org/x/sys/windows"
+
+	"finddupe/internal/wininfo"
 )
 
 // statFile reads the file's size, modification time and physical identity. Size
@@ -17,18 +20,13 @@ func statFile(f *os.File) (fileStat, error) {
 		return fileStat{}, err
 	}
 
-	// os.FileInfo does not expose the volume serial number and NTFS file index,
-	// so those still come from the handle directly.
-	var handle syscall.ByHandleFileInformation
-	if hErr := syscall.GetFileInformationByHandle(syscall.Handle(f.Fd()), &handle); hErr != nil {
-		return fileStat{Size: info.Size(), ModTime: info.ModTime()}, nil
+	out := fileStat{Size: info.Size(), ModTime: info.ModTime()}
+	winInfo, infoErr := wininfo.FromHandle(windows.Handle(f.Fd()))
+	if infoErr != nil {
+		return out, nil
 	}
-
-	return fileStat{
-		Size:     info.Size(),
-		ModTime:  info.ModTime(),
-		Dev:      uint64(handle.VolumeSerialNumber),
-		Inode:    uint64(handle.FileIndexHigh)<<32 | uint64(handle.FileIndexLow),
-		NumLinks: uint64(handle.NumberOfLinks),
-	}, nil
+	out.Dev = winInfo.VolumeSerialNumber
+	out.Inode = winInfo.FileIndex
+	out.NumLinks = winInfo.NumLinks
+	return out, nil
 }

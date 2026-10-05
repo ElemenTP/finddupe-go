@@ -104,9 +104,12 @@ func query(path string) ([]Extent, error) {
 }
 
 // isUnsupportedWindowsErr reports whether the ioctl failed because the
-// filesystem does not support retrieval pointers.
+// filesystem does not support retrieval pointers. ERROR_INVALID_PARAMETER is
+// deliberately not in this list: it is also the answer to a malformed request,
+// and folding it in would hide a wrong buffer size or structure behind "this
+// filesystem does not support extents". Callers treat any query error as
+// "unavailable", so a rejected request still degrades gracefully.
 func isUnsupportedWindowsErr(err error) bool {
 	return errors.Is(err, windows.ERROR_INVALID_FUNCTION) ||
-		errors.Is(err, windows.ERROR_NOT_SUPPORTED) ||
-		errors.Is(err, windows.ERROR_INVALID_PARAMETER)
+		errors.Is(err, windows.ERROR_NOT_SUPPORTED)
 }

@@ -50,6 +50,13 @@ type Detector struct {
 	// policy orders the members of a content group; the first one is kept.
 	policy KeeperPolicy
 
+	// compressionProbe reports whether a file is stored compressed. When set, a
+	// compressed member is preferred as the keeper (a CoW clone inherits the
+	// source's layout, so the group stays compressed). It is the only I/O the
+	// detector performs, and only for the members of a content group; nil
+	// disables the preference.
+	compressionProbe func(FileInfo) bool
+
 	// finalKeys is the materialized, ordered list of groups NextFinal walks;
 	// finalIdx is the group it is working on.
 	finalKeys []GroupKey
@@ -136,6 +143,13 @@ func WithCoWDetect() Option {
 // WithKeeperPolicy replaces the keeper order used to pick the file that is kept.
 func WithKeeperPolicy(policy KeeperPolicy) Option {
 	return func(d *Detector) { d.policy = policy }
+}
+
+// WithCompressionPreference prefers a member whose content is stored compressed
+// as the keeper, ahead of the configured policy. probe is consulted once per
+// member of a content group.
+func WithCompressionPreference(probe func(FileInfo) bool) Option {
+	return func(d *Detector) { d.compressionProbe = probe }
 }
 
 // zeroSHA is the sentinel key for files whose SHA-256 has not been computed.
@@ -344,6 +358,27 @@ func (d *Detector) completeHashesLocked(key GroupKey, st *keyState, limit int) [
 	return execs
 }
 
+// orderMembersLocked sorts a content bucket's members into keeper order,
+// optionally preferring compressed content. The probe is consulted once per
+// member: sorting must not turn it into an I/O storm.
+func (d *Detector) orderMembersLocked(members []FileInfo) {
+	if d.compressionProbe == nil {
+		sort.Slice(members, func(i, j int) bool { return d.policy.Less(members[i], members[j]) })
+		return
+	}
+
+	compressed := make(map[string]bool, len(members))
+	for _, fi := range members {
+		compressed[fi.Path] = d.compressionProbe(fi)
+	}
+	sort.Slice(members, func(i, j int) bool {
+		if compressed[members[i].Path] != compressed[members[j].Path] {
+			return compressed[members[i].Path]
+		}
+		return d.policy.Less(members[i], members[j])
+	})
+}
+
 // decideLocked emits the end-of-scan work of one group in bounded batches. done
 // reports that every task of the group has been emitted.
 //
@@ -396,7 +431,7 @@ func (d *Detector) buildPlanLocked(st *keyState) []Execution {
 		// Order first, then collapse hardlinked aliases, so the surviving path of
 		// an inode is the one the policy prefers.
 		members := append([]FileInfo(nil), files...)
-		sort.Slice(members, func(i, j int) bool { return d.policy.Less(members[i], members[j]) })
+		d.orderMembersLocked(members)
 		members = dedupeByInode(members)
 		if len(members) < minGroupSize {
 			continue

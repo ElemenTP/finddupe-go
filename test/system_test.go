@@ -1574,3 +1574,21 @@ func countLinesContaining(text, substr string) int {
 
 // unused but kept for potential future use
 var _ = strconv.Itoa
+
+// TestDedupe_PreferCompressedRequiresCoW verifies the flag's contract: the clone
+// source decides the data layout, so the preference is meaningless (and rejected)
+// for the actions that do not rewrite data.
+func TestDedupe_PreferCompressedRequiresCoW(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	makeFile(t, dir, "a.bin", "prefer compressed")
+
+	_, stderr, code := run(t, "dedupe", "--delete", "--prefer-compressed", dir)
+	if code == 0 {
+		t.Fatal("expected --prefer-compressed with --delete to fail")
+	}
+	if !strings.Contains(stderr, "only applies to --cow") {
+		t.Fatalf("unexpected error: %s", stderr)
+	}
+}

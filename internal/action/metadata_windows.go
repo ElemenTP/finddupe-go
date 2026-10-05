@@ -6,6 +6,8 @@ import (
 	"os"
 
 	"golang.org/x/sys/windows"
+
+	"finddupe/internal/wininfo"
 )
 
 // preserveMetadata gives dst the metadata of src: file attributes, the security
@@ -59,7 +61,8 @@ func copySecurityInfo(dst, src string) {
 }
 
 // copyFileTimes copies the creation, last-access and last-write times of src
-// onto dst. Failures are ignored for the same reason as copySecurityInfo.
+// onto dst. Failures are ignored for the same reason as copySecurityInfo. The
+// source is opened read-only, so a read-only victim can still be read.
 func copyFileTimes(dst, src string) {
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -67,8 +70,8 @@ func copyFileTimes(dst, src string) {
 	}
 	defer srcFile.Close()
 
-	var info windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(windows.Handle(srcFile.Fd()), &info); err != nil {
+	info, infoErr := wininfo.FromHandle(windows.Handle(srcFile.Fd()))
+	if infoErr != nil {
 		return
 	}
 

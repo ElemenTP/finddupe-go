@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"finddupe/internal/dupe"
+	"finddupe/internal/fileid"
 )
 
 // Result holds either a successfully processed file or an error.
@@ -478,7 +479,9 @@ func (w *Walker) processFileEntry(
 	}
 
 	// Get device/inode identity and link count (platform-specific).
-	fi.Dev, fi.Inode, fi.NumLinks = getFileIdentity(path, info)
+	if dev, inode, links, ok := fileid.FromFileInfo(info); ok {
+		fi.Dev, fi.Inode, fi.NumLinks = dev, inode, links
+	}
 
 	// Send the result.
 	sendResult(ctx, ch, Result{Info: fi})
