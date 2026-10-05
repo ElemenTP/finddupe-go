@@ -270,6 +270,14 @@ Show $FD @("dedupe", "--cow", "--prefer-compressed", "--no-progress", $pc)
 if ($CD) { & $CD (Join-Path $pc "aa-compressed.bin") (Join-Path $pc "zz-plain.bin") 2>&1 | Write-Host } else { Write-Host "compressdump not found" }
 Write-Host "expect: on ReFS compression is unavailable, so --prefer-compressed changes nothing"
 
+$res = Join-Path $Dir "resident"
+New-Item -ItemType Directory -Force -Path $res | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $res "small.txt"), "tiny")
+Section "extentdump: a sub-cluster file (resident data on NTFS, no extents)"
+& $ED (Join-Path $res "small.txt") 2>&1 | Write-Host
+Write-Host "expect: no error and extents=0; a resident file has no mapping, which must not"
+Write-Host "        be reported as 'this filesystem does not support extents'"
+
 Write-Host ""
 Write-Host "================================================================"
 Write-Host "== probe finished; target directory kept at: $Dir"

@@ -113,6 +113,10 @@ Besides the CoW/compression scenarios, both scripts now end with:
   keeper and every member still reports `compressed=true`. On ReFS both are `false`:
   the flag is a no-op there.
 
+The Windows script also dumps a sub-cluster file, which NTFS stores resident: the
+expectation is `extents=0` without an error, because "no extents" and "this
+filesystem cannot report extents" are different answers.
+
 The Windows script asks `Get-Volume -FilePath` about the target path, so a volume
 mounted at a folder is described by its own filesystem rather than by the host drive
 letter. `darwinfiemap`'s summary prints `clamped-overruns=N`: a step whose kernel

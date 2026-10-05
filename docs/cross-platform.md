@@ -16,6 +16,8 @@ internal/
 ├── fileid/
 │   ├── fileid_unix.go     // //go:build unix      → Dev/Inode/NumLinks from stat
 │   └── fileid_other.go    // //go:build !unix     → "unknown"
+├── log2phys/
+│   └── log2phys_darwin.go // //go:build darwin    → struct log2phys, shared with the probe
 ├── extent/
 │   ├── query_linux.go     // //go:build linux    → FIEMAP
 │   ├── query_darwin.go    // //go:build darwin   → getattrlist ATTR_CMNEXT_CLONEID
