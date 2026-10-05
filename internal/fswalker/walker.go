@@ -218,10 +218,12 @@ func splitPattern(pattern string) (string, string) {
 		return pattern, "**"
 	}
 
-	// Find the last separator before the wildcard.
+	// Find the last separator before the wildcard. walkGlob is only ever called
+	// with an absolute pattern, so there always is one (an absolute path has a
+	// separator before its first metacharacter); the guard keeps a relative
+	// pattern from slicing out of range if that ever changes.
 	sepIdx := strings.LastIndexAny(pattern[:wildIdx], "/\\")
 	if sepIdx < 0 {
-		// Wildcard at the start (e.g., "*.txt" or "**/*.txt").
 		return ".", pattern
 	}
 

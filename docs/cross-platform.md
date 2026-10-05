@@ -294,14 +294,9 @@ For the group ratios there are two signals:
    uncompressed files (partial ratios included) and the APFS clone ID for
    decmpfs-compressed files (family-level: 100% or 0%).
 
-`extent.SharedBytes(a, b)` (pairwise overlap) is kept as a library helper:
-
-1. It sums the overlap of **non-encoded physical** ranges (the primary signal).
-2. If that yields nothing, it falls back to comparing the **logical** ranges of extents the filesystem marked `Shared` — needed for compressed btrfs, where physical offsets are not comparable.
-
 ### Compressed-btrfs Caveat
 
-On btrfs with compression, extents are reported as `Encoded`: their physical offsets and logical lengths cannot be compared directly, so the physical-identity path (`SharedWithGroup`) skips them. In-group detection then depends on the filesystem's `FIEMAP_EXTENT_SHARED` hint (`SharedFlagBytes`); if the kernel does not set that hint, two compressed clones may not be reported as sharing. The pairwise `SharedBytes` helper still offers its shared-logical-range fallback.
+On btrfs with compression, extents are reported as `Encoded`: their physical offsets and logical lengths cannot be compared directly, so the physical-identity path (`SharedWithGroup`) skips them. In-group detection then depends on the filesystem's `FIEMAP_EXTENT_SHARED` hint (`SharedFlagBytes`); if the kernel does not set that hint, two compressed clones may not be reported as sharing. Encoded extents are matched by their physical start instead, which covers aligned runs.
 
 ### Compression State and Clone Sources
 

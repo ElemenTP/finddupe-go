@@ -54,7 +54,8 @@ type Config struct {
 	// IncludeZeroLen includes zero-length files (skipped by default).
 	IncludeZeroLen bool
 
-	// IncludeReadonly operates on read-only files (dedupe mode, Windows).
+	// IncludeReadonly also operates on read-only files. Without it they are
+	// skipped, on every platform, because replacing one is not always permitted.
 	IncludeReadonly bool
 
 	// SkipHardlinked skips already-hardlinked duplicate pairs in find mode (--hardlink).

@@ -28,6 +28,14 @@ if (-not $Dir) {
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 $Dir = (Resolve-Path $Dir).Path
 
+# The probe deletes its own fixed-name subdirectories (independent, hardlink, ...)
+# when a section re-runs, so it must never work directly in a directory the user
+# pointed it at: those names could already hold real data. Everything goes into a
+# fresh private directory instead.
+$Dir = Join-Path $Dir ("finddupe-cow-probe-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+$Dir = (Resolve-Path $Dir).Path
+
 function Find-Bin([string]$name) {
     foreach ($d in @($PSScriptRoot, (Join-Path $PSScriptRoot "..\bin"))) {
         $p = Join-Path $d $name
@@ -78,14 +86,18 @@ Write-Host ("powershell " + $PSVersionTable.PSVersion)
 $qualifier = Split-Path -Qualifier $Dir
 $letter = $qualifier.TrimEnd(':')
 Write-Host "--- Get-Volume ---"
-Get-Volume -DriveLetter $letter | Format-List 2>&1 | Out-String | Write-Host
+# A volume mounted at a folder has no drive letter: the probe is diagnostic, so
+# report what is available instead of failing.
+$volume = $null
+if ($letter) { $volume = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue }
+if ($volume) { $volume | Format-List 2>&1 | Out-String | Write-Host } else { Write-Host "(no drive letter for $qualifier)" }
 Write-Host "--- fsutil fsinfo volumeinfo ---"
 & fsutil fsinfo volumeinfo "$qualifier" 2>&1 | Write-Host
 Write-Host "--- fsutil fsinfo refsinfo (ReFS only) ---"
 & fsutil fsinfo refsinfo "$qualifier" 2>&1 | Write-Host
 
-$fsType = (Get-Volume -DriveLetter $letter).FileSystem
-if ($fsType -ne "ReFS") {
+$fsType = if ($volume) { $volume.FileSystem } else { "" }
+if ($fsType -and $fsType -ne "ReFS") {
     Write-Warning "volume $qualifier is $fsType, not ReFS; block cloning is expected to be unsupported"
 } else {
     Write-Host "volume is ReFS: block cloning should be available"

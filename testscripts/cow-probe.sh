@@ -21,6 +21,17 @@ if [ -z "$DIR" ]; then
 else
 	mkdir -p "$DIR" || exit 1
 	DIR="$(cd "$DIR" && pwd)"
+
+	# The probe deletes its own fixed-name subdirectories (independent/, hardlink/,
+	# ...) when a section re-runs, so it must never work directly in a directory
+	# the user pointed it at: those names could already hold real data. Everything
+	# goes into a fresh private directory instead.
+	WORK="$(mktemp -d "$DIR/finddupe-cow-probe.XXXXXX")" || {
+		echo "cannot create a work directory in $DIR" >&2
+		exit 1
+	}
+	DIR="$WORK"
+	echo "Probe work directory: $DIR"
 fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -215,18 +226,18 @@ compress_file() {
 # APFS native compression is exposed through the SF_COMPRESSED flag (`ls -lO`
 # prints "compressed"), not as a readable com.apple.decmpfs xattr.
 is_compressed() {
-	ls -lO "$1" 2>/dev/null | grep -q compressed
+	# Only the flags column is inspected: a file whose *name* contains
+	# "compressed" must not be mistaken for a compressed file.
+	ls -lO "$1" 2>/dev/null | awk 'NR == 1 { next } { for (i = 5; i <= NF; i++) if ($i == "compressed") exit 0 } exit 1'
 }
 
 independent_copy "$CMP/src.bin" "$CMP/compA.bin"
 independent_copy "$CMP/src.bin" "$CMP/compB.bin"
 
-COMPRESSION="none"
 if [ "$OS" = "Darwin" ]; then
 	HOW_A="$(compress_file "$CMP/compA.bin" || true)"
 	HOW_B="$(compress_file "$CMP/compB.bin" || true)"
 	echo "--- compression: compA=[$HOW_A] compB=[$HOW_B] ---"
-	COMPRESSION="${HOW_A:-none}"
 	if is_compressed "$CMP/compA.bin"; then
 		echo "compA.bin is compressed: yes"
 	else

@@ -409,9 +409,21 @@ that should end up CoW-sharing. `CoWSharedBytes` is a per-file sum: each shared
 range is counted once per member, so it must not be read as physical bytes saved.
 Same-inode (hardlinked) aliases are not separate members.
 
+### What the `Dupes:` line counts
+
+`Dupes:` follows the *decision*, not the action: a pair whose content was verified
+identical counts as a duplicate even when the elimination was skipped (read-only,
+`--ref`, cross-device hardlink, NTFS link limit) or failed, because the duplicate
+storage is still there. Three outcomes are deliberately excluded: a pair that
+turned out to be the same inode (already hardlinked) or to already share all its
+extents (already shared) is not duplicate storage, and a pair whose decision was
+withdrawn because a file changed during the scan is not a duplicate any more. The
+action-specific counters (`N files deleted`, `N reference files skipped`, …) are
+reported separately, so both questions stay answerable.
+
 On filesystems without extent reporting `FileShared` stays nil: the group members
 are still listed, with a note that extent information is unavailable. The
-pairwise `extent.SharedBytes` (physical overlap, with a shared-logical fallback
+group-wide `extent.SharedWithGroup` (physical overlap, with a physical-start match
 for compressed btrfs) remains available as a library helper. See
 [cross-platform.md](cross-platform.md) for the per-platform ioctls.
 

@@ -67,9 +67,9 @@ func init() {
 	dedupeCmd.Flags().BoolVarP(&dedupeFlags.followSymlinks, "follow-symlinks", "j", false,
 		"Follow symbolic links and reparse points")
 	dedupeCmd.Flags().BoolVarP(&dedupeFlags.rdonly, "rdonly", "r", false,
-		"Also operate on read-only files (Windows)")
+		"Also operate on read-only files (skipped by default on every platform)")
 	dedupeCmd.Flags().IntVarP(&dedupeFlags.threads, "threads", "t", 0,
-		"Number of scanner workers (default: number of CPUs)")
+		"Number of scanner workers (default: 2 x CPUs, max 1024)")
 	dedupeCmd.Flags().StringArrayVar(&dedupeFlags.refPaths, "ref", nil,
 		"Protect this path: its files become the keeper of their content group and are never eliminated; repeatable")
 }

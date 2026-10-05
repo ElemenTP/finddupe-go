@@ -307,6 +307,19 @@ func TestDoExecution_DupeElim_Hardlink(t *testing.T) {
 	if !os.SameFile(ki, vi) {
 		t.Fatal("victim is not hardlinked to the keeper")
 	}
+
+	// The replacement goes through a temporary name; nothing may be left behind.
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 2 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("temporary file left behind: %v", names)
+	}
 }
 
 // TestDoExecution_DupeElim_Hardlink_LinkFailureKeepsVictim is the regression

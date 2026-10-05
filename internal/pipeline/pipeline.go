@@ -39,6 +39,11 @@ const (
 	// defaultThreadsPerCPU is the worker multiplier used when --threads is omitted.
 	defaultThreadsPerCPU = 2
 
+	// maxThreads caps --threads. Every worker owns pipeline channel slots and
+	// goroutines, so an absurd value would allocate its way to an out-of-memory
+	// kill before any work happened.
+	maxThreads = 1024
+
 	// minCompareFiles is the number of files a comparison/elimination execution needs.
 	minCompareFiles = 2
 
@@ -235,12 +240,13 @@ func resultPath(path string) string {
 	return quoted[1 : len(quoted)-1]
 }
 
-// resolveThreads applies the default worker count when none is configured.
+// resolveThreads applies the default worker count when none is configured and
+// caps the value at maxThreads.
 func resolveThreads(threads int) int {
 	if threads <= 0 {
 		return runtime.NumCPU() * defaultThreadsPerCPU
 	}
-	return threads
+	return min(threads, maxThreads)
 }
 
 // newLogger builds the stderr logger for the configured verbosity.
@@ -617,31 +623,33 @@ func reportElimination(
 	keeper := out.Files[0]
 	victim := out.Files[1]
 
+	// Duplicate accounting follows the decision, not the action: a pair whose
+	// content was verified identical is a duplicate even when the elimination was
+	// skipped or failed (read-only, reference, cross-device, link limit, error),
+	// because the duplicate storage is still there. The exceptions are the pairs
+	// that turned out to share storage already — the same inode (already
+	// hardlinked) or the same extents (already shared) — and the pairs whose
+	// decision was withdrawn because a file changed during the scan.
+	if countsAsDuplicateStorage(out.Result) {
+		stats.DuplicateFiles.Add(1)
+		stats.DuplicateBytes.Add(victim.Size)
+	}
+
 	switch out.Result {
 	case action.ResultVerifiedDuplicate:
 		report.printf("Duplicate: '%s'\n", resultPath(keeper.Path))
 		report.printf("With:      '%s'\n", resultPath(victim.Path))
-		stats.DuplicateFiles.Add(1)
-		stats.DuplicateBytes.Add(victim.Size)
 	case action.ResultDeleted:
 		report.printf("Deleted:    '%s'\n", resultPath(victim.Path))
-		stats.DuplicateFiles.Add(1)
-		stats.DuplicateBytes.Add(victim.Size)
 		stats.DeletedFiles.Add(1)
 	case action.ResultHardlinked:
 		report.printf("Hardlinked: '%s'\n", resultPath(victim.Path))
-		stats.DuplicateFiles.Add(1)
-		stats.DuplicateBytes.Add(victim.Size)
 		stats.HardlinkedFiles.Add(1)
 	case action.ResultCoWCloned:
 		report.printf("CoW cloned: '%s'\n", resultPath(victim.Path))
-		stats.DuplicateFiles.Add(1)
-		stats.DuplicateBytes.Add(victim.Size)
 		stats.CoWClonedFiles.Add(1)
 	case action.ResultSkippedRO:
 		report.printf("Skipping duplicate readonly file '%s'.\n", resultPath(victim.Path))
-		stats.DuplicateFiles.Add(1)
-		stats.DuplicateBytes.Add(victim.Size)
 		stats.SkippedROFiles.Add(1)
 	case action.ResultSkippedRef:
 		stats.SkippedRefFiles.Add(1)
@@ -667,9 +675,17 @@ func reportElimination(
 	case action.ResultError:
 		logger.ErrorContext(ctx, "action failed",
 			"keeper", keeper.Path, "victim", victim.Path, "error", out.Err)
-	case action.ResultNotDuplicate:
-		// Nothing to report.
 	}
+}
+
+// countsAsDuplicateStorage reports whether an outcome means duplicate storage is
+// still there. A pair that is the same inode or already shares all its extents
+// holds no second copy, and a pair whose decision was withdrawn because a file
+// changed is no longer a duplicate.
+func countsAsDuplicateStorage(result action.Result) bool {
+	return result != action.ResultAlreadyHardlinked &&
+		result != action.ResultAlreadyShared &&
+		result != action.ResultSkippedChanged
 }
 
 // reportCoW prints one identical-content group and, for every member, how much

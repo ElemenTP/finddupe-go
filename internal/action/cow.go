@@ -3,9 +3,8 @@ package action
 import (
 	"context"
 	"errors"
-	"fmt"
+	"io/fs"
 	"os"
-	"path/filepath"
 
 	"finddupe/internal/dupe"
 	"finddupe/internal/extent"
@@ -22,11 +21,11 @@ var ErrCoWNotSupported = errors.New("CoW clone not supported on this filesystem;
 // already established by the detector, so cloning anyway is safe and
 // idempotent. Uncertainty (unsupported filesystem, compressed extents) simply
 // results in a clone.
-func (e *Executor) cloneFile(ex dupe.Execution) (Result, error) {
+func (e *Executor) cloneFile(ex dupe.Execution, victimInfo os.FileInfo) (Result, error) {
 	keeper := ex.Files[0]
 	victim := ex.Files[1]
 
-	if isReadOnly(victim.Path) && !e.opts.IncludeReadonly {
+	if isReadOnly(victim.Path, victimInfo) && !e.opts.IncludeReadonly {
 		return ResultSkippedRO, nil
 	}
 
@@ -167,40 +166,25 @@ func groupSharedBytes(files []dupe.FileInfo, groupExtents [][]extent.Extent, use
 	return shared
 }
 
-// cloneReplace writes a CoW clone of src to a temporary file next to dst and
+// cloneReplace writes a CoW clone of src to a free temporary name next to dst and
 // atomically replaces dst with it. On any failure dst is left untouched.
 func cloneReplace(src, dst string) error {
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".finddupe-cow-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	if closeErr := tmp.Close(); closeErr != nil {
-		_ = os.Remove(tmpPath)
-		return closeErr
-	}
+	return withTemporaryName(dst, func(tmpPath string) error {
+		if cloneErr := clonePlatformFile(src, tmpPath); cloneErr != nil {
+			// A clone that failed after creating (part of) the file leaves it
+			// behind; a name collision belongs to someone else and is left alone.
+			if !errors.Is(cloneErr, fs.ErrExist) {
+				_ = os.Remove(tmpPath)
+			}
+			return cloneErr
+		}
 
-	// clonefile(2) requires the destination not to exist; the Linux and Windows
-	// block-clone implementations expect to create it themselves.
-	if removeErr := os.Remove(tmpPath); removeErr != nil {
-		return removeErr
-	}
-
-	if cloneErr := clonePlatformFile(src, tmpPath); cloneErr != nil {
-		_ = os.Remove(tmpPath)
-		return cloneErr
-	}
-
-	if metaErr := preserveVictimMetadata(tmpPath, dst); metaErr != nil {
-		_ = os.Remove(tmpPath)
-		return metaErr
-	}
-
-	if replaceErr := replaceFile(tmpPath, dst); replaceErr != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("replace %s: %w", dst, replaceErr)
-	}
-	return nil
+		if metaErr := preserveVictimMetadata(tmpPath, dst); metaErr != nil {
+			_ = os.Remove(tmpPath)
+			return metaErr
+		}
+		return nil
+	})
 }
 
 // preserveVictimMetadata gives the clone the victim's metadata — as much of it

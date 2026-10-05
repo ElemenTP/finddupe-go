@@ -107,20 +107,6 @@ type Extent struct {
 	Opaque bool
 }
 
-// SharedBytes returns the number of bytes that a and b map to the same physical
-// storage. Where the same physical range is claimed twice, the overlap is
-// counted once.
-//
-// The primary signal is the physical offset of non-encoded extents. When that
-// yields nothing (for example compressed btrfs extents) the logical ranges of
-// extents the filesystem itself marked as shared are compared instead.
-func SharedBytes(a, b []Extent) int64 {
-	if shared := rangeOverlap(a, b, physicalRange); shared > 0 {
-		return shared
-	}
-	return rangeOverlap(a, b, sharedLogicalRange)
-}
-
 // Equal reports whether two extent lists describe the same storage layout:
 // same count in the same logical order, with equal logical offset, physical
 // identity, and length.
@@ -359,40 +345,6 @@ func physicalRange(e Extent) (interval, bool) {
 		return interval{}, false
 	}
 	return interval{start: e.Physical, end: e.Physical + e.Length}, true
-}
-
-// sharedLogicalRange selects extents the filesystem marked as shared by their
-// logical offset.
-func sharedLogicalRange(e Extent) (interval, bool) {
-	if !e.Shared || e.Length == 0 {
-		return interval{}, false
-	}
-	return interval{start: e.Logical, end: e.Logical + e.Length}, true
-}
-
-// rangeOverlap sums the overlap of the ranges both sides map through key.
-func rangeOverlap(a, b []Extent, key rangeKey) int64 {
-	return overlapSum(collectRanges(a, key), collectRanges(b, key))
-}
-
-// overlapSum sums the overlap of two start-sorted interval lists.
-func overlapSum(a, b []interval) int64 {
-	var shared int64
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		lo := max(a[i].start, b[j].start)
-		hi := min(a[i].end, b[j].end)
-		if lo < hi {
-			shared += int64(hi - lo) //nolint:gosec // extent lengths are bounded by the file size
-		}
-
-		if a[i].end <= b[j].end {
-			i++
-		} else {
-			j++
-		}
-	}
-	return shared
 }
 
 // mergeIntervals returns the union of start-sorted half-open ranges, merging

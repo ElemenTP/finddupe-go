@@ -54,9 +54,6 @@ func (l *log2phys) contig() int64    { return int64(binary.LittleEndian.Uint64(l
 func (l *log2phys) devOffset() int64 { return int64(binary.LittleEndian.Uint64(l.raw[12:20])) }
 func (l *log2phys) hex() string      { return fmt.Sprintf("% x", l.raw[:]) }
 
-// errRange is ERANGE, which F_LOG2PHYS[_EXT] returns past the end of a file.
-const errRange = unix.ERANGE
-
 // maxSteps bounds enumeration so a pathological answer cannot loop forever.
 const maxSteps = 1 << 20
 
@@ -208,6 +205,8 @@ func enumerate(f *os.File, size, blksize int64, v variant, byContig bool) []step
 		})
 
 		if err != nil {
+			// ERANGE (the documented "past the end of the file" answer) and any
+			// other error end the walk here; the step above records the errno.
 			break
 		}
 

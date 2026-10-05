@@ -35,7 +35,7 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestComputeFileInfo_SizeChanged` | File no longer the scanned size → `dupe.ErrFileChanged` instead of a misleading signature |
 | `TestComputeFileInfo_ModTime` | `Info.ModTime` reports the file's modification time |
 
-### `internal/dupe` (Detector, 14 tests)
+### `internal/dupe` (Detector, 21 tests)
 
 | Test | Description |
 |------|-------------|
@@ -61,7 +61,7 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDetector_Empty` | Zero state: `Len()==0`, no inode groups, non-nil stats |
 | `TestDetector_SamePathInsertedTwice` | Inserting one path twice is ignored (overlapping patterns cannot self-eliminate) |
 
-### `internal/action` (25 tests)
+### `internal/action` (27 tests)
 
 | Test | Description |
 |------|-------------|
@@ -90,8 +90,10 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestHardlinkLimitReached` | The fresh limit check never refuses a normal or missing file |
 | `TestDoExecution_CoWClone_PreservesVictimMetadata` | A clone keeps the victim's mode, mtime and (where supported) extended attributes instead of the keeper's |
 | `TestDoExecution_SamePhysicalFile_UnknownIdentity` | Without a file index from the scan, two names for one file are still recognized (via `os.SameFile`) and left alone |
+| `TestDoExecution_DupeElim_SymlinkVictimSkipped` | A path that became a symlink after hashing is never acted on, even when its target still matches |
+| `TestDoExecution_CoWClone_PreservesReadOnlyVictimMetadata` | Regression: a read-only victim keeps its extended attributes (the final mode is applied after them) |
 
-### `internal/fswalker` (27 tests)
+### `internal/fswalker` (33 tests)
 
 | Test | Description |
 |------|-------------|
@@ -106,8 +108,14 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestWalk_ContextCancellation` | Cancelled context stops walk |
 | `TestWalk_FileInfoFields` | FileInfo populated correctly |
 | `TestWalk_MultiplePatterns` | Multiple patterns combined |
+| `TestWalk_MultipleRecursivePatterns` | Regression: the loop-prevention set is per pattern, so a second recursive pattern does not skip the first one's directories |
+| `TestWalk_GlobInDirectoryComponent` | `sub/*/x.txt` and `*/s1/*.txt` match (a wildcard directory component used to match nothing) |
+| `TestWalk_DoubleStarCollapse` | Repeated `**` behaves like a single one |
+| `TestWalk_ManyDoubleStarsTerminate` | Regression: eight `**` against a 40-component path finish quickly (the matcher used to backtrack exponentially) |
+| `TestWalk_PatternWithFilePathPrefix` | A pattern under a regular file matches nothing and is reported as a miss |
+| `TestWalk_NonDirectoryPrefixReportsError` | A prefix that cannot be stat'ed for a reason other than "missing" is still reported |
 | `TestWalk_SymlinkToFile_SkippedWithoutFollow` | Links are not reported unless `-j` |
-| `TestWalk_SymlinkToFile_FollowedUsesTargetMetadata` | Regression: a followed link reports the target's size, not the link length |
+| `TestWalk_SymlinkToFile_FollowedIsReportedAsTarget` | Regression: a followed link is reported under the target's path with the target's size, never as the link itself |
 | `TestWalk_SymlinkToDir_Followed` | `-j` walks a directory link exactly once, even when the target is in the tree |
 | `TestWalk_SymlinkDir_SkippedWithoutFollow` | A directory link is not descended into by default |
 | `TestWalk_SymlinkLoop_Terminates` | A link to an ancestor terminates |
@@ -132,11 +140,12 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestPool_WaitBlocks` | `Wait()` blocks until completion |
 | `TestPool_ZeroSize` | Size 0 → defaults to `runtime.NumCPU()` |
 
-### `internal/extent` (10 tests)
+### `internal/extent` (11 tests)
 
 | Test | Description |
 |------|-------------|
-| `TestSharedBytes` | Table test: partial/identical/disjoint/multiple overlaps, encoded extents ignored, shared-logical fallback |
+| `TestSharedWithGroupOverlap` | Table test: partial/identical/disjoint/multiple overlaps, encoded extents without a physical start ignored |
+| `TestQuery_SparseFileIsNotUnsupported` | Regression: a file with nothing allocated is "nothing shared", not "this filesystem is unsupported" |
 | `TestQuery_HardlinksShareExtents` | Two hardlinked 64KB files share every byte; skips if `ErrUnsupported` |
 | `TestQuery_LengthsClampedToFileSize` | Regression: extent lengths never run past EOF, so a sharing ratio cannot exceed 100% |
 | `TestAppendBatch` (linux only) | FIEMAP batch bookkeeping: which offset the next request starts from, so a non-advancing response cannot loop forever |
@@ -181,7 +190,7 @@ hardware by the CoW probe scripts.
 |------|-------------|
 | `TestIsTerminal` | A regular file is not a terminal, so redirected output never gets escape sequences |
 
-### `internal/pipeline` (5 tests)
+### `internal/pipeline` (6 tests)
 
 | Test | Description |
 |------|-------------|
@@ -216,9 +225,17 @@ Hardlink creation, content preservation, same-inode verification, read-only hand
 
 `TestDedupeCoW_Unsupported` (graceful failure when cloning is unavailable), `TestDedupeCoW_CreateAndDetect` (clone then detect the group; expects `CoW candidate group` and `shared: 100.0%`; conditionally `t.Skip`s when CoW is unsupported), `TestFind_CoW_IndependentCopiesZeroShared` (independent copies are still listed as a group, but at 0% shared), and `TestDedupe_CoW_PreservesHardlink` (an existing hardlink must not be broken by `dedupe --cow`).
 
-### Reference Paths (1 test)
+### Reference Paths (2 tests)
 
-`TestDedupe_RefKeptAndDuplicateRemoved` — the `--ref` file is kept and the non-reference duplicate is removed.
+`TestDedupe_RefKeptAndDuplicateRemoved` — the `--ref` file is kept and the non-reference duplicate is removed. `TestDedupe_RefKeepsLargeOriginal` is the regression test for files larger than the scan-time checksum window: the reference must still win the keeper choice (it used to arrive as a victim and leave the duplicate in place).
+
+### Symlinks (2 tests)
+
+`TestDedupe_SymlinksResolvedToTarget` (a followed link is scanned and acted upon as its target: `--hardlink` links the real inode and leaves the link alone) and `TestDedupe_DeleteSymlinkTargetNotLink` (the duplicate file is removed, never the link).
+
+### Keeper Determinism (1 test)
+
+`TestDedupe_KeeperIsDeterministic` — the same input keeps the same path over repeated runs, whatever order the hashes finish in.
 
 ### Hardlink Listing (1 test)
 

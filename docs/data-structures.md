@@ -254,7 +254,6 @@ const (
     ResultSkippedRO                       // Read-only file skipped
     ResultSkippedRef                      // Reference file skipped
     ResultHardlinkLimit                   // NTFS link limit reached
-    ResultNotDuplicate                    // Files differ (CRC collision)
     ResultError                           // Action failed
     ResultAlreadyShared                   // dedupe --cow: pair already shares all storage
     ResultSkippedChanged                  // A file changed after its content was hashed
@@ -281,7 +280,6 @@ type Extent struct {
 Helper functions:
 
 ```go
-func SharedBytes(a, b []Extent) int64                  // pairwise physical overlap
 func Equal(a, b []Extent) bool                         // identical, trusted layout
 func SharedFlagBytes(e []Extent) int64                 // bytes the FS marked Shared
 func SharedWithGroup(group [][]Extent) []int64             // per-member already-shared bytes
@@ -289,7 +287,6 @@ func SharedWithGroup(group [][]Extent) []int64             // per-member already
 
 - On macOS, `Physical` is the device byte offset from `fcntl(F_LOG2PHYS_EXT)`; for decmpfs-compressed files, where the kernel returns `ENOTSUP`, it is the APFS clone ID instead, marked `Opaque` (family-level identity, exact match only).
 - `SharedWithGroup` intersects physical ranges once for the whole group (a byte shared with several group members counts once); encoded and opaque extents fall back to an exact physical-start match.
-- `SharedBytes` is the original pairwise helper: it sums the overlap of non-encoded physical ranges and, when that yields nothing, falls back to the logical ranges of extents marked `Shared` (compressed btrfs).
 - `Equal` is a conservative "already sharing" fast path for `dedupe --cow`: true only when both lists are non-empty, have the same length in the same logical order, every pair has equal `Logical`/`Physical`/`Length`, and no `Physical` is 0. `Encoded` extents are compared too: exact start+length identity stays sound under compression (only range arithmetic is not). Anything else returns false, which merely means the clone is attempted.
 - `SharedFlagBytes` sums the lengths of extents the filesystem marked `Shared` (Linux `FIEMAP_EXTENT_SHARED`). It is a per-file signal: it says the extent is shared with someone, not with whom.
 - `SharedWithGroup` is used for in-group ratios on filesystems without a shared flag; it merges every member's physical ranges and sweeps them once over compressed coordinates, so a shared run split at different boundaries per file is still counted once and every member is answered in one pass. `Opaque` extents (the APFS clone ID for compressed files) are excluded from range arithmetic and compared by exact key only, since unrelated keys can be numerically adjacent.
@@ -301,7 +298,6 @@ func SharedWithGroup(group [][]Extent) []int64             // per-member already
 const BytesToChecksum = 32768 // First 32KB used for the weak signature
 
 // internal/action
-const MaxHardlinks = 1023    // Windows NTFS hardlink limit per file
 
 const (
     chunkSizeSmall       = 64 * 1024        // medium files: cheap early-stop

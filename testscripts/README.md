@@ -23,8 +23,10 @@ This writes `bin/cow-test/<platform>/` (and `.zip` if `zip` is installed):
 - `linux-amd64`, `darwin-amd64`, `darwin-arm64`, `windows-amd64`, `windows-arm64`
 - each contains `finddupe`, `extentdump`, the probe script, and this README
 
-Copy the bundle matching your machine to that machine. The probe only creates
-files inside the directory you give it.
+Copy the bundle matching your machine to that machine. The probe creates its
+files in a fresh `finddupe-cow-probe.<random>` subdirectory of the directory you
+give it (and never deletes anything outside that subdirectory), so it is safe to
+point at any writable location.
 
 ## macOS (APFS)
 

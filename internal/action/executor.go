@@ -17,9 +17,6 @@ import (
 	"finddupe/internal/dupe"
 )
 
-// MaxHardlinks is the maximum number of hardlinks per file on Windows NTFS.
-const MaxHardlinks = 1023
-
 const (
 	// chunkSizeSmall is used for medium files to make early-stop cheap.
 	chunkSizeSmall = 64 * 1024
@@ -47,7 +44,6 @@ const (
 	ResultSkippedRO
 	ResultSkippedRef
 	ResultHardlinkLimit
-	ResultNotDuplicate
 	ResultError
 
 	// ResultAlreadyShared means the keeper and victim already share all their
@@ -123,7 +119,10 @@ func chunkSizeFor(fileSize int64) int64 {
 	}
 }
 
-// hashBufferSize returns the read buffer size for a full-file hash.
+// hashBufferSize returns the read buffer size for a full-file hash. It is a
+// different question from chunkSizeFor: a comparison wants small chunks so that a
+// mismatch is found early, while a full hash only wants to minimise syscalls, so
+// everything up to 1 MiB is read in one go.
 func hashBufferSize(fileSize int64) int64 {
 	if fileSize <= chunkSizeLarge {
 		return chunkSizeSmall
@@ -270,8 +269,9 @@ func (e *Executor) hashCalc(ctx context.Context, fi dupe.FileInfo) (dupe.FileInf
 		if readErr != nil {
 			storeHashState(&fi, h)
 			if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
-				// The file shrank: do not claim a complete hash.
-				return fi, nil
+				// The file shrank: do not claim a complete hash, and report it so
+				// the file is counted and retried instead of silently dropped.
+				return fi, fmt.Errorf("file shrank while hashing: %w", dupe.ErrFileChanged)
 			}
 			return fi, readErr
 		}
@@ -286,8 +286,6 @@ func (e *Executor) hashCalc(ctx context.Context, fi dupe.FileInfo) (dupe.FileInf
 // hashCompare reads two files chunk by chunk, updating SHA-256 hashers and
 // comparing accumulated hashes after each chunk for early-stop. Saved hash state
 // is resumed if available.
-//
-//nolint:funlen // the chunk loop is one linear pass: read, compare, resume state
 func hashCompare(
 	ctx context.Context, orig, cand dupe.FileInfo, chunkSize int64,
 ) (dupe.FileInfo, dupe.FileInfo, error) {
@@ -341,18 +339,16 @@ func hashCompare(
 
 		toRead := min(chunkSize, remaining)
 
-		nOrig, _ := io.ReadFull(fOrig, bufOrig[:toRead])
-		nCand, _ := io.ReadFull(fCand, bufCand[:toRead])
+		nOrig, nCand, readErr := readCompareChunk(fOrig, fCand, bufOrig[:toRead], bufCand[:toRead])
+		if readErr != nil {
+			return orig, cand, readErr
+		}
 
-		if nOrig == 0 || nCand == 0 || nOrig != nCand {
-			// Truncated file(s) — not a duplicate. Feed whatever was read into
-			// the digests before recording the offsets: advancing HashOffset
-			// without the matching bytes would make a later resume compute a
-			// digest of the wrong content.
-			hOrig.Write(bufOrig[:nOrig])
-			hCand.Write(bufCand[:nCand])
-			orig, cand = storePartialState(orig, hOrig, int64(nOrig), cand, hCand, int64(nCand))
-			return orig, cand, nil
+		if nOrig != nCand {
+			// One of the files changed length under us. They cannot be duplicates
+			// and no resume state is recorded: the two offsets would no longer
+			// describe prefixes of the same length.
+			return orig, cand, fmt.Errorf("file changed while comparing: %w", dupe.ErrFileChanged)
 		}
 
 		hOrig.Write(bufOrig[:nOrig])
@@ -374,6 +370,22 @@ func hashCompare(
 	orig.HashState = nil // no longer needed, SHA-256 is complete
 	cand.HashState = nil
 	return orig, cand, nil
+}
+
+// readCompareChunk reads one chunk from both files. A short read is not an error
+// here: the caller detects the length mismatch from the two counts, while a real
+// read failure must not be mistaken for one of the files ending early.
+func readCompareChunk(fOrig, fCand *os.File, bufOrig, bufCand []byte) (int, int, error) {
+	nOrig, errOrig := io.ReadFull(fOrig, bufOrig)
+	nCand, errCand := io.ReadFull(fCand, bufCand)
+
+	for _, err := range []error{errOrig, errCand} {
+		if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			continue
+		}
+		return nOrig, nCand, err
+	}
+	return nOrig, nCand, nil
 }
 
 // execute performs the configured action on the duplicate file.
@@ -404,29 +416,35 @@ func (e *Executor) execute(ctx context.Context, ex dupe.Execution) (Result, erro
 		return ResultSkippedRef, nil
 	}
 
+	// The duplicate decision was made from metadata captured during the scan;
+	// re-check it before touching anything, so a file that changed (or was
+	// replaced) since is never eliminated against a stale hash. The stats are
+	// handed to the actions below, which need the victim's mode for the
+	// read-only decision.
+	var victimInfo os.FileInfo
 	if e.opts.Action != config.ActionReport {
-		// The duplicate decision was made from metadata captured during the
-		// scan; re-check it before touching anything, so a file that changed
-		// (or was replaced) since is never eliminated against a stale hash.
-		if !unchanged(keeper) || !unchanged(victim) {
+		_, keeperOK := unchanged(keeper)
+		victimStat, victimOK := unchanged(victim)
+		if !keeperOK || !victimOK {
 			return ResultSkippedChanged, nil
 		}
+		victimInfo = victimStat
 	}
 
 	switch e.opts.Action {
 	case config.ActionReport:
 		return ResultVerifiedDuplicate, nil
 	case config.ActionDelete:
-		return e.deleteFile(ex)
+		return e.deleteFile(ex, victimInfo)
 	case config.ActionHardlink:
 		if !sameDevice(keeper, victim) {
 			return ResultSkippedCrossDevice, nil
 		}
-		return e.createHardlink(ex)
+		return e.createHardlink(ex, victimInfo)
 	case config.ActionCoWClone:
-		return e.cloneFile(ex)
+		return e.cloneFile(ex, victimInfo)
 	default:
-		return ResultNotDuplicate, nil
+		return ResultError, fmt.Errorf("unknown action %v", e.opts.Action)
 	}
 }
 
@@ -438,7 +456,8 @@ func sameDevice(a, b dupe.FileInfo) bool {
 }
 
 // unchanged reports whether the path still refers to the same regular file that
-// was hashed, by size and modification time. A record without a modification
+// was hashed, by size and modification time, and returns the stat it read so the
+// action that follows needs no second lookup. A record without a modification
 // time (for example a FileInfo built by a caller that never read the file)
 // cannot be verified and is accepted as-is.
 //
@@ -446,20 +465,20 @@ func sameDevice(a, b dupe.FileInfo) bool {
 // a device, socket or directory) must never be acted upon. [os.Link] on a link
 // path would link the symlink itself and [os.Remove] would delete the link,
 // neither of which touches the duplicate the decision was made about.
-func unchanged(fi dupe.FileInfo) bool {
+func unchanged(fi dupe.FileInfo) (os.FileInfo, bool) {
 	info, err := os.Lstat(fi.Path)
 	if err != nil {
 		// An unverifiable record is accepted (the action itself reports any
 		// failure); a record that did carry a modification time must not be.
-		return fi.ModTime.IsZero()
+		return nil, fi.ModTime.IsZero()
 	}
 	if !info.Mode().IsRegular() {
-		return false
+		return nil, false
 	}
 	if fi.ModTime.IsZero() {
-		return true
+		return info, true
 	}
-	return info.Size() == fi.Size && info.ModTime().Equal(fi.ModTime)
+	return info, info.Size() == fi.Size && info.ModTime().Equal(fi.ModTime)
 }
 
 // ensurePairUnchanged verifies that both files of a comparison still match the

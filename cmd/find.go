@@ -56,7 +56,7 @@ func init() {
 	findCmd.Flags().BoolVarP(&findFlags.followSymlinks, "follow-symlinks", "j", false,
 		"Follow symbolic links and reparse points")
 	findCmd.Flags().IntVarP(&findFlags.threads, "threads", "t", 0,
-		"Number of scanner workers (default: number of CPUs)")
+		"Number of scanner workers (default: 2 x CPUs, max 1024)")
 	findCmd.Flags().StringArrayVar(&findFlags.refPaths, "ref", nil,
 		"Protect this path: its files become the keeper of their content group and are never eliminated; repeatable")
 }

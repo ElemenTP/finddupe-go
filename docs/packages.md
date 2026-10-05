@@ -41,7 +41,7 @@ finddupe-go/
 │   │   ├── replace_unix.go    # Unix: atomic os.Rename
 │   │   └── replace_windows.go # Windows: MoveFileEx(REPLACE_EXISTING)
 │   ├── extent/                # Physical extent query for CoW detection
-│   │   ├── extent.go          # Extent, SharedBytes, Equal, SharedFlagBytes, SharedWithGroup
+│   │   ├── extent.go          # Extent, Equal, SharedFlagBytes, SharedWithGroup
 │   │   ├── query_linux.go     # Linux: FS_IOC_FIEMAP
 │   │   ├── query_darwin.go    # macOS: F_LOG2PHYS_EXT (libSystem), clone ID fallback
 │   │   ├── query_windows.go   # Windows: FSCTL_GET_RETRIEVAL_POINTERS
@@ -213,7 +213,7 @@ type Outcome struct {
 
 **Link/clone helpers**: `linkReplace` (hardlink under a temporary name, then atomic rename), `hardlinkLimitReached` (per OS: re-reads the link count on Windows, defers to the filesystem on Unix), `cloneReplace` (shared orchestration), `alreadyShared` (same physical file or, on the same device, `extent.Equal` → `ResultAlreadyShared`), `copyTailAt` (the unaligned tail of a block clone), `clonePlatformFile` (per OS), `replaceFile` (per OS), `preserveMetadata` (per OS: restores as much of the victim's metadata as the platform allows), `ErrCoWNotSupported`.
 
-**Action results**: `ResultVerifiedDuplicate`, `ResultAlreadyHardlinked`, `ResultDeleted`, `ResultHardlinked`, `ResultCoWCloned`, `ResultSkippedRO`, `ResultSkippedRef`, `ResultSkippedChanged`, `ResultSkippedCrossDevice`, `ResultHardlinkLimit`, `ResultNotDuplicate`, `ResultError`, `ResultAlreadyShared`
+**Action results**: `ResultVerifiedDuplicate`, `ResultAlreadyHardlinked`, `ResultDeleted`, `ResultHardlinked`, `ResultCoWCloned`, `ResultSkippedRO`, `ResultSkippedRef`, `ResultSkippedChanged`, `ResultSkippedCrossDevice`, `ResultHardlinkLimit`, `ResultError`, `ResultAlreadyShared`
 
 **Dependencies**: `internal/dupe`, `internal/config`, `internal/extent`, `golang.org/x/sys` (CoW ioctls)
 
@@ -255,7 +255,6 @@ type Extent struct {
 }
 
 func Query(path string, size int64) ([]Extent, error)
-func SharedBytes(a, b []Extent) int64
 func Equal(a, b []Extent) bool
 func SharedFlagBytes(e []Extent) int64
 func SharedWithGroup(group [][]Extent) []int64
@@ -264,7 +263,7 @@ func Supported() bool
 
 **Platform implementations**: Linux FIEMAP (`FS_IOC_FIEMAP`), macOS `fcntl(F_LOG2PHYS_EXT)` through the libSystem wrapper (`unix.FcntlInt`) with a `getattrlist(ATTR_CMNEXT_CLONEID)` fallback for decmpfs-compressed files, Windows `FSCTL_GET_RETRIEVAL_POINTERS`; other platforms return `ErrUnsupported`.
 
-**Helpers**: `Query` takes the file size the caller already knows, so it needs no stat of its own. `SharedBytes` is the pairwise physical-overlap helper (falling back to shared logical ranges for compressed btrfs). `Equal` is the conservative already-sharing fast path for `dedupe --cow`. `SharedFlagBytes` sums extents the filesystem marked `Shared` (a per-file signal). `SharedWithGroup` answers the already-shared bytes of every member of one content group in a single O(M log M) sweep; it is what `find --cow` reports, and it replaced a per-member "union of all the others" that cost O(n²).
+**Helpers**: `Query` takes the file size the caller already knows, so it needs no stat of its own. `Equal` is the conservative already-sharing fast path for `dedupe --cow`. `SharedFlagBytes` sums extents the filesystem marked `Shared` (a per-file signal). `SharedWithGroup` answers the already-shared bytes of every member of one content group in a single O(M log M) sweep; it is what `find --cow` reports, and it replaced a per-member "union of all the others" that cost O(n²).
 
 **Dependencies**: `golang.org/x/sys` (Unix/Windows syscalls)
 

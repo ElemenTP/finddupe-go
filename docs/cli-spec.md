@@ -33,7 +33,7 @@ Scans the specified paths/patterns for duplicate files and reports them. No file
 | `--zero` | `-z` | bool | false | Include zero-length files (skipped by default) |
 | `--no-progress` | `-p` | bool | false | Hide the progress indicator |
 | `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points: they are resolved and scanned as their target, under the target's own path |
-| `--threads` | `-t` | int | `0` (→ `runtime.NumCPU() × 2`) | Number of scanner workers |
+| `--threads` | `-t` | int | `0` (→ `runtime.NumCPU() × 2`, capped at 1024) | Number of scanner workers |
 | `--ref` | — | string (repeatable) | — | Consume the following path/pattern as a reference (compare against, but never act on). Can be repeated. |
 
 `--hardlink`, `--listlink`, and `--cow` are **mutually exclusive**. Selecting more than one fails with:
@@ -172,7 +172,7 @@ Exactly one action flag must be specified for `dedupe` mode:
 | `--zero` | `-z` | bool | false | Include zero-length files |
 | `--no-progress` | `-p` | bool | false | Hide the progress indicator |
 | `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points: they are resolved and scanned as their target, under the target's own path |
-| `--threads` | `-t` | int | `0` (→ `runtime.NumCPU() × 2`) | Number of scanner workers |
+| `--threads` | `-t` | int | `0` (→ `runtime.NumCPU() × 2`, capped at 1024) | Number of scanner workers |
 | `--rdonly` | `-r` | bool | false | Also operate on read-only files (Windows) |
 | `--ref` | — | string (repeatable) | — | Consume the following path/pattern as a reference (compare against, but never act on) |
 
@@ -240,7 +240,7 @@ CPUs: 16
    - `dedupe --hardlink` (`-H`): replace duplicates by creating hardlinks to the original
 5. **Paths are required**: at least one path/pattern argument must be provided
 6. **Ref paths**: `--ref <path>` consumes the next argument and can be repeated
-7. **Threads**: `--threads 0` (the default) uses `runtime.NumCPU() × 2` workers; negative values are also treated as the default
+7. **Threads**: `--threads 0` (the default) uses `runtime.NumCPU() × 2` workers; negative values are also treated as the default, and the value is capped at 1024 (each worker owns pipeline slots and goroutines)
 8. **Reference files are never eliminated**: a reference duplicate is reported as skipped, even in `dedupe` mode
 
 ## Global Flags

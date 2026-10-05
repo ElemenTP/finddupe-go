@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -50,8 +51,10 @@ func ClusterSize(path string) (uint64, error) {
 		uintptr(unsafe.Pointer(&totalClusters)),
 	)
 	if r1 == 0 {
-		if callErr != nil {
-			return 0, callErr
+		// LazyProc.Call always returns a non-nil error, so it is the errno that
+		// says whether the call failed or merely reported zero.
+		if errno, ok := callErr.(syscall.Errno); ok && errno != 0 {
+			return 0, errno
 		}
 		return 0, errors.New("GetDiskFreeSpaceW failed")
 	}

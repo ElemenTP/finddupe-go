@@ -10,7 +10,9 @@ import (
 	"finddupe/internal/extent"
 )
 
-func TestSharedBytes(t *testing.T) {
+// TestSharedWithGroupOverlap covers the physical-range arithmetic of the group
+// helper: how much of the first member the second one covers.
+func TestSharedWithGroupOverlap(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -49,24 +51,19 @@ func TestSharedBytes(t *testing.T) {
 			want: 60,
 		},
 		{
-			name: "encoded independent extents are ignored",
+			name: "encoded extents without a physical start are ignored",
 			a:    []extent.Extent{{Logical: 0, Length: 100, Encoded: true}},
 			b:    []extent.Extent{{Logical: 0, Length: 100, Encoded: true}},
 			want: 0,
-		},
-		{
-			name: "shared logical fallback for encoded extents",
-			a:    []extent.Extent{{Logical: 0, Length: 100, Encoded: true, Shared: true}},
-			b:    []extent.Extent{{Logical: 0, Length: 100, Encoded: true, Shared: true}},
-			want: 100,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := extent.SharedBytes(tc.a, tc.b); got != tc.want {
-				t.Fatalf("SharedBytes = %d, want %d", got, tc.want)
+			got := extent.SharedWithGroup([][]extent.Extent{tc.a, tc.b})
+			if len(got) != 2 || got[0] != tc.want {
+				t.Fatalf("SharedWithGroup = %v, want first member %d", got, tc.want)
 			}
 		})
 	}
@@ -194,8 +191,8 @@ func TestQuery_HardlinksShareExtents(t *testing.T) {
 	a := queryOrSkip(t, orig)
 	b := queryOrSkip(t, link)
 
-	if got := extent.SharedBytes(a, b); got != int64(len(data)) {
-		t.Fatalf("hardlinked files share %d bytes, want %d", got, len(data))
+	if got := extent.SharedWithGroup([][]extent.Extent{a, b}); got[0] != int64(len(data)) {
+		t.Fatalf("hardlinked files share %d bytes, want %d", got[0], len(data))
 	}
 }
 
@@ -217,8 +214,8 @@ func TestQuery_IndependentCopiesShareNothing(t *testing.T) {
 	ea := queryOrSkip(t, a)
 	eb := queryOrSkip(t, b)
 
-	if got := extent.SharedBytes(ea, eb); got != 0 {
-		t.Fatalf("independent copies share %d bytes, want 0", got)
+	if got := extent.SharedWithGroup([][]extent.Extent{ea, eb}); got[0] != 0 {
+		t.Fatalf("independent copies share %d bytes, want 0", got[0])
 	}
 }
 

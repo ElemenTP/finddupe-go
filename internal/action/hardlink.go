@@ -19,7 +19,7 @@ import (
 // Hard links share the keeper's inode and therefore its permissions and
 // timestamps. The victim's own metadata cannot be preserved and is not
 // restored: doing so would silently rewrite the keeper's metadata as well.
-func (e *Executor) createHardlink(ex dupe.Execution) (Result, error) {
+func (e *Executor) createHardlink(ex dupe.Execution, victimInfo os.FileInfo) (Result, error) {
 	keeper := ex.Files[0]
 	victim := ex.Files[1]
 
@@ -30,25 +30,21 @@ func (e *Executor) createHardlink(ex dupe.Execution) (Result, error) {
 		return ResultHardlinkLimit, nil
 	}
 
-	// Check if candidate is read-only.
-	readOnly := isReadOnly(victim.Path)
-	if readOnly && !e.opts.IncludeReadonly {
+	if isReadOnly(victim.Path, victimInfo) && !e.opts.IncludeReadonly {
 		return ResultSkippedRO, nil
 	}
 
 	// Windows refuses to replace a read-only file; clear the write protection
-	// before the rename (same requirement as the CoW replacement).
-	if readOnly {
-		info, statErr := os.Stat(victim.Path)
-		if statErr != nil {
-			return ResultError, statErr
-		}
-		if chmodErr := os.Chmod(victim.Path, info.Mode()|0o200); chmodErr != nil {
-			return ResultError, chmodErr
-		}
+	// before the rename.
+	changed, protectErr := clearWriteProtection(victim.Path, victimInfo)
+	if protectErr != nil {
+		return ResultError, protectErr
 	}
 
 	if err := linkReplace(keeper.Path, victim.Path); err != nil {
+		// The victim is untouched (the link is made under a temporary name and
+		// only renamed over it on success): put its mode back.
+		restoreWriteProtection(victim.Path, victimInfo, changed)
 		return ResultError, err
 	}
 
