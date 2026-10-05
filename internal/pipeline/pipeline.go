@@ -100,15 +100,10 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		close(outcomeCh)
 	}()
 
-	// The coordinator owns the detector and decides when work is finished.
-	// In CoW-detect mode, after the input is drained, it emits one CoWDetect
-	// execution per identical-content group.
-	var final func() []dupe.Execution
-	if cfg.CoWDetect {
-		final = func() []dupe.Execution { return cowGroupExecutions(detector) }
-	}
-
-	err := coordinate(ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh, final)
+	// The coordinator owns the detector and decides when work is finished: once
+	// the input is drained it asks the detector for the elimination (or CoW
+	// detection) work of every content group it has found.
+	err := coordinate(ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh, detector.NextFinal)
 
 	stopProgress()
 	printSummary(stats)
@@ -198,23 +193,6 @@ func resultPath(path string) string {
 	}
 	quoted := strconv.Quote(path)
 	return quoted[1 : len(quoted)-1]
-}
-
-// cowGroupExecutions turns the detector's identical-content groups into
-// CoWDetect executions, one per group, in canonical order.
-func cowGroupExecutions(detector *dupe.Detector) []dupe.Execution {
-	groups := detector.CoWGroups()
-	sortGroups(groups)
-	execs := make([]dupe.Execution, 0, len(groups))
-
-	for _, group := range groups {
-		execs = append(execs, dupe.Execution{
-			Key:   dupe.GroupKey{Signature: group[0].Signature, Size: group[0].Size},
-			Type:  dupe.CoWDetect,
-			Files: group,
-		})
-	}
-	return execs
 }
 
 // resolveThreads applies the default worker count when none is configured.
@@ -399,7 +377,7 @@ type coordinator struct {
 	stats       *dupe.Stats
 	logger      *slog.Logger
 	executionCh chan<- dupe.Execution
-	final       func() []dupe.Execution
+	final       func(limit int) ([]dupe.Execution, bool)
 	finalDone   bool
 	pending     []dupe.Execution
 	inFlight    int
@@ -407,9 +385,11 @@ type coordinator struct {
 }
 
 // coordinate runs the coordinator loop until the input and all executor
-// outcomes are drained. final, when non-nil, is called once after the input is
-// drained and no work is in flight, to produce any last batch of work (the CoW
-// groups).
+// outcomes are drained. final is called whenever the input is drained and no
+// work is in flight; it returns the next batch of end-of-scan work and whether
+// the detector is finished. It may be called repeatedly, because completing the
+// hash of a file that an early-stopped comparison left behind can reveal further
+// duplicates in its group.
 //
 // The loop never sends on the execution channel from outside the select, so it
 // cannot block there while outcomes wait to be read. Blocking sends in the
@@ -425,7 +405,7 @@ func coordinate(
 	fileInfoCh <-chan dupe.FileInfo,
 	executionCh chan<- dupe.Execution,
 	outcomeCh <-chan action.Outcome,
-	final func() []dupe.Execution,
+	final func(limit int) ([]dupe.Execution, bool),
 ) error {
 	c := &coordinator{
 		ctx:         ctx,
@@ -475,7 +455,7 @@ func coordinate(
 				outCh = nil
 			} else {
 				reportOutcome(ctx, out, c.stats, c.logger)
-				c.pending = append(c.pending, completeExecution(c.detector, out)...)
+				completeExecution(c.detector, out)
 				c.inFlight--
 			}
 
@@ -485,18 +465,21 @@ func coordinate(
 		}
 
 		// Once the input is drained and nothing is queued or in flight, the
-		// detector state is final: emit the one-shot batch (CoW groups) and, when
-		// that produced nothing, close the execution channel.
-		if fiCh == nil && len(c.pending) == 0 && c.inFlight == 0 {
-			if !c.finalDone {
+		// detector state is final: ask it for end-of-scan work, in bounded
+		// batches, until it reports that nothing is left. The queue bound applies
+		// here too, so a scan with millions of duplicates never materializes all
+		// elimination tasks at once.
+		if fiCh == nil && len(c.pending) == 0 && c.inFlight == 0 && !c.finalDone {
+			if c.final == nil {
 				c.finalDone = true
-				if c.final != nil {
-					c.pending = append(c.pending, c.final()...)
-				}
+			} else {
+				execs, done := c.final(backlogLimit)
+				c.pending = append(c.pending, execs...)
+				c.finalDone = done && len(c.pending) == 0
 			}
-			if len(c.pending) == 0 {
-				c.closeExec()
-			}
+		}
+		if c.finalDone && len(c.pending) == 0 {
+			c.closeExec()
 		}
 	}
 
@@ -511,24 +494,23 @@ func (c *coordinator) closeExec() {
 	}
 }
 
-// completeExecution feeds an executor outcome back into the detector and
-// returns the follow-up work it produced.
-func completeExecution(detector *dupe.Detector, out action.Outcome) []dupe.Execution {
+// completeExecution feeds an executor outcome back into the detector. The
+// error travels with it: a hash that could not be completed leaves the file
+// unverified, and a comparison that failed must not be mistaken for proof that
+// its two files differ.
+func completeExecution(detector *dupe.Detector, out action.Outcome) {
 	switch out.Kind {
 	case dupe.HashCalc:
 		if len(out.Files) < 1 {
-			return nil
+			return
 		}
-		return detector.OnHashDone(out.Key, out.Files[0])
+		detector.OnHashDone(out.Key, out.Files[0], out.Err != nil)
 	case dupe.HashComp:
 		if len(out.Files) < minCompareFiles {
-			return nil
+			return
 		}
-		return detector.OnCompareDone(out.Key, out.Files[0], out.Files[1])
+		detector.OnCompareDone(out.Key, out.Files[0], out.Files[1], out.Err != nil)
 	case dupe.DupeElim, dupe.CoWDetect:
-		return nil
-	default:
-		return nil
 	}
 }
 

@@ -116,7 +116,7 @@ find mode:
 | `-v, --verbose` | Verbose output |
 | `-z, --zero` | Include zero-length files |
 | `-p, --no-progress` | Hide progress indicator |
-| `-j, --follow-symlinks` | Follow symbolic links (resolved to their target) |
+| `-j, --follow-symlinks` | Follow symbolic links: each link is resolved and scanned as its target (reported under the target's path) |
 | `-t <n>, --threads <n>` | Number of worker threads (default: CPU count × 2) |
 | `--ref <path>` | Mark the next path/pattern as reference (compare against, never act on); repeatable |
 
@@ -133,7 +133,7 @@ dedupe mode (exactly one action is required):
 | `-v, --verbose` | Verbose output |
 | `-z, --zero` | Include zero length files |
 | `-p, --no-progress` | Hide progress indicator |
-| `-j, --follow-symlinks` | Follow symbolic links (resolved to their target) |
+| `-j, --follow-symlinks` | Follow symbolic links: each link is resolved and scanned as its target (reported under the target's path) |
 | `-t <n>, --threads <n>` | Number of worker threads (default: CPU count × 2) |
 | `--ref <path>` | Mark the next path/pattern as reference files (not to be eliminated); repeatable |
 

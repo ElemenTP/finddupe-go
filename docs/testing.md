@@ -42,14 +42,21 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDetector_FirstInsert` | First file → no executions; stats updated |
 | `TestDetector_TwoUnhashedFiles_EmitHashComp` | Exactly two unhashed files → one `HashComp` |
 | `TestDetector_ThirdUnhashedFile_EmitHashCalc` | Third unhashed file → `HashCalc` for the new file only |
-| `TestDetector_KnownShaMatch_EmitDupeElim` | Known matching SHA-256 → `DupeElim` keeper/victim |
-| `TestDetector_KnownShaMismatch_NoExec` | Known different SHA-256 → no work |
-| `TestDetector_ThreeIdenticalFiles_AllReported` | Regression: 4 identical files → exactly 3 eliminations, one keeper |
-| `TestDetector_NoDoubleElimination` | A scheduled victim is never handed out twice |
-| `TestDetector_PartialProgressPreserved` | Early-stop state carried into a later `HashCalc` |
+| `TestDetector_KnownShaMatch_DeferredToFinal` | A matching SHA-256 is decided by `NextFinal`, not during the scan |
+| `TestDetector_KnownShaMismatch_NoExec` | Different SHA-256 in one group → no work (only a bucket's members are duplicates) |
+| `TestDetector_ThreeIdenticalFiles_AllReported` | Three identical files → two eliminations, one keeper, no victim twice |
+| `TestDetector_EarlyStoppedCompareIsCompleted` | Regression: files stranded by an early-stopped comparison are hashed by `NextFinal`, so a duplicate against a later-finished file is found |
+| `TestDetector_SettledPairNotHashed` | A two-file comparison that proved a difference needs no hashing |
+| `TestDetector_FailedCompareIsRetried` | A comparison that could not run leads to a hash attempt, and unhashable files stop being retried |
+| `TestDetector_KeeperPolicyPrefersReference` | A reference wins the keeper choice even when it was inserted last |
+| `TestDetector_KeeperPolicyPrefersMoreHardlinks` | The victim is the file whose removal actually frees storage |
+| `TestDetector_KeeperPolicyIsStableRegardlessOfInsertOrder` | Same keeper for either insertion order |
+| `TestDetector_CustomKeeperPolicy` | `WithKeeperPolicy` replaces the built-in order |
+| `TestDetector_FinalBatchesAreBounded` | A large group is emitted over several bounded `NextFinal` calls |
 | `TestDetector_PartialProgressKeepsLargerOffset` | The most advanced partial offset wins |
-| `TestDetector_CRCCollisionSeparatesBuckets` | Different SHA-256 buckets → matched against the right keeper |
-| `TestDetector_CoWDetectMode` | `WithCoWDetect()` emits no per-pair work and never schedules victims; `CoWGroups()` groups by SHA-256 and collapses hardlinked aliases |
+| `TestDetector_CRCCollisionSeparatesBuckets` | Different sizes stay separate groups |
+| `TestDetector_HardlinkedAliasesCollapse` | Aliases of one inode never eliminate each other, and the preferred path survives |
+| `TestDetector_CoWDetectMode` | One `CoWDetect` per content bucket, members in keeper order |
 | `TestDetector_InsertInodeGroups` | `InsertInode`/`InodeGroups` group by `(Dev, Inode)` |
 | `TestDetector_Empty` | Zero state: `Len()==0`, no inode groups, non-nil stats |
 | `TestDetector_SamePathInsertedTwice` | Inserting one path twice is ignored (overlapping patterns cannot self-eliminate) |
@@ -314,12 +321,12 @@ go tool cover -func=coverage.out
 
 Critical paths requiring high coverage:
 - Checksum and identity computation (correctness-critical)
-- Detector state machine (`Insert` / `OnHashDone` / `OnCompareDone`, no double elimination)
+- Detector state machine (`Insert` / `OnHashDone` / `OnCompareDone` / `NextFinal`, no double elimination, deterministic keeper)
 - Chunked comparison / early-stop and resume
 - Hardlink creation and deletion logic
 - Same-physical-file refusal in every action (`ResultAlreadyHardlinked`)
 - Extent overlap arithmetic, `extent.Equal`, and the per-file sharing signals
-- CoW group construction (`CoWGroups` / inode collapse) and the per-member ratios
+- CoW group construction (buckets collapsed by inode) and the per-member ratios
 
 ## Running Tests
 

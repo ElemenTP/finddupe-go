@@ -70,68 +70,89 @@ This is not a standard CRC. The polynomial `(x >> 8) ^ ((x & 0xff) << 24) ^ ((x 
 Duplicate detection is a **state machine** in `internal/dupe/detector.go`. The detector performs no I/O: callers feed it files and executor outcomes, and it returns `[]dupe.Execution` work items.
 
 ```
-detector.Insert(fi)          → []Execution   // a newly scanned file
-detector.OnHashDone(key, fi) → []Execution   // a HashCalc finished
-detector.OnCompareDone(key, a, b) []Execution// a HashComp finished
+detector.Insert(fi)                      → []Execution        // a newly scanned file
+detector.OnHashDone(key, fi, incomplete)                      // a HashCalc finished
+detector.OnCompareDone(key, a, b, incomplete)                 // a HashComp finished
+detector.NextFinal(limit)                → ([]Execution, bool) // end-of-scan work
 ```
+
+Hashing is streaming, elimination is not. `Insert` only schedules the hashing work
+the new file needs; `NextFinal` decides who is kept once the whole scan is known,
+because the keeper can only be chosen after every member of a content group has been
+seen. The file whose hash happens to finish first is an accident of scheduling, and
+for files larger than the scan-time checksum window it is unrelated to the order the
+files were given in.
 
 Two-level grouping:
 1. **Primary key**: `GroupKey{Signature, Size}` — the weak CRC plus the file size.
 2. **Secondary key**: the full SHA-256 of the file content (`[32]byte`), with the all-zero value meaning "not yet computed".
 
-A `GroupKey` therefore maps to `map[[32]byte][]FileInfo`: one bucket for each known SHA-256, plus the zero-SHA bucket for files whose full hash is still unknown.
+A `GroupKey` therefore maps to a `keyState`: one bucket per known SHA-256, plus a
+pending set for files whose full hash is still unknown. A *bucket* is the unit of
+content identity — only files inside the same bucket are duplicates, and one group can
+hold several unrelated contents that happen to share a weak signature and a size.
 
 ### Strategy by Group Size
 
 | Files sharing the key | Action |
 |-----------------------|--------|
-| 1 file | Store it. No hashing — unique files cost nothing beyond the weak checksum. |
-| Exactly 2 unhashed files | Emit one `HashComp` (chunked comparison with early-stop). |
-| 3 or more files | Emit `HashCalc` for **every** unhashed file that has no task in flight, then match completed hashes. |
+| 1 file | Store it. No hashing — unique files cost nothing beyond the weak checksum, and the per-bucket maps are not even allocated. |
+| Exactly 2 unhashed files | Emit one `HashComp` (chunked comparison with early-stop). A verdict of "the two differ" settles the pair: neither file is hashed further. |
+| 3 or more files | Emit `HashCalc` for the file just inserted — O(1) per insert, whatever the group size. Files an early-stopped comparison left behind are completed by `NextFinal`. |
 
 ### Pseudocode
 
 ```go
 func (d *Detector) Insert(fi FileInfo) []Execution {
     key := GroupKey{Signature: fi.Signature, Size: fi.Size}
-    shaGroups, exists := d.groups[key]
+    st, exists := d.groups[key]
     if !exists {
-        d.groups[key] = map[[32]byte][]FileInfo{fi.SHA256: {fi}}
+        d.groups[key] = &keyState{first: fi, count: 1}   // no inner map yet
         return nil
     }
 
-    // Fast path: the file already carries a complete SHA-256 (small files).
-    if fi.SHA256 != zeroSHA {
-        return d.placeSha(key, shaGroups, fi)
+    st.count++
+    st.addFile(fi)                     // into its SHA-256 bucket, or the pending set
+
+    if fi.SHA256 != zeroSHA {          // small files arrive hashed by the scan
+        return nil
     }
-
-    totalExisting := count(shaGroups)
-    zeroFiles := shaGroups[zeroSHA]
-    shaGroups[zeroSHA] = append(zeroFiles, fi)
-
-    if totalExisting == 1 && len(zeroFiles) == 1 {
-        // Exactly two unhashed files: compare directly.
-        return []Execution{{Key: key, Type: HashComp,
-            Files: []FileInfo{zeroFiles[0], fi}}}
+    if st.count == 2 {                 // exactly two unhashed files: compare them
+        return []Execution{{Key: key, Type: HashComp, Files: st.pendingPair()}}
     }
-
-    // 3+ files: hash every unhashed file without a task in flight.
-    return d.emitHashCalc(key, shaGroups)
+    return []Execution{{Key: key, Type: HashCalc, Files: []FileInfo{fi}}}
 }
 ```
 
 ### Consistency Rules
 
-- **Keeper**: the first file placed in a SHA-256 bucket is the keeper and is never a victim. "First" means whichever member's hash or comparison completed first, so on a multi-core scan the keeper is **not reproducible** between runs; `--ref` is the supported way to pin it (see Consistency Rules in the CLI spec).
-- **No double elimination**: a file scheduled as a victim is recorded in the `scheduled` set, so it can never be selected as a keeper or handed out again.
-- **No concurrent double hashing**: `inflight` tracks paths that already have a hash/compare task queued.
-- **Partial resume**: when a comparison stops early, `OnCompareDone` persists the more advanced `HashState`/`HashOffset` for each file, so a later comparison resumes instead of re-reading from the start.
-- **Complete hash**: `OnHashDone`/`OnCompareDone` move a file from the zero-SHA bucket into its concrete SHA-256 bucket and emit a `DupeElim` when it matches the bucket's keeper.
-- **CoW-detect mode**: with `WithCoWDetect()` (`find --cow`), no per-pair work is
-  emitted, every file stays in its SHA-256 bucket, and nothing is scheduled for
-  elimination. After the input is drained, `CoWGroups()` returns one group per
-  matching SHA-256 bucket with at least two distinct physical files, and the
-  pipeline emits one `CoWDetect` execution per group.
+- **Keeper (deterministic)**: elimination is deferred to the end of the scan.
+  `NextFinal` completes every group, then decides each content bucket: its members are
+  sorted by the keeper policy and the first one is kept, while the others become
+  victims (one `DupeElim` each). The default policy is
+  `DefaultKeeperPolicy` — reference files first, then the file with more hardlinks
+  (deleting or replacing a file that still has other links frees no storage), then the
+  smallest path. The choice no longer depends on which hash finished first, so a run
+  is reproducible; `--ref` remains the way to force a specific original.
+- **No double elimination**: each bucket's plan is built once (one task per victim) and
+  drained in bounded batches. Hardlinked aliases are collapsed *after* the policy
+  ordering, so the surviving path of an inode is the preferred one and a path can
+  never be both keeper and victim.
+- **No concurrent double hashing**: only the file just inserted is scheduled while
+  streaming, and `NextFinal` is called only when nothing is in flight.
+- **Partial resume**: when a comparison stops early (or a hash attempt is interrupted),
+  the more advanced `HashState`/`HashOffset` is persisted, so the next attempt resumes
+  instead of re-reading from the start.
+- **Complete hash**: `OnHashDone`/`OnCompareDone` move a file from the pending set into
+  its concrete SHA-256 bucket. A comparison that returns two still-unhashed files
+  *without* an error proved that they differ, and a two-file group needs no further
+  hashing.
+- **Unverifiable files**: a hash that cannot be completed (I/O error, or a file that
+  keeps changing) is retried at most `maxFailedHashRetries` times by `NextFinal` and
+  then left alone — a file whose content was never verified is never eliminated.
+- **CoW-detect mode**: with `WithCoWDetect()` (`find --cow`) the same `NextFinal` pass
+  turns each content bucket with at least two distinct physical files into one
+  `CoWDetect` execution carrying all its members, instead of emitting eliminations.
 
 ### Comparison to the C Original
 
@@ -142,7 +163,7 @@ The C version uses a **binary search tree** with root at index 1, `Larger`/`Smal
 | `FileData[]` array | `groups` map |
 | BST navigation (`Larger`/`Smaller`) | Hash map lookup (O(1)) |
 | `Same` chain for collisions | `map[[32]byte][]FileInfo` buckets |
-| `CheckDuplicate()` function | `Detector.Insert()` + outcome callbacks |
+| `CheckDuplicate()` function | `Detector.Insert()` + outcome callbacks + `NextFinal()` |
 
 ### Same-Physical-File Refusal (Every Action)
 
@@ -229,6 +250,7 @@ reported.
 - Early exit on the first differing chunk (don't read the rest)
 - Fixed memory: two chunk buffers regardless of file size
 - Partial hash state is saved so a later `HashComp`/`HashCalc` can resume from `HashOffset` instead of re-reading from the start
+- `Insert` is O(1) in the group size, and end-of-scan work is emitted in bounded batches (`NextFinal(limit)`), so a scan with millions of duplicates neither stalls the coordinator nor materializes every task at once
 
 ## 4. Action Execution
 
@@ -354,12 +376,12 @@ Detection is opt-in because it costs an extra open + extent query per file. It i
 a single final pass: after the input is fully drained and every hash/comparison
 has finished, the detector state is complete and the pipeline asks for groups.
 
-1. `dupe.Detector.CoWGroups()` returns every SHA-256 bucket with at least two
+1. `dupe.Detector.NextFinal()` walks every content bucket with at least two
    **distinct physical files**, keeping one path per `(Dev, Inode)`. Hardlinked
    aliases collapse to a single member; use `find --listlink` to list hardlink
    groups.
-2. The pipeline turns each group into one `CoWDetect` execution
-   (`cowGroupExecutions`) instead of one execution per pair.
+2. The detector turns each bucket into one `CoWDetect` execution instead of one
+   execution per pair, drained in bounded batches.
 3. `detectCoW` computes, for every member, how many of its bytes are already
    shared with another group member:
    - if any extent in the group carries the filesystem's `Shared` flag

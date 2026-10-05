@@ -79,3 +79,86 @@ func TestCoordinateSaturatedChannels(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestCoordinateFinalizerRounds verifies that the coordinator keeps asking the
+// detector for end-of-scan work until it reports completion, that it dispatches
+// every batch it returns, and that each request is bounded by the queue limit —
+// a scan with millions of duplicates must not materialize every task at once.
+func TestCoordinateFinalizerRounds(t *testing.T) {
+	t.Parallel()
+
+	const timeout = 10 * time.Second
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	stats := dupe.NewStats()
+	detector := dupe.NewDetector(stats)
+	logger := slog.New(slog.DiscardHandler)
+
+	executionCh := make(chan dupe.Execution, 4)
+	outcomeCh := make(chan action.Outcome, 4)
+	fileInfoCh := make(chan dupe.FileInfo)
+	close(fileInfoCh)
+
+	const perBatch = 3
+	const batches = 2
+	wantLimit := cap(executionCh) * channelBufferFactor
+
+	var mu sync.Mutex
+	calls := 0
+	dispatched := 0
+
+	final := func(limit int) ([]dupe.Execution, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		calls++
+		if limit != wantLimit {
+			t.Errorf("finalizer called with limit %d, want %d", limit, wantLimit)
+		}
+		if calls > batches {
+			return nil, true
+		}
+		execs := make([]dupe.Execution, 0, perBatch)
+		for i := range perBatch {
+			execs = append(execs, dupe.Execution{Type: dupe.DupeElim, Key: dupe.GroupKey{Size: int64(i)}})
+		}
+		return execs, false
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		defer close(outcomeCh)
+		for ex := range executionCh {
+			mu.Lock()
+			dispatched++
+			mu.Unlock()
+			outcomeCh <- action.Outcome{Kind: ex.Type, Key: ex.Key, Result: action.ResultDeleted}
+		}
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- coordinate(ctx, detector, stats, logger, fileInfoCh, executionCh, outcomeCh, final)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("coordinate returned %v", err)
+		}
+	case <-time.After(timeout):
+		t.Fatal("coordinate never finished the finalization rounds")
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if dispatched != perBatch*batches {
+		t.Fatalf("dispatched %d executions, want %d", dispatched, perBatch*batches)
+	}
+	if calls < batches+1 {
+		t.Fatalf("finalizer called %d times, want at least %d", calls, batches+1)
+	}
+}

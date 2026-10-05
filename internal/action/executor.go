@@ -368,17 +368,27 @@ func sameDevice(a, b dupe.FileInfo) bool {
 	return a.Dev == 0 || b.Dev == 0 || a.Dev == b.Dev
 }
 
-// unchanged reports whether a file still has the size and modification time
-// recorded when its content was hashed. A record without a modification time
-// (for example a FileInfo built by a caller that never read the file) cannot be
-// verified and is accepted as-is.
+// unchanged reports whether the path still refers to the same regular file that
+// was hashed, by size and modification time. A record without a modification
+// time (for example a FileInfo built by a caller that never read the file)
+// cannot be verified and is accepted as-is.
+//
+// The check deliberately uses Lstat: a path that has become a symbolic link (or
+// a device, socket or directory) must never be acted upon. [os.Link] on a link
+// path would link the symlink itself and [os.Remove] would delete the link,
+// neither of which touches the duplicate the decision was made about.
 func unchanged(fi dupe.FileInfo) bool {
+	info, err := os.Lstat(fi.Path)
+	if err != nil {
+		// An unverifiable record is accepted (the action itself reports any
+		// failure); a record that did carry a modification time must not be.
+		return fi.ModTime.IsZero()
+	}
+	if !info.Mode().IsRegular() {
+		return false
+	}
 	if fi.ModTime.IsZero() {
 		return true
-	}
-	info, err := os.Stat(fi.Path)
-	if err != nil {
-		return false
 	}
 	return info.Size() == fi.Size && info.ModTime().Equal(fi.ModTime)
 }

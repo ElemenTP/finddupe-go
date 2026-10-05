@@ -41,9 +41,12 @@ Coordinator (feeds outcomes back to the detector, dispatches follow-up work, rep
 ```
 
 `dupe.Execution{Key, Type, Files}` is the unit of work. `dupe.Detector` is a state
-machine: `Insert` returns the work a new file triggers, and `OnHashDone` /
-`OnCompareDone` feed executor outcomes back in and return follow-up work. The
-first file in a SHA-256 bucket is the keeper and is never a victim.
+machine: `Insert` returns the *hashing* work a new file triggers, `OnHashDone` /
+`OnCompareDone` feed executor outcomes back in, and `NextFinal(limit)` decides the
+duplicates once the scan is over — for every content bucket, a `KeeperPolicy` (refs
+first, then more hardlinks, then the smallest path) picks the keeper and the other
+members become victims. Elimination is never decided while files are still arriving,
+so the keeper does not depend on which hash finished first.
 
 ### CoW / hardlink specifics
 
@@ -53,7 +56,6 @@ first file in a SHA-256 bucket is the keeper and is never a victim.
 - CoW detection (`find --cow`) and hardlink listing (`find --listlink`) use
   `internal/extent` and the detector's inode index respectively.
 - Inode identity is `(Dev, Inode)`: inode numbers are only unique per device.
-```
 
 ### Startup Flow
 

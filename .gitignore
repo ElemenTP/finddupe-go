@@ -37,3 +37,7 @@ bin
 # local cross-compiled diagnostics
 darwinfiemap
 extentdump
+
+# local build/lint caches (the default cache directories may be read-only)
+.tmp-gocache/
+.tmp-lintcache/

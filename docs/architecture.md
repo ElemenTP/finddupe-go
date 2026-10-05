@@ -59,15 +59,14 @@ This replaces the older design in which the detector and executor were each a si
 │                                                           │
 │ On Outcome from outcomeCh:                                │
 │   reportOutcome(...)                                      │
-│   HashCalc → detector.OnHashDone(key, fi)                 │
-│   HashComp → detector.OnCompareDone(key, a, b)            │
+│   HashCalc → detector.OnHashDone(key, fi, err != nil)     │
+│   HashComp → detector.OnCompareDone(key, a, b, err != nil)│
 │   DupeElim / CoWDetect → nothing further                  │
-│   → follow-up Executions → executionCh                    │
 │                                                           │
-│ CoW-detect mode: input drained && inFlight == 0           │
-│   → detector.CoWGroups() → one CoWDetect per group        │
-│                                                           │
-│ Termination: input drained && inFlight == 0               │
+│ End of scan: input drained && inFlight == 0               │
+│   → detector.NextFinal(limit) until it reports done       │
+│     DupeElim (one per victim) or CoWDetect (one per       │
+│     content bucket)                                       │
 │   → close(executionCh)                                    │
 └───────────┬───────────────────────────────────────────────┘
             │
@@ -140,10 +139,11 @@ pipeline.Run(ctx, cfg)                                      │
   │     │                                                   │
   │     ├── nil: stored in (GroupKey → SHA-256) buckets     │
   │     ├── HashComp: exactly two unhashed files            │
-  │     ├── HashCalc: 3+ files, every unhashed file         │
-  │     ├── DupeElim: identical hash, keeper + victim       │
-  │     └── CoWDetect: none per pair; emitted as one        │
-  │           execution per group after input drain         │
+  │     └── HashCalc: the file just inserted (3+ files)     │
+  │           │                                             │
+  │   after the input drains (and nothing is in flight):    │
+  │     detector.NextFinal(limit) → DupeElim / CoWDetect    │
+  │       keeper chosen now, by policy, per content bucket  │
   │           │                                             │
   │           ▼                                             │
   │   executor workers: action.Executor.DoExecution         │
@@ -229,11 +229,11 @@ Results + final summary printed to stdout                    │
 
 ### 1. Two-Level Hash Map instead of a Binary Search Tree
 
-The C version uses a binary search tree for storing file signatures. The Go version uses `map[GroupKey]map[[32]byte][]FileInfo`:
+The C version uses a binary search tree for storing file signatures. The Go version uses `map[GroupKey]*keyState`:
 
 - The **outer** map is keyed by the composite `(Signature, Size)`, which is the weak-checksum candidate set.
-- The **inner** map is keyed by the full SHA-256; the all-zero key holds files whose full hash is not yet known (possibly a partial state).
-- The **first** file in each SHA-256 bucket is the keeper and is never a victim.
+- Each state holds one **bucket** per known SHA-256 plus a **pending** set for files whose full hash is not yet known (possibly a partial state). The bucket is the unit of content identity: only files inside the same bucket are duplicates.
+- The maps of a state are allocated only when its second file arrives, so a scan of unique files does not pay for an inner map per file.
 
 For collision handling (different files with the same weak checksum), the bucket serves as the same chain. The composite key removes size-wrap collisions that a signature-only key would keep together.
 
@@ -253,26 +253,35 @@ Reading 32KB + CRC + `(Dev, Inode, NumLinks)` retrieval is the most I/O-intensiv
 
 - **1 file**: store, no hashing (cheapest possible path for unique files).
 - **Exactly 2 unhashed files**: one `HashComp` compares them in chunks and stops at the first difference, saving partial hash state. This avoids hashing two full files when they are usually different.
-- **3+ files**: `HashCalc` for every unhashed file without a task in flight, then O(1) matching against completed SHA-256 buckets. This is what guarantees that all of N identical files are reported (N−1 eliminations).
+- **3+ files**: `HashCalc` for the file just inserted — O(1) per insert — then O(1) matching against completed SHA-256 buckets. This is what guarantees that all of N identical files are reported (N−1 eliminations). Files an early-stopped comparison left unfinished are completed by `NextFinal` before the group is decided.
 
 ### 6. Reference Files Are Walked First (and Never Eliminated)
 
-`walkAll` walks `RefPaths` before `Paths` and marks them `IsRef`; `scanChecksums` drains the entire reference phase before submitting any normal file. Reference files are therefore inserted first and become the keeper of their content group. In addition, the executor refuses to eliminate a reference victim (`ResultSkippedRef`) unless the action is `ActionReport`, so a reference file can never be deleted, hardlinked, or cloned.
+`walkAll` walks `RefPaths` before `Paths` and marks them `IsRef`; `scanChecksums` drains the entire reference phase before submitting any normal file. The keeper policy puts reference files first, so a referenced original is kept whatever order hashes finish in (this used to hold only for files whose SHA-256 was known at scan time). In addition, the executor refuses to eliminate a reference victim (`ResultSkippedRef`) unless the action is `ActionReport`, so a reference file can never be deleted, hardlinked, or cloned.
 
 ### 7. Cancel-on-Signal
 
 The pipeline listens for SIGINT and SIGTERM via `signal.NotifyContext`. On signal the context is cancelled, which propagates through all goroutines via `ctx.Done()`. Each stage checks the context before processing the next item, and the coordinator closes `executionCh`, which lets the executor workers exit and close `outcomeCh`.
 
-### 8. CoW Detection as One Final Group Pass
+### 8. Elimination and CoW Detection as One End-of-Scan Pass
 
-`find --cow` does not emit per-pair work while files stream in. Instead the detector
-keeps every identical file in its SHA-256 bucket, and only after the input is drained
-and `inFlight == 0` does the coordinator call `detector.CoWGroups()` and dispatch one
-`CoWDetect` execution per group (`cowGroupExecutions`). Grouping at the end means a
-file cannot be grouped before its hash was compared, and it reports the whole
-identical-content set at once: one path per `(Dev, Inode)` (hardlinked aliases
-collapse) with a per-member already-shared byte count. Independent copies are
-members too, at 0% shared, because they are precisely the files that should CoW-share.
+Neither `dedupe` nor `find --cow` decides anything while files stream in: the detector
+only hashes. Once the input is drained and `inFlight == 0`, the coordinator repeatedly
+calls `detector.NextFinal(limit)` until it reports completion, dispatching the bounded
+batches it returns:
+
+- **dedupe**: one `DupeElim` per victim, with the keeper chosen by `KeeperPolicy`
+  (references first, then more hardlinks, then the smallest path) instead of by
+  whichever hash finished first.
+- **`find --cow`**: one `CoWDetect` per content bucket with at least two distinct
+  physical files, reporting the whole identical-content set at once — one path per
+  `(Dev, Inode)` (hardlinked aliases collapse) with a per-member already-shared byte
+  count. Independent copies are members too, at 0% shared, because they are precisely
+  the files that should CoW-share.
+
+Deciding at the end means a group cannot be settled before its last member was hashed,
+and the batch bound keeps the coordinator's queue (and the memory it holds) under
+control on a scan with millions of duplicates.
 
 ## Termination
 
@@ -280,10 +289,11 @@ The coordinator owns the termination condition:
 
 1. `fileInfoCh` closes when the walker and the checksum workers are done.
 2. The coordinator tracks `inFlight` (dispatched executions not yet completed).
-3. Once the input is drained **and** `inFlight == 0`, it runs the one-shot final
-   batch: in CoW-detect mode, `detector.CoWGroups()` produces one `CoWDetect`
-   execution per identical-content group (`cowGroupExecutions`). Only then is the
-   detector state final, so the grouping cannot miss a file that is still hashing.
+3. Once the input is drained **and** `inFlight == 0`, it asks the detector for
+   end-of-scan work (`detector.NextFinal`). This can happen repeatedly: completing the
+   hash of a file an early-stopped comparison left behind can reveal further
+   duplicates in the same group. Only when the detector reports that nothing is left
+   is the state final.
 4. It closes `executionCh`.
 5. The executor workers observe the closed channel and exit; a `sync.WaitGroup` then closes `outcomeCh`.
 6. The coordinator drains the remaining outcomes and returns.
@@ -292,6 +302,6 @@ The coordinator owns the termination condition:
 
 - **Per-file errors** (e.g., can't read a file): logged, counted in stats (`CantReadFiles`), processing continues.
 - **Action errors** (e.g., can't delete a file): reported as `ResultError`, logged, counted, processing continues.
-- **Hash/compare errors**: logged in `runExecutor` (DupeElim errors are reported by `reportElimination` instead).
+- **Hash/compare errors**: logged in `runExecutor` (DupeElim errors are reported by `reportElimination` instead) and fed back into the detector, which retries a file at most `maxFailedHashRetries` times before leaving it unverified and uneliminated.
 - **Context cancellation**: all goroutines exit and `pipeline.Run` returns `ctx.Err()`.
 - **`--listlink`** takes a separate, simpler path (`runListLink`) that skips duplicate detection entirely.

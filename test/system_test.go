@@ -133,6 +133,80 @@ func sameInode(t *testing.T, a, b string) bool {
 }
 
 // =============================================================================
+// Symlink Tests
+// =============================================================================
+
+// TestDedupe_SymlinksResolvedToTarget is the end-to-end regression test for
+// `-j`: a followed link used to be handed to the action layer under the link's
+// own path, so `--hardlink` linked the symlink itself (os.Link on a link path)
+// and `--delete` removed the link while the duplicate file survived. Links are
+// now resolved before the action decides.
+func TestDedupe_SymlinksResolvedToTarget(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	links := makeDir(t, dir, "links")
+	data := makeDir(t, dir, "data")
+	target := makeFile(t, data, "target.bin", strings.Repeat("payload", 1000))
+	copy1 := makeFile(t, data, "copy.bin", strings.Repeat("payload", 1000))
+	// The only duplicate reachable through the link directory.
+	if err := os.Symlink(target, filepath.Join(links, "link.bin")); err != nil {
+		t.Skipf("cannot create symlinks: %v", err)
+	}
+
+	stdout, stderr, code := run(t, "find", "-j", "--no-progress", links, data)
+	if code != 0 {
+		t.Fatalf("find -j failed (%d): %s%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, target) || strings.Contains(stdout, filepath.Join(links, "link.bin")) {
+		t.Fatalf("find -j must report the resolved target, got:\n%s", stdout)
+	}
+
+	// --hardlink: the copy becomes a second link to the target's inode, and the
+	// symlink stays a symlink.
+	stdout, stderr, code = run(t, "dedupe", "--hardlink", "-j", "--no-progress", links, data)
+	if code != 0 {
+		t.Fatalf("dedupe --hardlink -j failed (%d): %s%s", code, stdout, stderr)
+	}
+	if !sameInode(t, target, copy1) {
+		t.Fatal("the duplicate must be hardlinked to the target's inode")
+	}
+	if info, err := os.Lstat(filepath.Join(links, "link.bin")); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the symlink must be left alone: %v (mode %v)", err, info)
+	}
+}
+
+// TestDedupe_DeleteSymlinkTargetNotLink verifies the delete path of the same
+// guarantee: the duplicate file is removed, never the link.
+func TestDedupe_DeleteSymlinkTargetNotLink(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	links := makeDir(t, dir, "links")
+	data := makeDir(t, dir, "data")
+	target := makeFile(t, data, "target.bin", strings.Repeat("payload", 1000))
+	duplicate := makeFile(t, data, "duplicate.bin", strings.Repeat("payload", 1000))
+	link := filepath.Join(links, "link.bin")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("cannot create symlinks: %v", err)
+	}
+
+	stdout, stderr, code := run(t, "dedupe", "--delete", "-j", "--no-progress", "--ref", link, data)
+	if code != 0 {
+		t.Fatalf("dedupe --delete -j failed (%d): %s%s", code, stdout, stderr)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("the symlink must be preserved: %v", err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("the referenced original must be preserved: %v", err)
+	}
+	if _, err := os.Stat(duplicate); err == nil {
+		t.Fatal("the duplicate file must be the one removed")
+	}
+}
+
+// =============================================================================
 // Find Mode Tests
 // =============================================================================
 
@@ -1149,6 +1223,64 @@ func TestDedupe_RefKeptAndDuplicateRemoved(t *testing.T) {
 	}
 	if _, err := os.Stat(workFile); !os.IsNotExist(err) {
 		t.Errorf("non-reference duplicate must be removed, stat err = %v", err)
+	}
+}
+
+// TestDedupe_RefKeepsLargeOriginal is the regression test for --ref on files
+// larger than the scan-time checksum window: their SHA-256 is unknown when they
+// are inserted, so the keeper used to be whichever hash finished first — the
+// reference was then handed out as a victim, refused by the action layer, and
+// the duplicate was never removed.
+func TestDedupe_RefKeepsLargeOriginal(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	refDir := makeDir(t, dir, "ref")
+	workDir := makeDir(t, dir, "work")
+
+	payload := strings.Repeat("payload", 30000) // 210 KB: hashed after the scan
+	refFile := makeFile(t, refDir, "orig.bin", payload)
+	work1 := makeFile(t, workDir, "copy1.bin", payload)
+	work2 := makeFile(t, workDir, "copy2.bin", payload)
+
+	_, stderr, code := run(t, "dedupe", "--delete", "--no-progress", "--ref", refDir, workDir)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
+	}
+
+	if _, err := os.Stat(refFile); err != nil {
+		t.Errorf("the reference file must be kept: %v", err)
+	}
+	for _, path := range []string{work1, work2} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("duplicate %s must be removed, stat err = %v", path, err)
+		}
+	}
+}
+
+// TestDedupe_KeeperIsDeterministic verifies that the kept file does not depend on
+// which hash happened to finish first: the same input always keeps the same path
+// (the default policy ends with the smallest path). The files are larger than the
+// scan-time checksum window so their SHA-256 is computed during the run.
+func TestDedupe_KeeperIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	for range 3 {
+		dir := t.TempDir()
+		payload := strings.Repeat("payload", 30000)
+		first := makeFile(t, dir, "a.bin", payload)
+		second := makeFile(t, dir, "b.bin", payload)
+
+		_, stderr, code := run(t, "dedupe", "--delete", "--no-progress", first, second)
+		if code != 0 {
+			t.Fatalf("expected exit 0, got %d\n%s", code, stderr)
+		}
+		if _, err := os.Stat(first); err != nil {
+			t.Fatalf("a.bin must be kept: %v", err)
+		}
+		if _, err := os.Stat(second); !os.IsNotExist(err) {
+			t.Fatalf("b.bin must be the victim, stat err = %v", err)
+		}
 	}
 }
 

@@ -32,7 +32,7 @@ Scans the specified paths/patterns for duplicate files and reports them. No file
 | `--verbose` | `-v` | bool | false | Verbose output: show hardlink skip details, file index information |
 | `--zero` | `-z` | bool | false | Include zero-length files (skipped by default) |
 | `--no-progress` | `-p` | bool | false | Hide the progress indicator |
-| `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points (resolved to their target) |
+| `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points: they are resolved and scanned as their target, under the target's own path |
 | `--threads` | `-t` | int | `0` (→ `runtime.NumCPU() × 2`) | Number of scanner workers |
 | `--ref` | — | string (repeatable) | — | Consume the following path/pattern as a reference (compare against, but never act on). Can be repeated. |
 
@@ -171,7 +171,7 @@ Exactly one action flag must be specified for `dedupe` mode:
 | `--verbose` | `-v` | bool | false | Verbose output |
 | `--zero` | `-z` | bool | false | Include zero-length files |
 | `--no-progress` | `-p` | bool | false | Hide the progress indicator |
-| `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points (resolved to their target) |
+| `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points: they are resolved and scanned as their target, under the target's own path |
 | `--threads` | `-t` | int | `0` (→ `runtime.NumCPU() × 2`) | Number of scanner workers |
 | `--rdonly` | `-r` | bool | false | Also operate on read-only files (Windows) |
 | `--ref` | — | string (repeatable) | — | Consume the following path/pattern as a reference (compare against, but never act on) |

@@ -3,6 +3,7 @@
 package action
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
 	"unsafe"
@@ -12,12 +13,22 @@ import (
 	"finddupe/internal/volinfo"
 )
 
-// duplicateExtentsData mirrors DUPLICATE_EXTENTS_DATA.
-type duplicateExtentsData struct {
-	FileHandle       windows.Handle
-	SourceFileOffset int64
-	TargetFileOffset int64
-	ByteCount        int64
+// duplicateExtentsDataSize is sizeof(DUPLICATE_EXTENTS_DATA): a HANDLE followed
+// by three 8-byte-aligned LARGE_INTEGERs, i.e. 4 bytes of padding after the
+// handle on 32-bit Windows.
+const duplicateExtentsDataSize = 32
+
+// buildDuplicateExtentsData lays out the DUPLICATE_EXTENTS_DATA input by hand.
+// A Go struct mirroring the C type would be 28 bytes with different field
+// offsets on windows/386 (Go aligns int64 to 4 there, MSVC to 8), and the ioctl
+// would be rejected — or, worse, read ByteCount out of bounds.
+func buildDuplicateExtentsData(handle windows.Handle, sourceOffset, targetOffset, byteCount int64) [duplicateExtentsDataSize]byte {
+	var data [duplicateExtentsDataSize]byte
+	binary.LittleEndian.PutUint64(data[0:8], uint64(handle)) // HANDLE + padding
+	binary.LittleEndian.PutUint64(data[8:16], uint64(sourceOffset))
+	binary.LittleEndian.PutUint64(data[16:24], uint64(targetOffset))
+	binary.LittleEndian.PutUint64(data[24:32], uint64(byteCount))
+	return data
 }
 
 // clonePlatformFile creates a CoW (block) clone of src at dst. dst must not
@@ -73,19 +84,14 @@ func clonePlatformFile(src, dst string) error {
 		return errors.Join(ErrCoWNotSupported, errors.New("file is smaller than one cluster"))
 	}
 
-	data := duplicateExtentsData{
-		FileHandle:       windows.Handle(srcFile.Fd()),
-		SourceFileOffset: 0,
-		TargetFileOffset: 0,
-		ByteCount:        aligned,
-	}
+	data := buildDuplicateExtentsData(windows.Handle(srcFile.Fd()), 0, 0, aligned)
 
 	var returned uint32
 	ioErr := windows.DeviceIoControl(
 		dstHandle,
 		windows.FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-		(*byte)(unsafe.Pointer(&data)),
-		uint32(unsafe.Sizeof(data)),
+		&data[0],
+		duplicateExtentsDataSize,
 		nil,
 		0,
 		&returned,

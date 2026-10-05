@@ -3,11 +3,13 @@ package fswalker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"finddupe/internal/dupe"
 )
@@ -46,8 +48,8 @@ func sendResult(ctx context.Context, ch chan<- Result, result Result) bool {
 }
 
 // walkState is the state shared by the callbacks of one pattern: the set of
-// already-visited directories (symlink loop prevention, shared across the
-// patterns of one walk) and whether this pattern matched anything.
+// already-visited directories (symlink loop prevention within this pattern) and
+// whether the pattern matched anything.
 type walkState struct {
 	seen    map[string]bool
 	matched int
@@ -97,15 +99,11 @@ func (w *Walker) Walk(ctx context.Context, patterns []string, opts WalkOptions) 
 
 // walkPatterns iterates over all patterns and walks each one.
 func (w *Walker) walkPatterns(ctx context.Context, patterns []string, opts WalkOptions, ch chan<- Result) {
-	// seen tracks resolved symlink targets to prevent infinite loops
-	// when FollowSymlinks is enabled. Key is the canonical path.
-	seen := make(map[string]bool)
-
 	for _, pattern := range patterns {
 		if ctx.Err() != nil {
 			return
 		}
-		w.walkPattern(ctx, pattern, opts, ch, seen)
+		w.walkPattern(ctx, pattern, opts, ch)
 	}
 }
 
@@ -114,7 +112,7 @@ func (w *Walker) walkPatterns(ctx context.Context, patterns []string, opts WalkO
 // treated as a glob. A pattern that matches no usable file produces a
 // [NoMatchError] so a typo cannot pass for a successful run.
 func (w *Walker) walkPattern(
-	ctx context.Context, pattern string, opts WalkOptions, ch chan<- Result, seen map[string]bool,
+	ctx context.Context, pattern string, opts WalkOptions, ch chan<- Result,
 ) {
 	// Convert to absolute path for consistent dedup and output.
 	absPattern, err := filepath.Abs(pattern)
@@ -122,18 +120,20 @@ func (w *Walker) walkPattern(
 		absPattern = pattern
 	}
 
-	st := &walkState{seen: seen}
+	// seen is deliberately scoped to one pattern: sharing it across patterns
+	// makes a later pattern skip every directory an earlier one recorded, so
+	// "/data/**/*.txt /data/**/*.jpg" would silently lose whole subtrees and
+	// report "no files matched" for a pattern that does match. Duplicate files
+	// reached by several patterns are deduplicated downstream
+	// (scanChecksums.seenPaths, Detector.seenPaths).
+	st := &walkState{seen: make(map[string]bool)}
 
-	switch _, statErr := os.Stat(absPattern); {
-	case statErr == nil:
+	if _, statErr := os.Stat(absPattern); statErr == nil {
 		// The pattern names an existing path, so it is taken literally: a path
 		// may contain glob characters ("/data/[2020] photos", "report[1].txt")
 		// and splitting it on them would scan the wrong tree or nothing at all.
 		w.walkLiteral(ctx, absPattern, opts, ch, st)
-	case !os.IsNotExist(statErr):
-		st.failed = true
-		sendResult(ctx, ch, Result{Err: statErr})
-	default:
+	} else {
 		w.walkGlob(ctx, absPattern, opts, ch, st)
 	}
 
@@ -172,15 +172,21 @@ func (w *Walker) walkGlob(ctx context.Context, pattern string, opts WalkOptions,
 
 	info, err := os.Stat(baseDir)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			st.failed = true
-			sendResult(ctx, ch, Result{Err: err})
+		// A prefix that cannot be resolved at all (missing directory, a path
+		// component that is not a directory, a broken link) means the pattern
+		// matches nothing; the caller reports that. Anything else (permissions,
+		// I/O) is a real error and is reported with the pattern it came from.
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return
 		}
-		return // nothing matched; the caller reports it
+		st.failed = true
+		sendResult(ctx, ch, Result{Err: fmt.Errorf("pattern %q: %w", pattern, err)})
+		return
 	}
 
 	if !info.IsDir() {
-		w.processFile(ctx, baseDir, opts, ch, st)
+		// The literal prefix exists but is a regular file, so the remaining
+		// components (e.g. "notes.txt/*.jpg") cannot match anything.
 		return
 	}
 
@@ -270,8 +276,7 @@ func splitAtExistingDir(pattern string) (string, string) {
 func (w *Walker) createWalkFn(
 	ctx context.Context, baseDir, matchPattern string, opts WalkOptions, ch chan<- Result, st *walkState,
 ) fs.WalkDirFunc {
-	// Determine if the pattern is recursive (contains **).
-	recursive := strings.Contains(matchPattern, "**")
+	pattern := compilePattern(matchPattern, baseDir)
 
 	return func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -302,6 +307,7 @@ func (w *Walker) createWalkFn(
 			}
 			return nil
 		}
+		depth := pathDepth(baseDir, path)
 
 		// Plain directories are walked by WalkDir itself. Recording them in
 		// seen keeps a symlink pointing at a directory that is already (or
@@ -314,8 +320,9 @@ func (w *Walker) createWalkFn(
 			}
 			st.seen[path] = true
 
-			// For non-recursive patterns, skip subdirectories but not the root.
-			if !recursive && path != baseDir {
+			// Do not descend deeper than the pattern can match: "*.txt" needs one
+			// level below the base directory, "*/x.txt" two, "**" any number.
+			if !pattern.descends(depth) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -336,16 +343,22 @@ func (w *Walker) createWalkFn(
 		}
 
 		if info.IsDir() {
-			if !recursive && path != baseDir {
+			if !pattern.descends(depth) {
 				return skipDir()
 			}
 			w.walkSymlinkTarget(ctx, resolved, matchPattern, opts, ch, st)
 			return skipDir()
 		}
 
-		// Match against the pattern.
-		if !matchPath(matchPattern, path) {
+		// The entry is matched where it sits in the walk; a followed link is then
+		// reported under its resolved target, which is the file the action layer
+		// must operate on (os.Link on a symlink path would link the symlink, and
+		// removing it would delete the link instead of the duplicate).
+		if !pattern.matches(path, depth) {
 			return nil
+		}
+		if resolved != "" {
+			path = resolved
 		}
 
 		// The pattern matched something usable, even if the file is later
@@ -363,6 +376,19 @@ func (w *Walker) createWalkFn(
 		w.processFileEntry(ctx, path, info, ch)
 		return nil
 	}
+}
+
+// symlinkTarget returns the canonical target of path when path is itself a
+// symbolic link, and "" when it is not.
+func symlinkTarget(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return "", nil
+	}
+	return filepath.EvalSymlinks(path)
 }
 
 // entryInfo returns the metadata of the file an entry refers to. Symlinks are
@@ -479,6 +505,17 @@ func (w *Walker) processFile(
 	}
 	st.matched++
 
+	// An explicit argument that is itself a link is scanned as its target, so the
+	// action layer operates on the file whose content was verified rather than on
+	// the link (os.Link would link the symlink; os.Remove would delete the link).
+	if target, linkErr := symlinkTarget(path); linkErr != nil {
+		st.failed = true
+		sendResult(ctx, ch, Result{Err: linkErr})
+		return
+	} else if target != "" {
+		path = target
+	}
+
 	if info.Size() == 0 && !opts.IncludeZeroLen {
 		if opts.ZeroLen != nil {
 			opts.ZeroLen.AddZeroLen(1)
@@ -489,64 +526,151 @@ func (w *Walker) processFile(
 	w.processFileEntry(ctx, path, info, ch)
 }
 
-// matchPath checks if a path matches a pattern with ** support.
-// ** matches zero or more directory components.
-// The path should be relative to the base directory, or absolute if the pattern is relative.
-func matchPath(pattern, name string) bool {
-	// Fast path: exact match.
-	if pattern == name {
-		return true
-	}
+// compiledPattern is a match pattern prepared once per walk: compiling up front
+// keeps the per-file cost to the matching itself instead of re-splitting and
+// re-parsing the pattern for every candidate.
+type compiledPattern struct {
+	// parts is the component-wise pattern, with runs of "**" collapsed.
+	parts []string
 
-	// Fast path: pattern is just "**" — matches everything.
-	if pattern == "**" {
-		return true
-	}
+	// depth is len(parts): for a pattern without "**" a file must sit exactly
+	// that many components below the base directory.
+	depth int
 
-	// Normalize to forward slashes for consistent matching.
-	pattern = filepath.ToSlash(pattern)
-	name = filepath.ToSlash(name)
+	// recursive is true when the pattern contains "**", which matches any
+	// number of components.
+	recursive bool
 
-	// For non-** patterns, use filepath.Match against the basename only
-	// (flat match, not recursive).
-	if !strings.Contains(pattern, "**") {
-		matched, err := filepath.Match(pattern, filepath.Base(name))
-		if err != nil {
-			return false
-		}
-		return matched
-	}
+	// all is true for the pattern "**": every regular file matches.
+	all bool
 
-	// ** pattern: split into components and match recursively.
-	return matchComponents(strings.Split(pattern, "/"), strings.Split(name, "/"))
+	// baseDir is the walk root the pattern is relative to.
+	baseDir string
 }
 
-// matchComponents recursively matches pattern components against path components.
-// ** in the pattern matches zero or more path components.
-func matchComponents(patParts, nameParts []string) bool {
-	if len(patParts) == 0 {
-		return len(nameParts) == 0
+// compilePattern prepares pattern for repeated matching below baseDir.
+func compilePattern(pattern, baseDir string) compiledPattern {
+	if pattern == "**" {
+		return compiledPattern{all: true, recursive: true, baseDir: baseDir}
 	}
 
-	if patParts[0] == "**" {
-		// ** matches zero or more path components.
-		// Try matching ** against 0, 1, 2, ... name parts.
-		for i := 0; i <= len(nameParts); i++ {
-			if matchComponents(patParts[1:], nameParts[i:]) {
-				return true
-			}
+	// Normalise separators once: the component matcher works on "/".
+	slash := filepath.ToSlash(pattern)
+	rawParts := strings.Split(slash, "/")
+
+	parts := make([]string, 0, len(rawParts))
+	for i, part := range rawParts {
+		if part == "**" && i > 0 && parts[len(parts)-1] == "**" {
+			continue // "**/**" is equivalent to "**"
 		}
-		return false
+		parts = append(parts, part)
 	}
 
-	if len(nameParts) == 0 {
+	return compiledPattern{
+		parts:     parts,
+		depth:     len(parts),
+		recursive: strings.Contains(slash, "**"),
+		baseDir:   baseDir,
+	}
+}
+
+// descends reports whether a directory this many components below baseDir can
+// still contain a match, so WalkDir knows whether to enter it.
+func (p compiledPattern) descends(depth int) bool {
+	if p.all || p.recursive {
+		return true
+	}
+	return depth < p.depth
+}
+
+// matches reports whether the file at path, depth components below the walk
+// base directory, matches the pattern.
+func (p compiledPattern) matches(path string, depth int) bool {
+	if p.all {
+		return true
+	}
+	if !p.recursive && depth != p.depth {
 		return false
 	}
+	if !p.recursive && p.depth == 1 {
+		// Single-component pattern: match the basename without splitting.
+		base := path[strings.LastIndexAny(path, "/\\")+1:]
+		matched, err := filepath.Match(p.parts[0], base)
+		return err == nil && matched
+	}
+	return matchComponents(p.parts, relativeParts(p.baseDir, path))
+}
 
-	matched, err := filepath.Match(patParts[0], nameParts[0])
-	if err != nil || !matched {
-		return false
+// relativeParts returns the components of path below baseDir. WalkDir always
+// builds path from baseDir, so a plain prefix cut is exact here.
+func relativeParts(baseDir, path string) []string {
+	rest := path
+	if len(path) > len(baseDir) {
+		rest = path[len(baseDir):]
+	}
+	return strings.FieldsFunc(rest, func(r rune) bool { return r == '/' || r == '\\' })
+}
+
+// pathDepth returns how many components path sits below baseDir (0 for baseDir
+// itself).
+func pathDepth(baseDir, path string) int {
+	if len(path) <= len(baseDir) {
+		return 0
 	}
 
-	return matchComponents(patParts[1:], nameParts[1:])
+	depth := 0
+	for i := len(baseDir); i < len(path); i++ {
+		if path[i] == '/' || path[i] == '\\' {
+			depth++
+		}
+	}
+	return depth
+}
+
+// matchComponents reports whether the path components satisfy the pattern
+// components: "**" matches zero or more components, every other component must
+// match exactly one via [filepath.Match].
+//
+// The greedy backtracking below is linear in the number of components; a
+// recursive implementation retried every split point at every "**", which made a
+// pattern such as "**/**/**/**/*.txt" cost minutes per candidate file.
+func matchComponents(patParts, nameParts []string) bool {
+	var (
+		patIdx  int
+		nameIdx int
+		starPat = -1
+		starPos int
+	)
+
+	for nameIdx < len(nameParts) {
+		switch {
+		case patIdx < len(patParts) && patParts[patIdx] == "**":
+			// Try "**" against zero components first, and remember where to
+			// resume if that fails.
+			starPat, starPos = patIdx, nameIdx
+			patIdx++
+		case patIdx < len(patParts) && matchComponent(patParts[patIdx], nameParts[nameIdx]):
+			patIdx++
+			nameIdx++
+		case starPat >= 0:
+			// Let the last "**" consume one more component.
+			starPos++
+			nameIdx = starPos
+			patIdx = starPat + 1
+		default:
+			return false
+		}
+	}
+
+	// Trailing "**" components match zero components.
+	for patIdx < len(patParts) && patParts[patIdx] == "**" {
+		patIdx++
+	}
+	return patIdx == len(patParts)
+}
+
+// matchComponent matches one path component against one pattern component.
+func matchComponent(pattern, name string) bool {
+	matched, err := filepath.Match(pattern, name)
+	return err == nil && matched
 }

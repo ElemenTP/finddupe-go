@@ -100,21 +100,28 @@ finddupe-go/
 ```go
 func NewDetector(stats *Stats, opts ...Option) *Detector
 func WithCoWDetect() Option
+func WithKeeperPolicy(policy KeeperPolicy) Option
 
 func (d *Detector) Insert(fi FileInfo) []Execution
-func (d *Detector) OnHashDone(key GroupKey, fi FileInfo) []Execution
-func (d *Detector) OnCompareDone(key GroupKey, a, b FileInfo) []Execution
+func (d *Detector) OnHashDone(key GroupKey, fi FileInfo, incomplete bool)
+func (d *Detector) OnCompareDone(key GroupKey, a, b FileInfo, incomplete bool)
+func (d *Detector) NextFinal(limit int) ([]Execution, bool)
 func (d *Detector) InsertInode(fi FileInfo)
 func (d *Detector) InodeGroups() [][]FileInfo
-func (d *Detector) CoWGroups() [][]FileInfo
 func (d *Detector) Len() int
 func (d *Detector) Stats() *Stats
+
+type KeeperPolicy interface {
+    Less(a, b FileInfo) bool
+}
+type DefaultKeeperPolicy struct{}
 ```
 
-- `Insert` — checksum-based insertion; returns the work a new file triggers.
-- `OnHashDone` / `OnCompareDone` — feed executor outcomes back in and return follow-up work.
+- `Insert` — checksum-based insertion; returns the hashing work the new file triggers (HashComp for a pair, HashCalc for itself). It never decides anything.
+- `OnHashDone` / `OnCompareDone` — feed executor outcomes back in. `incomplete` marks an attempt that reached no verdict (I/O error or a changed file), so a failed comparison is never mistaken for "the files differ".
+- `NextFinal` — end-of-scan work, at most `limit` executions per call, plus whether the detector has nothing left. It completes the hashes an early-stopped comparison left behind, then decides each content bucket with the keeper policy. The caller must have nothing in flight and must call it again until it reports completion.
+- `KeeperPolicy` — orders the members of one content bucket; the first is kept. `DefaultKeeperPolicy` prefers references, then more hardlinks, then the smallest path.
 - `InsertInode` / `InodeGroups` — `(Dev, Inode)` hardlink index used by `find --listlink`.
-- `CoWGroups` — used only in CoW-detect mode (`find --cow`), after the input is drained: every SHA-256 bucket with at least two distinct physical files becomes one group, keeping one path per `(Dev, Inode)` so hardlinked aliases collapse to a single member. It emits no per-pair work.
 
 **Dependencies**: None (stdlib only)
 
@@ -139,7 +146,7 @@ type NoMatchError struct{ Pattern string }
 
 **Platform helpers**: `getFileIdentity(path, info)` in `walker_unix.go` / `walker_windows.go`.
 
-**Features**: `**` recursive glob matching, literal paths (a pattern that names an existing path is scanned as written, so `/data/[2020] photos` is not split on its brackets), symlink following control (with loop prevention), zero-length file filtering, `ZeroLenCounter` callback, and no-match reporting: a pattern that matches no usable file yields one `*NoMatchError` on the channel, which the pipeline turns into a failed run. Only regular files are reported: symlinks are skipped unless `FollowSymlinks` is set (then they are resolved and reported with the target's size/identity, and links to directories are walked through the `seen` set), and devices/FIFOs/sockets are always ignored so nothing blocks on an open.
+**Features**: `**` recursive glob matching, literal paths (a pattern that names an existing path is scanned as written, so `/data/[2020] photos` is not split on its brackets), symlink following control (with per-pattern loop prevention), zero-length file filtering, `ZeroLenCounter` callback, and no-match reporting: a pattern that matches no usable file yields one `*NoMatchError` on the channel, which the pipeline turns into a failed run. Only regular files are reported: symlinks are skipped unless `FollowSymlinks` is set (then they are resolved and **reported under the target's own path**, so a later action operates on the file whose content was verified rather than on the link; links to directories are walked through the `seen` set), and devices/FIFOs/sockets are always ignored so nothing blocks on an open.
 
 **Dependencies**: `internal/dupe` (for `FileInfo`)
 
@@ -289,7 +296,7 @@ func Run(ctx context.Context, cfg *config.Config) error
 - `walkAll` — walks `RefPaths` first, then `Paths`.
 - `scanChecksums` — feeds checksum tasks to the worker pool; drains the reference phase first.
 - `coordinate` — the coordinator loop that owns the detector, dispatches executions, and decides termination.
-- `cowGroupExecutions` — the one-shot final batch for `find --cow`: `detector.CoWGroups()` → one `CoWDetect` execution per identical-content group, dispatched after the input is drained and all hashing has finished.
+- `detector.NextFinal(limit)` — passed to `coordinate` as the end-of-scan work source: elimination tasks (or one `CoWDetect` per content bucket in `find --cow`), drained in bounded batches after the input is finished and nothing is in flight.
 - `runExecutor` — the per-worker executor loop.
 - `reportOutcome` / `reportElimination` / `reportCoW` — user-facing output and stats. `reportCoW` prints one `CoW candidate group (N files, identical content):` block with a `shared: X% (Y of Z)` line per member, or the members only when `FileShared` is nil.
 - `printSummary` — final statistics, including `N CoW groups found (X of file bytes already shared)`.

@@ -180,16 +180,23 @@ type Detector struct {
     // inodes groups files by physical identity for --listlink.
     inodes map[InodeKey][]FileInfo
 
-    // inflight tracks paths that already have a hash/compare task queued.
-    inflight map[GroupKey]map[string]struct{}
+    // groups maps the composite key to one keyState: a bucket per known
+    // SHA-256 plus the files whose digest is still unknown.
+    groups map[GroupKey]*keyState
 
-    // scheduled tracks paths already handed to the executor for elimination.
-    scheduled map[string]struct{}
-
-    // coWDetect keeps every identical file in its bucket and suppresses
-    // per-pair DupeElim work (find --cow). The final CoWGroups() pass reports
-    // one group per matching SHA-256 bucket.
+    // coWDetect emits one CoWDetect per content bucket instead of per-victim
+    // DupeElim work (find --cow).
     coWDetect bool
+
+    // policy orders the members of a content bucket; the first is kept.
+    policy KeeperPolicy
+
+    // finalKeys / finalIdx walk the groups once the scan is over.
+    finalKeys []GroupKey
+    finalIdx  int
+
+    // failed counts finalization hash attempts that could not be completed.
+    failed map[string]int
 
     stats *Stats
 }
@@ -199,26 +206,28 @@ type Detector struct {
 ```go
 func NewDetector(stats *Stats, opts ...Option) *Detector
 func WithCoWDetect() Option
+func WithKeeperPolicy(policy KeeperPolicy) Option
 
 func (d *Detector) Insert(fi FileInfo) []Execution
-func (d *Detector) OnHashDone(key GroupKey, fi FileInfo) []Execution
-func (d *Detector) OnCompareDone(key GroupKey, a, b FileInfo) []Execution
+func (d *Detector) OnHashDone(key GroupKey, fi FileInfo, incomplete bool)
+func (d *Detector) OnCompareDone(key GroupKey, a, b FileInfo, incomplete bool)
+func (d *Detector) NextFinal(limit int) ([]Execution, bool)
 func (d *Detector) InsertInode(fi FileInfo)
 func (d *Detector) InodeGroups() [][]FileInfo
-func (d *Detector) CoWGroups() [][]FileInfo
 func (d *Detector) Len() int
 func (d *Detector) Stats() *Stats
 ```
 
 **Strategy by group size** (files sharing one `GroupKey`):
-1. **1 file** → store it; no SHA-256 work yet (avoids unnecessary I/O).
-2. **Exactly 2 unhashed files** → emit one `HashComp` (chunked comparison with early-stop). Partial progress is saved for a later resume.
-3. **3+ files** → emit `HashCalc` for every unhashed file that has no task in flight, then match completed hashes against the SHA-256 buckets.
+1. **1 file** → store it; no SHA-256 work yet (avoids unnecessary I/O), and no per-bucket map is allocated.
+2. **Exactly 2 unhashed files** → emit one `HashComp` (chunked comparison with early-stop). A verdict of "different" settles the pair; an interrupted attempt keeps its partial state and is resumed by `NextFinal`.
+3. **3+ files** → emit `HashCalc` for the file just inserted only (O(1) per insert); leftovers from an early-stopped comparison are completed by `NextFinal`.
 
 **Consistency rules**:
-- The first file placed in a SHA-256 bucket is the **keeper** and is never a victim.
-- A file is scheduled as a victim at most once; the `scheduled` set records it and it is never placed in a SHA-256 bucket, so it cannot be selected as a keeper or eliminated twice.
-- With `WithCoWDetect()` (`find --cow`), no per-pair work is emitted and nothing is scheduled for elimination: every identical file stays in its SHA-256 bucket. Once the input is drained, `CoWGroups()` returns one group per bucket that has at least two distinct physical files, keeping one path per `(Dev, Inode)` so hardlinked aliases collapse to a single member.
+- Elimination is deferred to `NextFinal`. For every content bucket whose content is fully known, the members are ordered by the **keeper policy** and the first one is kept; every other member becomes a victim. The keeper is therefore reproducible, not "whichever hash finished first".
+- Hardlinked aliases are collapsed after the policy ordering, so the surviving path of an inode is the preferred one and a path can never be both keeper and victim.
+- A file whose hash cannot be completed is retried at most `maxFailedHashRetries` times and then left alone: a file whose content was never verified is never eliminated.
+- With `WithCoWDetect()` (`find --cow`), `NextFinal` emits one `CoWDetect` per bucket that has at least two distinct physical files, keeping one path per `(Dev, Inode)` so hardlinked aliases collapse to a single member.
 - `InsertInode` ignores files with `Inode == 0` or `NumLinks < 2`, and groups by `InodeKey` (Dev + Inode).
 
 ## Action `Outcome` and `Result`
