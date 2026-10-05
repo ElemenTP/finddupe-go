@@ -22,11 +22,12 @@ Examples:
   finddupe dedupe --delete --ref /originals -- /copies
 
 Keeper selection: when several files have identical content, one of them (the
-keeper) keeps its data and the others are eliminated. Which file becomes the
-keeper is not deterministic - it is whichever file finishes hashing first on a
-multi-core scan. Use --ref to mark the files that must be kept: a reference file
-is never eliminated and always becomes the keeper of its content group, so its
-duplicates elsewhere are the ones removed.
+keeper) keeps its data and the others are eliminated. Elimination is decided only
+after the scan has finished, and the keeper is chosen by a fixed policy, so the
+same tree keeps the same file on every run: a reference file (--ref) first, then
+the file with the most hardlinks, then the smallest path. --prefer-compressed puts
+a compressed member (btrfs/zfs, APFS) ahead of that order so the CoW clone keeps
+the compression, and --interactive asks about each group instead.
 
 Note for users of the original Windows finddupe: there, -ref was a terminator
 ("everything after it is a reference") and references were never preferred over
