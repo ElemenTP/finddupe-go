@@ -296,45 +296,54 @@ For the group ratios there are two signals:
 
 ### ReFS / Dev Drive: Measured Behaviour
 
-The Windows probe bundle was run against a ReFS Dev Drive (Windows 11, ReFS 3.14,
-4096-byte clusters) and reported two things worth knowing:
+A ReFS Dev Drive (Windows 11, ReFS 3.14, 4096-byte clusters) was verified with the
+probe bundle in `testscripts/`, with the following results.
 
-- **`--prefer-compressed` is a no-op there.** ReFS does not implement NTFS per-file
-  compression (`compact /c` answers "The request is not supported"), so every answer
-  is `compressed=false` and the keeper order stays the default one. The flag is only
-  meaningful on Linux (btrfs/zfs) and macOS (APFS).
-- **Extent reporting may be unavailable even though the filesystem is "supported".**
-  On that volume `FSCTL_GET_RETRIEVAL_POINTERS` answered the request but reported no
-  extents for files that clearly have data. That is no longer read as an empty
-  mapping (which `find --cow` printed as "shared: 0.0%", a claim the answer does not
-  support): a file larger than one cluster whose query reports no extents is
-  reported as unavailable, with the raw numbers (`reported no extents for a
-  N-byte file (returned M bytes)`) so a probe log can tell the two cases apart.
-  Cloning is unaffected by this: it needs `FSCTL_DUPLICATE_EXTENTS_TO_FILE` and the
-  volume's cluster size, not the mapping.
-- **Destination preallocation is best-effort.** `SetFileInformationByHandle` with
-  `FileAllocationInfo` is an optimization (it keeps the clone from fragmenting) and
-  a ReFS Dev Drive rejected it; it is now attempted without being required, and the
-  failure is reported next to the clone error if the clone itself fails. Every step
-  of the clone path names itself in its error, so a probe log identifies the call
-  that failed instead of reporting "not supported on this filesystem" for
-  everything.
-- **The cluster size is resolved three ways.** `GetDiskFreeSpaceW` needs a volume
-  *root*, and that Dev Drive answered `ERROR_FILE_NOT_FOUND` for both the mount
-  point (GetVolumePathNameW) and the drive letter, which broke the clone path and
-  — because an extent query needs the cluster size to turn cluster numbers into
-  bytes — silently made `find --cow` report 0% shared. `volinfo.ClusterSize` now
-  tries the mount point, then the drive letter, and finally asks the volume through
-  a handle on the path itself (`FILE_FS_SIZE_INFORMATION`, which needs no root);
-  the answer of that last route is validated (a power of two between 512 bytes and
-  64 MiB) so a wrong information class cannot poison it. Every attempt's error is
-  joined into the returned error.
-- **An unsupported extent query stays an error off Unix.** The sparse-file special
-  case ("an unallocated file shares nothing") is decided from the allocation block
-  count, which only Unix exposes. On other platforms the query error is now kept
-  instead of being converted into an empty mapping — that conversion is what made
-  the probe report `extents=0` with no error while the volume had answered
-  nothing.
+**Working:** `dedupe --cow` clones (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`), `find --cow`
+reports the sharing ratio, a second run is a no-op because the pair already shares
+its extents, hardlink identity is untouched, and `--listlink` lists hardlink groups.
+
+```
+CoW cloned: '…\b.bin'                      ← dedupe --cow
+    '…\a.bin'  shared: 100.0% (1 MB of 1 MB)  ← find --cow afterwards
+    '…\b.bin'  shared: 100.0% (1 MB of 1 MB)
+```
+
+ReFS reports no per-extent "shared" flag, so the in-group signal is the physical LCN
+of each extent; extents come back as a small leading run plus one large run:
+
+```
+[0] logical=0    physical=28076752896 length=4096
+[1] logical=4096 physical=28114644992 length=1044480
+```
+
+**`--prefer-compressed` is a no-op on ReFS.** ReFS does not implement NTFS per-file
+compression (`compact /c` answers "The request is not supported"), so every answer
+is `compressed=false` and the keeper order stays the default one. The flag is only
+meaningful on Linux (btrfs/zfs) and macOS (APFS).
+
+**Two Windows-specific hazards found by that probe run, both fixed:**
+
+- *The cluster size cannot be assumed to come from a volume root.*
+  `GetDiskFreeSpaceW` needs a root path and that Dev Drive answered
+  `ERROR_FILE_NOT_FOUND` for both the mount point (`GetVolumePathNameW`) and the
+  drive letter. Because an extent query needs the cluster size before it can turn
+  cluster numbers into byte offsets, this alone made `find --cow` report 0% shared
+  and made `dedupe --cow` fail with "not supported on this filesystem". Route 3 —
+  `GetFileInformationByHandleEx(FILE_FS_SIZE_INFORMATION)` on a handle to the path
+  itself, which needs no root — is what answers on that volume; its result is
+  validated as a power of two between 512 bytes and 64 MiB. `volinfo.ClusterSize`
+  tries all three routes and joins every attempt's error, so a failure names the
+  call that failed.
+- *"The query was refused" must not be turned into "nothing is shared".* The
+  sparse-file special case (an unallocated file shares nothing) is decided from the
+  allocation block count, which only Unix exposes; off Unix the query error is now
+  kept. Before that, a refused query produced an empty mapping, which the report
+  printed as `shared: 0.0%` — a claim the volume had never made.
+
+`SetFileInformationByHandle(FileAllocationInfo)` (destination preallocation) is
+best-effort: it is an optimization against fragmentation, that volume rejects it,
+and the clone proceeds without it.
 
 ## Compressed-btrfs Caveat
 

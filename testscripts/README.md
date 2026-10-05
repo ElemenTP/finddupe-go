@@ -92,10 +92,25 @@ The whole script output (it is split into `== section ==` markers), plus:
   `false`. On ReFS every answer is expected to be `false`, because ReFS does not
   implement NTFS per-file compression (`compact /c` reports "The request is not
   supported"), which also means `--prefer-compressed` never changes anything there.
-  If `extentdump` reports `extents=0` for files that clearly have data, note whether
-  it also prints an error: a query that the volume answers without data is reported
-  as `FSCTL_GET_RETRIEVAL_POINTERS returned no data`, and `find --cow` then says
-  extent information is unavailable instead of claiming 0% shared.
+
+### What a healthy Windows/ReFS run looks like
+
+Verified on Windows 11 with a ReFS 3.14 Dev Drive (4096-byte clusters):
+
+- `extentdump` prints real extents (a small leading run plus one large run), and
+  `total logical bytes` equals the file size;
+- `dedupe --cow` prints `CoW cloned: '<victim>'` and `1 files replaced with CoW
+  clones`;
+- the `find --cow` that follows prints `shared: 100.0%` for every member;
+- a second `dedupe --cow` prints nothing and reports `Dupes: 0 B in 0 files`,
+  because the pair already shares its extents;
+- the hardlink section leaves both file IDs unchanged.
+
+If `extentdump` prints `extents=0` with no error, or `dedupe --cow` reports
+`cluster size of …`, send the whole log: both point at the volume refusing to
+describe itself, which is what the three-way cluster-size probe and the
+"unavailable" reporting are there to make visible instead of silently reporting
+"nothing shared".
 - `find --cow` groups byte-identical files that are not hardlinks of each
   other and prints, per file, how many bytes are already shared with the rest
   of the group:
