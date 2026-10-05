@@ -261,7 +261,9 @@ func (r *reportWriter) flush() {
 	_ = r.w.Flush()
 }
 
-func fileOrder(a, b dupe.FileInfo) bool {
+// fileOrder takes pointers: FileInfo is a large value and sorting copies its
+// arguments, so passing it by value cost O(n log n) copies per group.
+func fileOrder(a, b *dupe.FileInfo) bool {
 	if a.IsRef != b.IsRef {
 		return a.IsRef
 	}
@@ -818,10 +820,10 @@ func runListLink(
 // which are scheduling artifacts; sorting keeps the report reproducible.
 func sortGroups(groups [][]dupe.FileInfo) {
 	for _, group := range groups {
-		sort.Slice(group, func(i, j int) bool { return fileOrder(group[i], group[j]) })
+		sort.Slice(group, func(i, j int) bool { return fileOrder(&group[i], &group[j]) })
 	}
 	sort.Slice(groups, func(i, j int) bool {
-		return fileOrder(groups[i][0], groups[j][0])
+		return fileOrder(&groups[i][0], &groups[j][0])
 	})
 }
 

@@ -72,6 +72,10 @@ type Options struct {
 // Executor executes the work items the detector produces.
 type Executor struct {
 	opts Options
+
+	// layouts remembers the keepers whose groups are being eliminated, see
+	// alreadyShared.
+	layouts keeperLayoutCache
 }
 
 // New creates a new Executor.

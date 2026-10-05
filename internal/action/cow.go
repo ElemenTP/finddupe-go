@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"sync"
+	"time"
 
 	"finddupe/internal/dupe"
 	"finddupe/internal/extent"
@@ -40,7 +42,7 @@ func (e *Executor) cloneFile(ex dupe.Execution, victimInfo os.FileInfo) (Result,
 		return ResultSkippedCrossDevice, nil
 	}
 
-	if alreadyShared(keeper, victim) {
+	if e.alreadyShared(keeper, victim) {
 		return ResultAlreadyShared, nil
 	}
 
@@ -59,7 +61,7 @@ func (e *Executor) cloneFile(ex dupe.Execution, victimInfo os.FileInfo) (Result,
 // their storage. It is deliberately conservative: any uncertainty returns false
 // so the caller performs the clone. Encoded (compressed) extents participate,
 // because exact start+length identity is still meaningful for them.
-func alreadyShared(keeper, victim dupe.FileInfo) bool {
+func (e *Executor) alreadyShared(keeper, victim dupe.FileInfo) bool {
 	if samePhysicalFile(keeper, victim) {
 		return true
 	}
@@ -73,15 +75,72 @@ func alreadyShared(keeper, victim dupe.FileInfo) bool {
 		return false
 	}
 
-	keeperExtents, err := extent.Query(keeper.Path, keeper.Size)
-	if err != nil {
-		return false
+	// Every victim of one group asks about the same keeper, so its layout is
+	// remembered: a group of n files otherwise pays n−1 extra opens and FIEMAP
+	// calls (with FIEMAP_FLAG_SYNC on Linux) for an answer that cannot change —
+	// the keeper is never modified by an elimination.
+	keeperExtents, ok := e.layouts.get(keeper)
+	if !ok {
+		var err error
+		if keeperExtents, err = extent.Query(keeper.Path, keeper.Size); err != nil {
+			return false
+		}
+		e.layouts.put(keeper, keeperExtents)
 	}
+
 	victimExtents, err := extent.Query(victim.Path, victim.Size)
 	if err != nil {
 		return false
 	}
 	return extent.Equal(keeperExtents, victimExtents)
+}
+
+// keeperLayoutCache holds the extent layouts of the keepers whose groups are being
+// eliminated. Entries are keyed by path, size and modification time, so a file that
+// changed since it was scanned cannot be answered from a stale layout, and the map
+// is dropped once it reaches layoutCacheLimit: a run over a huge tree must not
+// accumulate an extent list per group forever.
+type keeperLayoutCache struct {
+	mu      sync.Mutex
+	entries map[string]keeperLayout
+}
+
+// layoutCacheLimit bounds the cache. Reaching it clears the map; the next victims
+// of each group re-query once, which is the cost this cache exists to avoid only
+// for the group being processed now.
+const layoutCacheLimit = 4096
+
+type keeperLayout struct {
+	size    int64
+	modTime time.Time
+	extents []extent.Extent
+}
+
+// get returns the cached layout of fi, if one was stored for exactly this version
+// of the file.
+func (c *keeperLayoutCache) get(fi dupe.FileInfo) ([]extent.Extent, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, ok := c.entries[fi.Path]
+	if !ok || entry.size != fi.Size || !entry.modTime.Equal(fi.ModTime) {
+		return nil, false
+	}
+	return entry.extents, true
+}
+
+// put stores the layout of fi.
+func (c *keeperLayoutCache) put(fi dupe.FileInfo, extents []extent.Extent) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.entries == nil {
+		c.entries = make(map[string]keeperLayout)
+	}
+	if len(c.entries) >= layoutCacheLimit {
+		clear(c.entries)
+	}
+	c.entries[fi.Path] = keeperLayout{size: fi.Size, modTime: fi.ModTime, extents: extents}
 }
 
 // detectCoW reports, for every file of an identical-content group, how many of

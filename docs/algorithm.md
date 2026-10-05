@@ -346,7 +346,10 @@ All platforms go through `cloneReplace(src, dst)` in `internal/action/cow.go`:
 ```
 0. If keeper and victim are the same physical file, or they are on the same
    device and their extent layouts compare Equal,
-   → ResultAlreadyShared (no clone, no file change)
+   → ResultAlreadyShared (no clone, no file change). The keeper's layout is
+   remembered for the rest of its group (keyed by path, size and mtime, bounded
+   and dropped when full), because every other victim asks the same question and
+   the keeper is never modified by an elimination
 1. Create a temporary file next to the victim
 2. Clone the keeper into the temporary path (platform-specific)
 3. Complete the clone's data layout from the keeper: the clone holds the keeper's

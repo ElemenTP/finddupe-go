@@ -10,6 +10,8 @@ import (
 	"finddupe/internal/config"
 	"finddupe/internal/dupe"
 	"finddupe/internal/extent"
+	"strconv"
+	"time"
 )
 
 // TestSameDevice covers the guard that keeps a hardlink from being attempted
@@ -258,5 +260,52 @@ func TestPhysicalIdentityMissing(t *testing.T) {
 				t.Errorf("physicalIdentityMissing(%v) = %v, want %v", tc.group, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestKeeperLayoutCache covers the cache that keeps a group of n files from
+// querying the same keeper n−1 times: an entry only answers for the exact version
+// of the file it was stored for, and the map is bounded.
+func TestKeeperLayoutCache(t *testing.T) {
+	t.Parallel()
+
+	var cache keeperLayoutCache
+	extents := []extent.Extent{{Logical: 0, Physical: 4096, Length: 100}}
+	modTime := time.Unix(1700000000, 0)
+	keeper := dupe.FileInfo{Path: "/data/keeper.bin", Size: 100, ModTime: modTime}
+
+	if _, ok := cache.get(keeper); ok {
+		t.Fatal("an empty cache must not answer")
+	}
+
+	cache.put(keeper, extents)
+	got, ok := cache.get(keeper)
+	if !ok || !extent.Equal(got, extents) {
+		t.Fatalf("cache get = (%v, %v), want the stored layout", got, ok)
+	}
+
+	// A file that changed since it was scanned must not be answered from the old
+	// layout: the decision (skip the clone) would be made on storage that no longer
+	// holds this content.
+	grown := keeper
+	grown.Size = 200
+	if _, hit := cache.get(grown); hit {
+		t.Error("a different size must miss the cache")
+	}
+	touched := keeper
+	touched.ModTime = modTime.Add(time.Second)
+	if _, hit := cache.get(touched); hit {
+		t.Error("a different modification time must miss the cache")
+	}
+
+	// The cache is bounded: filling it past the limit must not grow without end.
+	for i := range layoutCacheLimit + 1 {
+		cache.put(dupe.FileInfo{Path: filepath.Join("/data", strconv.Itoa(i)), Size: 1}, extents)
+	}
+	cache.mu.Lock()
+	size := len(cache.entries)
+	cache.mu.Unlock()
+	if size > layoutCacheLimit {
+		t.Errorf("cache holds %d entries, want at most %d", size, layoutCacheLimit)
 	}
 }
