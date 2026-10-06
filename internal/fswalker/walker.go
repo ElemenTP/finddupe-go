@@ -49,12 +49,32 @@ func sendResult(ctx context.Context, ch chan<- Result, result Result) bool {
 }
 
 // walkState is the state shared by the callbacks of one pattern: the set of
-// already-visited directories (symlink loop prevention within this pattern) and
-// whether the pattern matched anything.
+// already-visited directories (symlink loop prevention within this pattern),
+// whether the pattern matched anything, and the files already reported.
 type walkState struct {
 	seen    map[dirKey]bool
 	matched int
 	failed  bool
+
+	// files holds the paths already counted as skipped zero-length, shared by
+	// every pattern of one Walk call: the same file reached twice (a link and its
+	// target, overlapping patterns, "dir dir") is one skipped file. Results are
+	// deliberately left alone — the pipeline deduplicates them by path — so only
+	// the summary counter needs this.
+	files map[string]struct{}
+}
+
+// markZeroLen records a zero-length path and reports whether it is new to this
+// Walk call.
+func (st *walkState) markZeroLen(path string) bool {
+	if st.files == nil {
+		st.files = make(map[string]struct{})
+	}
+	if _, ok := st.files[path]; ok {
+		return false
+	}
+	st.files[path] = struct{}{}
+	return true
 }
 
 // dirKey identifies a directory the walk has entered. Physical identity is
@@ -157,11 +177,15 @@ func (w *Walker) Walk(ctx context.Context, patterns []string, opts WalkOptions) 
 
 // walkPatterns iterates over all patterns and walks each one.
 func (w *Walker) walkPatterns(ctx context.Context, patterns []string, opts WalkOptions, ch chan<- Result) {
+	// The file paths already reported are shared by every pattern of this call:
+	// the same file named twice (overlapping patterns, "dir dir", a link and its
+	// target) is one result and one skipped-zero-length count.
+	files := make(map[string]struct{})
 	for _, pattern := range patterns {
 		if ctx.Err() != nil {
 			return
 		}
-		w.walkPattern(ctx, pattern, opts, ch)
+		w.walkPattern(ctx, pattern, opts, ch, files)
 	}
 }
 
@@ -170,7 +194,7 @@ func (w *Walker) walkPatterns(ctx context.Context, patterns []string, opts WalkO
 // treated as a glob. A pattern that matches no usable file produces a
 // [NoMatchError] so a typo cannot pass for a successful run.
 func (w *Walker) walkPattern(
-	ctx context.Context, pattern string, opts WalkOptions, ch chan<- Result,
+	ctx context.Context, pattern string, opts WalkOptions, ch chan<- Result, files map[string]struct{},
 ) {
 	// Convert to absolute path for consistent dedup and output.
 	absPattern, err := filepath.Abs(pattern)
@@ -183,8 +207,8 @@ func (w *Walker) walkPattern(
 	// "/data/**/*.txt /data/**/*.jpg" would silently lose whole subtrees and
 	// report "no files matched" for a pattern that does match. Duplicate files
 	// reached by several patterns are deduplicated downstream
-	// (scanChecksums.seenPaths, Detector.seenPaths).
-	st := &walkState{}
+	// (scanChecksums.seenPaths, Detector.seenPaths) and by the shared file set.
+	st := &walkState{files: files}
 
 	if _, statErr := os.Stat(absPattern); statErr == nil {
 		// The pattern names an existing path, so it is taken literally: a path
@@ -353,13 +377,37 @@ func splitAtExistingDir(pattern string) (string, string) {
 func (w *Walker) createWalkFn(
 	ctx context.Context, baseDir, matchPattern string, opts WalkOptions, ch chan<- Result, st *walkState,
 ) fs.WalkDirFunc {
-	pattern := compilePattern(matchPattern, baseDir)
+	return w.matchWalkFn(ctx, baseDir, compilePattern(matchPattern, baseDir), opts, ch, st, "", 0)
+}
 
+// matchWalkFn is createWalkFn for an already-compiled pattern. A followed
+// directory link walks its target with the pattern the walk started with, plus
+// the position the link occupies in the tree:
+//
+//   - matchPrefix is the path the walked subtree is reached under (the link's
+//     path, possibly nested). An entry below the target is matched at
+//     matchPrefix + its path inside the target, so a link is a directory *at its
+//     own position*: the pattern's components above it are matched by the path to
+//     it, and everything below matches where the link's contents appear. This is
+//     what a followed *file* link does (matched where it sits, reported under the
+//     resolved path); without it, the pattern restarted at the target and files
+//     the plain walk would have found were lost.
+//   - depthOffset is the depth matchPrefix sits below the pattern's base
+//     directory, so the pattern's depth rules apply to the same tree position
+//     whether the entry was reached through the link or directly.
+func (w *Walker) matchWalkFn(
+	ctx context.Context, root string, pattern compiledPattern, opts WalkOptions,
+	ch chan<- Result, st *walkState, matchPrefix string, depthOffset int,
+) fs.WalkDirFunc {
 	return func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			// On permission errors, skip the directory to avoid a flood of
-			// "permission denied" errors for every file inside it.
+			// A directory whose contents cannot be read is reported once and
+			// skipped: repeating the error for every file inside it would only
+			// flood the log. Reporting it is what keeps it from looking like a
+			// pattern that matched nothing (or worse, passing silently).
 			if os.IsPermission(err) {
+				st.failed = true
+				sendResult(ctx, ch, Result{Info: dupe.FileInfo{Path: path}, Err: err})
 				return filepath.SkipDir
 			}
 			st.failed = true
@@ -384,13 +432,17 @@ func (w *Walker) createWalkFn(
 			}
 			return nil
 		}
-		depth := pathDepth(baseDir, path)
+		depth := pathDepth(root, path) + depthOffset
+		matchPath := path
+		if matchPrefix != "" {
+			matchPath = matchPrefix + strings.TrimPrefix(path, root)
+		}
 
 		// Plain directories are walked by WalkDir itself; recording them keeps a
 		// symlink pointing at a directory that is already (or later) part of the
 		// tree from being walked twice (see skipVisitedDir).
 		if d.IsDir() && !isSymlink {
-			if skipVisitedDir(baseDir, path, d, opts, st) {
+			if skipVisitedDir(root, path, d, opts, st) {
 				return filepath.SkipDir
 			}
 
@@ -420,7 +472,7 @@ func (w *Walker) createWalkFn(
 			if !pattern.descends(depth) {
 				return skipDir()
 			}
-			w.walkSymlinkTarget(ctx, resolved, matchPattern, opts, ch, st)
+			w.walkSymlinkTarget(ctx, resolved, pattern, opts, ch, st, matchPath, depth)
 			return skipDir()
 		}
 
@@ -428,7 +480,7 @@ func (w *Walker) createWalkFn(
 		// reported under its resolved target, which is the file the action layer
 		// must operate on (os.Link on a symlink path would link the symlink, and
 		// removing it would delete the link instead of the duplicate).
-		if !pattern.matches(path, depth) {
+		if !pattern.matches(matchPath, depth) {
 			return nil
 		}
 		if resolved != "" {
@@ -439,9 +491,11 @@ func (w *Walker) createWalkFn(
 		// skipped as empty: that is not a "no files matched" situation.
 		st.matched++
 
-		// Skip zero-length files unless IncludeZeroLen is set.
+		// Skip zero-length files unless IncludeZeroLen is set. The same file can
+		// be reached twice (a link and its target, overlapping patterns): count it
+		// once, the way the rest of the run reports it once.
 		if info.Size() == 0 && !opts.IncludeZeroLen {
-			if opts.ZeroLen != nil {
+			if opts.ZeroLen != nil && st.markZeroLen(path) {
 				opts.ZeroLen.AddZeroLen(1)
 			}
 			return nil
@@ -515,9 +569,16 @@ func (w *Walker) entryInfo(path string, d os.DirEntry, opts WalkOptions) (os.Fil
 // symlink; the caller passes the already-resolved target. The target is recorded
 // in the same set as the plain directories, so a target that is already part of
 // the tree (under either spelling) is not walked twice and a loop terminates.
+//
+// matchPrefix is the tree position the target is walked at (the link's path) and
+// depthOffset its depth below the pattern's base directory: the entries inside
+// are matched where the link sits, exactly as the plain visit of the same
+// directory matches them at its own position. Both visits therefore find the
+// same files under the same reported paths, which is what makes the "walked
+// once" set safe.
 func (w *Walker) walkSymlinkTarget(
-	ctx context.Context, target, matchPattern string,
-	opts WalkOptions, ch chan<- Result, st *walkState,
+	ctx context.Context, target string, pattern compiledPattern,
+	opts WalkOptions, ch chan<- Result, st *walkState, matchPrefix string, depthOffset int,
 ) {
 	// The stat is needed for the identity; a target that cannot be stat'ed is
 	// walked anyway and reports its own errors.
@@ -527,7 +588,7 @@ func (w *Walker) walkSymlinkTarget(
 	}
 
 	// Walk the resolved target directory.
-	walkFn := w.createWalkFn(ctx, target, matchPattern, opts, ch, st)
+	walkFn := w.matchWalkFn(ctx, target, pattern, opts, ch, st, matchPrefix, depthOffset)
 	if walkErr := filepath.WalkDir(target, walkFn); walkErr != nil {
 		st.failed = true
 		sendResult(ctx, ch, Result{Err: walkErr})
@@ -596,8 +657,10 @@ func (w *Walker) processFile(
 		path = target
 	}
 
+	// The same file can be named twice (a link and its target, overlapping
+	// arguments): count the skipped zero-length file once.
 	if info.Size() == 0 && !opts.IncludeZeroLen {
-		if opts.ZeroLen != nil {
+		if opts.ZeroLen != nil && st.markZeroLen(path) {
 			opts.ZeroLen.AddZeroLen(1)
 		}
 		return
@@ -674,7 +737,7 @@ func (p compiledPattern) matches(path string, depth int) bool {
 	}
 	if !p.recursive && p.depth == 1 {
 		// Single-component pattern: match the basename without splitting.
-		base := path[strings.LastIndexAny(path, "/\\")+1:]
+		base := path[strings.LastIndexAny(path, separators)+1:]
 		return matchComponent(p.parts[0], base)
 	}
 	return matchComponents(p.parts, relativeParts(p.baseDir, path))
@@ -682,12 +745,13 @@ func (p compiledPattern) matches(path string, depth int) bool {
 
 // relativeParts returns the components of path below baseDir. WalkDir always
 // builds path from baseDir, so a plain prefix cut is exact here.
+//
+// The split uses the same separator set as pathDepth: on Unix a backslash is an
+// ordinary byte in a file name, and splitting on it made a depth-limited pattern
+// fail on any path whose name contains one.
 func relativeParts(baseDir, path string) []string {
-	rest := path
-	if len(path) > len(baseDir) {
-		rest = path[len(baseDir):]
-	}
-	return strings.FieldsFunc(rest, func(r rune) bool { return r == '/' || r == '\\' })
+	rest := strings.TrimPrefix(path, baseDir)
+	return strings.FieldsFunc(rest, func(r rune) bool { return strings.ContainsRune(separators, r) })
 }
 
 // pathDepth returns how many components path sits below baseDir (0 for baseDir

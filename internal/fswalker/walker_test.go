@@ -461,6 +461,173 @@ func TestWalk_SymlinkToDir_Followed(t *testing.T) {
 	}
 }
 
+// walkPaths walks one pattern and returns the sorted result paths.
+func walkPaths(t *testing.T, pattern string, opts fswalker.WalkOptions) ([]string, []error) {
+	t.Helper()
+
+	w := fswalker.New()
+	paths, errs := collectResults(t, w.Walk(context.Background(), []string{pattern}, opts))
+	sort.Strings(paths)
+	return paths, errs
+}
+
+// TestWalk_DirLinkMatchesAtItsPosition is the regression test for a directory
+// symlink making a depth-limited pattern lose files. The link sits at depth 1 and
+// its target is also part of the tree: following the link re-anchored the pattern
+// on the target (so nothing inside matched), while the visit that would have
+// matched was skipped because the target had already been walked. Whatever the
+// plain walk finds must be found with -j as well.
+func TestWalk_DirLinkMatchesAtItsPosition(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "parent/v2.3/file.txt", "content")
+	symlinkTo(t, filepath.Join(dir, "parent", "v2.3"), filepath.Join(dir, "parent", "latest"))
+
+	pattern := filepath.Join(dir, "parent", "*", "*.txt")
+	plain, plainErrs := walkPaths(t, pattern, fswalker.WalkOptions{})
+	followed, followedErrs := walkPaths(t, pattern, fswalker.WalkOptions{FollowSymlinks: true})
+
+	if len(plainErrs) > 0 {
+		t.Fatalf("plain walk errors = %v", plainErrs)
+	}
+	if len(plain) != 1 {
+		t.Fatalf("plain walk paths = %v, want the file under v2.3", plain)
+	}
+	if len(followedErrs) > 0 {
+		t.Fatalf("the link visit made the pattern look like a miss: %v", followedErrs)
+	}
+	if len(followed) != len(plain) {
+		t.Fatalf("following the link changed the matches: %v vs %v", followed, plain)
+	}
+}
+
+// TestWalk_DirLinkMatchesWhereTheLinkSits covers the components a link occupies:
+// a file inside the target sits where the link's contents appear, not where the
+// target lives in the file system.
+func TestWalk_DirLinkMatchesWhereTheLinkSits(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "ext/a/x.txt", "content")
+	mkSubdir(t, dir, "scan")
+	symlinkTo(t, filepath.Join(dir, "ext"), filepath.Join(dir, "scan", "link"))
+
+	followed := fswalker.WalkOptions{FollowSymlinks: true}
+	// scan/link/a/x.txt: three components below the walk root.
+	deep := filepath.Join(dir, "scan", "*", "*", "*.txt")
+	paths, errs := walkPaths(t, deep, followed)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(paths) != 1 || !strings.HasSuffix(paths[0], "x.txt") {
+		t.Fatalf("scan/*/*/*.txt = %v, want x.txt through the link", paths)
+	}
+
+	// scan/link/a/x.txt is *not* scan/*/*.txt: the link occupies the first
+	// component, the directory inside the target the second.
+	shallow := filepath.Join(dir, "scan", "*", "*.txt")
+	paths, _ = walkPaths(t, shallow, followed)
+	if len(paths) != 0 {
+		t.Fatalf("scan/*/*.txt = %v, want nothing (the file is one level deeper)", paths)
+	}
+}
+
+// TestWalk_BackslashIsNotASeparator verifies that a name containing a backslash
+// is one path component on Unix: splitting on it made a depth-limited pattern
+// fail on any such file, while pathDepth (which uses the platform separator) said
+// the depth matched.
+func TestWalk_BackslashIsNotASeparator(t *testing.T) {
+	t.Parallel()
+
+	if filepath.Separator != '/' {
+		t.Skip("a backslash is a separator on this platform")
+	}
+
+	dir := t.TempDir()
+	writeFile(t, dir, `sub/a\b.txt`, "content")
+
+	pattern := filepath.Join(dir, "*", "*.txt")
+	paths, errs := walkPaths(t, pattern, fswalker.WalkOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("a depth-2 pattern must match a name containing a backslash, got %v", paths)
+	}
+}
+
+// TestWalk_UnreadableDirIsReported verifies that a directory whose contents
+// cannot be read is reported (and counted as unreadable) instead of looking like
+// a pattern that matched nothing.
+func TestWalk_UnreadableDirIsReported(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+
+	dir := t.TempDir()
+	writeFile(t, dir, "locked/b.txt", "content")
+	locked := filepath.Join(dir, "locked")
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	paths, errs := walkPaths(t, filepath.Join(dir, "**"), fswalker.WalkOptions{})
+	if len(paths) != 0 {
+		t.Fatalf("files inside an unreadable directory must not be reported, got %v", paths)
+	}
+	if len(errs) != 1 {
+		t.Fatalf("errors = %v, want one reported permission error", errs)
+	}
+
+	// A pattern naming the unreadable directory must not be reported as a miss.
+	direct := filepath.Join(locked, "**")
+	paths, errs = walkPaths(t, direct, fswalker.WalkOptions{})
+	if len(paths) != 0 {
+		t.Fatalf("paths = %v, want none", paths)
+	}
+	if len(errs) != 1 || isNoMatch(errs[0], direct) {
+		t.Fatalf("errors = %v, want the permission error and no no-match error", errs)
+	}
+}
+
+// countingZeroLen counts skipped zero-length files.
+type countingZeroLen struct{ n int64 }
+
+func (c *countingZeroLen) AddZeroLen(delta int64) { c.n += delta }
+
+// TestWalk_ZeroLengthCountedOnce verifies that the same skipped zero-length file
+// is counted once, whether it is reached twice through a link or named twice.
+func TestWalk_ZeroLengthCountedOnce(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "empty.txt", "")
+	symlinkTo(t, filepath.Join(dir, "empty.txt"), filepath.Join(dir, "link.txt"))
+
+	counter := &countingZeroLen{}
+	w := fswalker.New()
+	if _, errs := collectResults(t, w.Walk(context.Background(), []string{dir},
+		fswalker.WalkOptions{FollowSymlinks: true, ZeroLen: counter})); len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if counter.n != 1 {
+		t.Errorf("zero-length counter = %d with -j, want 1", counter.n)
+	}
+
+	counter = &countingZeroLen{}
+	if _, errs := collectResults(t, w.Walk(context.Background(), []string{dir, dir},
+		fswalker.WalkOptions{ZeroLen: counter})); len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if counter.n != 1 {
+		t.Errorf("zero-length counter = %d for a repeated directory, want 1", counter.n)
+	}
+}
+
 // TestWalk_SymlinkDir_SkippedWithoutFollow verifies that a directory symlink is
 // not descended into (and does not spill its contents in as files) by default.
 func TestWalk_SymlinkDir_SkippedWithoutFollow(t *testing.T) {
