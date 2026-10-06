@@ -106,12 +106,18 @@ Besides the CoW/compression scenarios, both scripts now end with:
   reports `Skipping duplicate readonly file` / `N read-only files skipped`; with `-r`
   the victim is replaced and keeps mode `0444` and its `user.probe` attribute
   (Linux). This is where the read-only xattr regression lived.
+- **a fully sparse file** (Windows): a size with no allocated clusters must be an
+  empty extent list, not an error; on ReFS the volume may instead describe nothing,
+  which is reported as unavailable rather than as 0% shared;
 - **`--prefer-compressed` A/B**: two groups with identical content and different
   compression state (on btrfs the plain member needs `btrfs property set … compression
   no` plus an in-place rewrite, which the script does). Without `-C` the smallest
   path wins and the group ends uncompressed; with `-C` the compressed member is the
-  keeper and every member still reports `compressed=true`. On ReFS both are `false`:
-  the flag is a no-op there.
+  keeper and every member still reports `compressed=true`. Where cloning is
+  unsupported (NTFS) the keeper is still observable in the failure line — the
+  compressed member with `-C`, the plain one without it. On ReFS both are `false`
+  (the flag is a no-op there), and a ReFS `Copy-Item` may block-clone the pair, which
+  the run correctly reports as already shared (`Dupes: 0`).
 
 The Windows script also dumps a sub-cluster file, which NTFS stores resident: the
 expectation is `extents=0` without an error, because "no extents" and "this

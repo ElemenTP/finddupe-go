@@ -294,7 +294,25 @@ Section "dedupe --cow -C: the compressed member is the keeper"
 Show $FD @("dedupe", "--cow", "--prefer-compressed", "--no-progress", (Join-Path $pc "with"))
 if ($CD) { & $CD (Join-Path $pc "with\aa-plain.bin") (Join-Path $pc "with\zz-compressed.bin") 2>&1 | Write-Host } else { Write-Host "compressdump not found" }
 Write-Host "expect: on a volume that can compress, -C keeps the group compressed and"
-Write-Host "        without it the plain member wins; on ReFS the flag changes nothing"
+Write-Host "        without it the plain member wins; where cloning works at all, the keeper"
+Write-Host "        named in a failure is still the compressed member with -C. On ReFS the"
+Write-Host "        flag changes nothing (both members stay plain), and a ReFS Copy-Item may"
+Write-Host "        block-clone the pair, in which case the run is a no-op ('Dupes: 0')."
+
+# A fully sparse file has a size but no allocated clusters. Linux answers "no
+# extents" (covered by a unit test); Windows is the open question, because ReFS has
+# been seen answering a query with no data at all, which the query reports as
+# unavailable rather than as "nothing is shared".
+$sparse = Join-Path $Dir "sparse"
+New-Item -ItemType Directory -Force -Path $sparse | Out-Null
+$holed = Join-Path $sparse "holed.bin"
+& fsutil file createnew $holed 1048576 | Out-Null
+& fsutil sparse setflag $holed 2>&1 | Out-Null
+& fsutil sparse setrange $holed 0 1048576 2>&1 | Out-Null
+Section "extentdump: a fully sparse file (no allocated clusters)"
+& $ED $holed 2>&1 | Write-Host
+Write-Host "expect: no extents and no error; 'unavailable' would also be an honest answer"
+Write-Host "        on a volume that describes nothing, and either is worth reporting"
 
 $res = Join-Path $Dir "resident"
 New-Item -ItemType Directory -Force -Path $res | Out-Null
