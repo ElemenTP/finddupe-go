@@ -960,6 +960,34 @@ func TestDedupeDelete_RemovesEveryPathOfAVictimInode(t *testing.T) {
 	}
 }
 
+// TestFind_DupesCountsStorageOncePerInode verifies that an alias of a victim is a
+// second name, not a second copy: every path is reported (and later acted on),
+// but the Dupes totals count the bytes that exist twice once.
+func TestFind_DupesCountsStorageOncePerInode(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := strings.Repeat("x", 25)
+	original := makeFile(t, dir, "original.txt", content)
+	aliasA := makeFile(t, dir, "copy-a.txt", content)
+	aliasB := makeHardlink(t, dir, "copy-b.txt", aliasA)
+
+	out, _, code := run(t, "find", dir, "--no-progress")
+	if code != 0 {
+		t.Fatalf("find exited %d:\n%s", code, out)
+	}
+	// The copy's two names are one physical file, so only one 25-byte copy exists
+	// twice, however many pairs are listed.
+	if got := summaryLine(out, "Dupes:"); got != "Dupes: 25 B in 1 files" {
+		t.Errorf("Dupes = %q, want the bytes that exist twice counted once:\n%s", got, out)
+	}
+	for _, path := range []string{original, aliasA, aliasB} {
+		if !strings.Contains(out, path) {
+			t.Errorf("%s missing from the report:\n%s", path, out)
+		}
+	}
+}
+
 func TestDedupeHardlink_WithReadonly(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

@@ -2,8 +2,12 @@ package pipeline //nolint:testpackage // exercises the unexported chooser
 
 import (
 	"bytes"
+	"context"
+	"io"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"finddupe/internal/config"
 	"finddupe/internal/dupe"
@@ -22,7 +26,8 @@ func members() []dupe.FileInfo {
 func newTestChooser(t *testing.T, action config.Action, answers string) (*interactiveChooser, *bytes.Buffer) {
 	t.Helper()
 	var seen bytes.Buffer
-	return newInteractiveChooser(action, newReportWriter(&seen), strings.NewReader(answers)), &seen
+	return newInteractiveChooser(context.Background(), action, newReportWriter(&seen),
+		strings.NewReader(answers)), &seen
 }
 
 func TestInteractiveChooser_KeepsByNumber(t *testing.T) {
@@ -110,5 +115,38 @@ func TestInteractiveChooser_EndOfInputStopsAsking(t *testing.T) {
 	}
 	if !chooser.stopped {
 		t.Fatal("end of input must stop further questions")
+	}
+}
+
+// TestInteractiveChooser_CancelledContextStops verifies that a cancelled run does
+// not stay parked on the prompt: the read blocks until the user answers, so
+// SIGINT would otherwise leave the process alive on stdin.
+func TestInteractiveChooser_CancelledContextStops(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// A pipe that is never written to: the read can only end through the context.
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Close(); _ = writer.Close() })
+
+	chooser := newInteractiveChooser(ctx, config.ActionDelete, newReportWriter(io.Discard), reader)
+	done := make(chan bool, 1)
+	go func() {
+		_, ok := chooser.Choose(members())
+		done <- ok
+	}()
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("a cancelled run must not keep a keeper")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Choose stayed parked on stdin after cancellation")
 	}
 }

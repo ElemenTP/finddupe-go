@@ -97,7 +97,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			return errInteractiveNeedsTerminal
 		}
 		detectorOpts = append(detectorOpts, dupe.WithKeeperChooser(
-			newInteractiveChooser(cfg.Action, report, os.Stdin),
+			newInteractiveChooser(ctx, cfg.Action, report, os.Stdin),
 		))
 	}
 	detector := dupe.NewDetector(stats, detectorOpts...)
@@ -162,7 +162,9 @@ func actionFailures(stats *dupe.Stats) error {
 // returned function is idempotent and waits for the line to be cleared, so
 // results never appear next to a stale progress line.
 func startProgress(ctx context.Context, cfg *config.Config, stats *dupe.Stats) func() {
-	if !cfg.ShowProgress || !progress.IsTerminal(os.Stderr) {
+	// The interactive chooser reads answers from the same terminal: a progress
+	// line redrawn every tick would erase the prompt.
+	if !cfg.ShowProgress || cfg.Interactive || !progress.IsTerminal(os.Stderr) {
 		return func() {}
 	}
 
@@ -302,10 +304,11 @@ func detectorOptions(cfg *config.Config) []dupe.Option {
 	if cfg.CoWDetect {
 		opts = append(opts, dupe.WithCoWDetect())
 	}
-	// A report has no action that would cover a hardlinked path, so it lists every
-	// path of a physical file — unless --hardlink asked to skip those pairs, which
-	// is the only thing that option does in find mode.
-	if cfg.Action == config.ActionReport && !cfg.SkipHardlinked && !cfg.CoWDetect {
+	// A report lists every path of a physical file. With --hardlink the executor
+	// classifies the pair as "already hardlinked" and drops it there — which is
+	// also where the documented verbose log lives — so the filter stays in one
+	// place and `-H` remains observable.
+	if cfg.Action == config.ActionReport && !cfg.CoWDetect {
 		opts = append(opts, dupe.WithHardlinkedAliases())
 	}
 	// The compression preference is about the clone source: a CoW clone inherits
@@ -481,6 +484,31 @@ type coordinator struct {
 	pending     []dupe.Execution
 	inFlight    int
 	execClosed  bool
+	victims     victimCounter
+}
+
+// victimCounter tracks the physical files already counted as duplicate storage.
+// A victim inode that owns several paths inside its group is acted on once per
+// path (each one is a real file to replace or remove), but the bytes exist twice
+// once: the Dupes totals must not grow with the number of names.
+type victimCounter struct {
+	counted map[dupe.InodeKey]struct{}
+}
+
+// count reports whether fi adds duplicate storage that was not counted yet.
+func (v *victimCounter) count(fi dupe.FileInfo) bool {
+	if fi.Inode == 0 {
+		return true // no identity: every path is its own physical file
+	}
+	key := dupe.InodeKey{Dev: fi.Dev, Inode: fi.Inode}
+	if _, ok := v.counted[key]; ok {
+		return false
+	}
+	if v.counted == nil {
+		v.counted = make(map[dupe.InodeKey]struct{})
+	}
+	v.counted[key] = struct{}{}
+	return true
 }
 
 // coordinate runs the coordinator loop until the input and all executor
@@ -527,7 +555,7 @@ func coordinate(
 	// still makes progress.
 	backlogLimit := max(cap(executionCh)*channelBufferFactor, 1)
 
-	for fiCh != nil || outCh != nil || len(c.pending) > 0 {
+	for ctx.Err() == nil && (fiCh != nil || outCh != nil || len(c.pending) > 0) {
 		// The send case is part of the select so that draining outcomes always
 		// stays possible, even when the execution channel is full.
 		var recv <-chan dupe.FileInfo
@@ -555,7 +583,7 @@ func coordinate(
 			if !ok {
 				outCh = nil
 			} else {
-				reportOutcome(ctx, out, c.stats, c.logger, c.report)
+				reportOutcome(ctx, out, c.stats, c.logger, c.report, &c.victims)
 				completeExecution(c.detector, out)
 				c.inFlight--
 			}
@@ -584,6 +612,12 @@ func coordinate(
 		}
 	}
 
+	// The loop can also end because the channel-closing selects won the race
+	// against <-ctx.Done(); a cancelled run must still report the cancellation, so
+	// the summary is not a "completed" one and the exit code is non-zero.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -652,11 +686,12 @@ func runExecutor(
 
 // reportOutcome prints results and updates statistics for a finished execution.
 func reportOutcome(
-	ctx context.Context, out action.Outcome, stats *dupe.Stats, logger *slog.Logger, report *reportWriter,
+	ctx context.Context, out action.Outcome, stats *dupe.Stats, logger *slog.Logger,
+	report *reportWriter, victims *victimCounter,
 ) {
 	switch out.Kind {
 	case dupe.DupeElim:
-		reportElimination(ctx, out, stats, logger, report)
+		reportElimination(ctx, out, stats, logger, report, victims)
 	case dupe.CoWDetect:
 		reportCoW(out, stats, report)
 	case dupe.HashCalc, dupe.HashComp:
@@ -666,7 +701,8 @@ func reportOutcome(
 
 // reportElimination handles the reported result of a DupeElim execution.
 func reportElimination(
-	ctx context.Context, out action.Outcome, stats *dupe.Stats, logger *slog.Logger, report *reportWriter,
+	ctx context.Context, out action.Outcome, stats *dupe.Stats, logger *slog.Logger,
+	report *reportWriter, victims *victimCounter,
 ) {
 	if len(out.Files) < dupe.FilesPerExecution {
 		return
@@ -688,7 +724,7 @@ func reportElimination(
 	// that turned out to share storage already — the same inode (already
 	// hardlinked) or the same extents (already shared) — and the pairs whose
 	// decision was withdrawn because a file changed during the scan.
-	if countsAsDuplicateStorage(out.Result) && !hardlinkAlias {
+	if countsAsDuplicateStorage(out.Result) && !hardlinkAlias && victims.count(victim) {
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 	}
@@ -808,9 +844,18 @@ func runListLink(
 	go scanChecksums(ctx, stats, logger, pool, walkResultCh, fileInfoCh, true, misses)
 
 	for fi := range fileInfoCh {
+		if ctx.Err() != nil {
+			break
+		}
 		stats.TotalFiles.Add(1)
 		stats.TotalBytes.Add(fi.Size)
 		detector.InsertInode(fi)
+	}
+
+	// An interrupted run must not look like a completed one: the groups printed so
+	// far are partial and the caller turns this into a non-zero exit code.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	groups := detector.InodeGroups()

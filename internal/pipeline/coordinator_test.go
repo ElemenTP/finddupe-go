@@ -2,6 +2,7 @@ package pipeline //nolint:testpackage // needs the unexported coordinator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"finddupe/internal/action"
+	"finddupe/internal/config"
 	"finddupe/internal/dupe"
 )
 
@@ -163,5 +165,44 @@ func TestCoordinateFinalizerRounds(t *testing.T) {
 	}
 	if calls < batches+1 {
 		t.Fatalf("finalizer called %d times, want at least %d", calls, batches+1)
+	}
+}
+
+// TestCoordinateCancelledContextIsReported is the regression test for an
+// interrupted run passing for a completed one: the loop could drain the closing
+// channels without ever selecting <-ctx.Done() and return nil, so SIGINT printed
+// the summary and exited 0.
+func TestCoordinateCancelledContextIsReported(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	stats := dupe.NewStats()
+	fileInfoCh := make(chan dupe.FileInfo)
+	executionCh := make(chan dupe.Execution)
+	outcomeCh := make(chan action.Outcome)
+	close(fileInfoCh)
+	close(outcomeCh)
+
+	err := coordinate(ctx, dupe.NewDetector(stats), stats, slog.New(slog.DiscardHandler),
+		fileInfoCh, executionCh, outcomeCh, newReportWriter(io.Discard), nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("coordinate returned %v, want context.Canceled", err)
+	}
+}
+
+// TestRunListLinkCancelledContextIsReported covers the same contract for
+// --listlink, which used to return only the pattern misses.
+func TestRunListLinkCancelledContextIsReported(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := runListLink(ctx, &config.Config{Paths: []string{t.TempDir()}}, dupe.NewStats(),
+		slog.New(slog.DiscardHandler), newReportWriter(io.Discard))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runListLink returned %v, want context.Canceled", err)
 	}
 }

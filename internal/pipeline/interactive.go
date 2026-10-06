@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ const maxPromptAttempts = 3
 // the whole group. That is also why the prompt can be a plain read from stdin —
 // no other stage is waiting for this goroutine while the user thinks.
 type interactiveChooser struct {
+	ctx    context.Context
 	action config.Action
 	report *reportWriter
 	input  *bufio.Reader
@@ -41,17 +43,48 @@ type interactiveChooser struct {
 
 // newInteractiveChooser creates a chooser reading answers from in. The caller is
 // responsible for checking that in is a terminal.
-func newInteractiveChooser(action config.Action, report *reportWriter, in io.Reader) *interactiveChooser {
+func newInteractiveChooser(ctx context.Context, action config.Action, report *reportWriter,
+	in io.Reader,
+) *interactiveChooser {
 	return &interactiveChooser{
+		ctx:    ctx,
 		action: action,
 		report: report,
 		input:  bufio.NewReader(in),
 	}
 }
 
+// readAnswer reads one line from the terminal. The read blocks until the user
+// answers, so a cancelled run (SIGINT/SIGTERM) would otherwise leave the process
+// parked on stdin: the read runs in its own goroutine and the context decides.
+// The goroutine is abandoned on cancellation; the process is on its way out and
+// closing stdin releases it.
+func (c *interactiveChooser) readAnswer() (string, error) {
+	if c.ctx == nil {
+		return c.input.ReadString('\n')
+	}
+
+	type answer struct {
+		line string
+		err  error
+	}
+	answers := make(chan answer, 1)
+	go func() {
+		line, err := c.input.ReadString('\n')
+		answers <- answer{line: line, err: err}
+	}()
+
+	select {
+	case got := <-answers:
+		return got.line, got.err
+	case <-c.ctx.Done():
+		return "", c.ctx.Err()
+	}
+}
+
 // Choose implements [dupe.KeeperChooser].
 func (c *interactiveChooser) Choose(members []dupe.FileInfo) (dupe.FileInfo, bool) {
-	if c.stopped {
+	if c.stopped || (c.ctx != nil && c.ctx.Err() != nil) {
 		return dupe.FileInfo{}, false
 	}
 	if c.autoDefault {
@@ -64,9 +97,10 @@ func (c *interactiveChooser) Choose(members []dupe.FileInfo) (dupe.FileInfo, boo
 		c.report.flush()
 		c.printPrompt(len(members))
 
-		line, err := c.input.ReadString('\n')
+		line, err := c.readAnswer()
 		if err != nil && line == "" {
-			// stdin ended (or failed): stop asking and leave the rest alone.
+			// stdin ended (or failed), or the run was cancelled: stop asking and
+			// leave the rest alone.
 			c.stopped = true
 			return dupe.FileInfo{}, false
 		}
