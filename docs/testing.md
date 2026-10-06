@@ -132,7 +132,11 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestWalk_DoubleStarCollapse` | Repeated `**` behaves like a single one |
 | `TestWalk_ManyDoubleStarsTerminate` | Regression: eight `**` against a 40-component path finish quickly (the matcher used to backtrack exponentially) |
 | `TestWalk_PatternWithFilePathPrefix` | A pattern under a regular file matches nothing and is reported as a miss |
-| `TestWalk_NonDirectoryPrefixReportsError` | A prefix that cannot be stat'ed for a reason other than "missing" is still reported |
+| `TestWalk_UnreadableDirIsReported` | A directory whose contents cannot be read is reported (and counted), not silently skipped; naming it directly is not a "no files matched" |
+| `TestWalk_DirLinkMatchesAtItsPosition` | Regression: a followed directory link matches the pattern where the link sits, so an in-tree link no longer loses the files the plain walk finds |
+| `TestWalk_DirLinkMatchesWhereTheLinkSits` | A file inside the target is matched at the depth it appears at through the link |
+| `TestWalk_BackslashIsNotASeparator` | A backslash in a name is one component on Unix |
+| `TestWalk_ZeroLengthCountedOnce` | A skipped zero-length file reached twice is counted once |
 | `TestWalk_SymlinkToFile_SkippedWithoutFollow` | Links are not reported unless `-j` |
 | `TestWalk_SymlinkToFile_FollowedIsReportedAsTarget` | Regression: a followed link is reported under the target's path with the target's size, never as the link itself |
 | `TestWalk_SymlinkToDir_Followed` | `-j` walks a directory link exactly once, even when the target is in the tree |

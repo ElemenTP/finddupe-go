@@ -67,7 +67,7 @@ This is not a standard CRC. The polynomial `(x >> 8) ^ ((x & 0xff) << 24) ^ ((x 
 
 ### Overview
 
-Duplicate detection is a **state machine** in `internal/dupe/detector.go`. The detector performs no I/O: callers feed it files and executor outcomes, and it returns `[]dupe.Execution` work items.
+Duplicate detection is a **state machine** in `internal/dupe/detector.go`. The detector performs no file I/O of its own: callers feed it files and executor outcomes, and it returns `[]dupe.Execution` work items. The one exception is the optional `--prefer-compressed` probe, consulted once per member while a group is ordered.
 
 ```
 detector.Insert(fi)                      → []Execution        // a newly scanned file
@@ -133,7 +133,9 @@ func (d *Detector) Insert(fi FileInfo) []Execution {
   `DefaultKeeperPolicy` — reference files first, then the file with more hardlinks
   (deleting or replacing a file that still has other links frees no storage), then the
   smallest path. With `--prefer-compressed` a compressed member is preferred ahead of
-  the hardlink and path rules (the probe runs once per member of a content group).
+  the hardlink and path rules (the probe runs once per member of a content group),
+  but never ahead of a reference file: the executor refuses to eliminate one, so a
+  reference that became a victim would leave the group un-eliminated.
   The choice no longer depends on which hash finished first, so a run is
   reproducible; `--ref` remains the way to force a specific original.
 - **One task per victim path**: each bucket's plan is built once and drained in
@@ -391,8 +393,9 @@ victim (existence and mode) and one of the clone it just created.
 
 The extent check is only a "skip the work" fast path: content equality was already
 established by the detector, so cloning anyway is safe and idempotent. It is
-deliberately conservative — `extent.Equal` returns false for empty lists, for
-encoded (compressed) extents, and for unknown (zero) physical addresses, and any
+deliberately conservative — `extent.Equal` returns false for empty lists and for
+unknown (zero) physical addresses, compares encoded (compressed) extents by their
+encoded runs, and any
 uncertainty (unsupported filesystem, query failure) simply means "clone".
 Physical offsets are only meaningful within one device, so two files with
 different `Dev` values are never treated as sharing storage. Extent lengths are

@@ -169,7 +169,10 @@ describe itself, which is what the three-way cluster-size probe and the
 - `find --cow` groups byte-identical files that are not hardlinks of each
   other and prints, per file, how many bytes are already shared with the rest
   of the group:
-  - on Linux the `FIEMAP_EXTENT_SHARED` flag is used when the filesystem sets
+  - on Linux the `FIEMAP_EXTENT_SHARED` flag is reported by `extentdump` as a
+    diagnostic per-file signal; the sharing ratio itself comes from the physical
+    ranges (`extent.SharedWithGroup`), because the flag says "shared with
+    someone", not with whom. The flag is used when the filesystem sets
     it, otherwise the physical start address is compared in-group;
   - on macOS/Windows there is no shared flag, so physical start identity is
     compared in-group.

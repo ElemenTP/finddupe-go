@@ -137,11 +137,11 @@ loses the file entirely, so the keeper's metadata is what remains.
 
 ### Linux — `FICLONE`
 
-`clone_linux.go` opens the clone destination with `O_CREATE|O_EXCL` and calls `unix.IoctlFileClone` (`FICLONE`) on the destination handle with the source handle. Supported on **btrfs** and **XFS** (reflink). Unsupported errors (`EOPNOTSUPP`, `ENOTTY`, `EINVAL`, `EXDEV`, `ENOSYS`) are joined with `ErrCoWNotSupported`.
+`clone_linux.go` opens the clone destination with `O_CREATE|O_EXCL` and calls `unix.IoctlFileClone` (`FICLONE`) on the destination handle with the source handle. Supported on **btrfs** and **XFS** (reflink). Unsupported errors (`EOPNOTSUPP`, `ENOTTY`, `EINVAL`, `ENOSYS`) are joined with `ErrCoWNotSupported`; `EXDEV` joins `ErrCrossDevice` instead, because the pair is on two volumes rather than the filesystem lacking reflink.
 
 ### macOS — `clonefile(2)`
 
-`clone_darwin.go` calls `unix.Clonefile(src, dst, 0)`. Supported on **APFS**. `clonefile` requires the destination not to exist, which `cloneReplace` guarantees by removing the temporary file first.
+`clone_darwin.go` calls `unix.Clonefile(src, dst, 0)`. Supported on **APFS**. `clonefile` requires the destination not to exist, which `cloneReplace` guarantees by asking for an exclusively-created name nothing has reserved (never create-then-remove, which another process could win).
 
 ### Windows — `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
 
@@ -287,7 +287,7 @@ map to different LCNs and report 0%; after `dedupe --cow` both files map to the
 same runs (`28074434560+4096`, `28053598208+1044480`), `find --cow` reports 100%,
 and a second `dedupe --cow` is a no-op. An existing hardlink is left untouched
 and appears in `find --listlink`. ReFS has no NTFS-style transparent compression,
-and files smaller than one cluster are reported as unsupported rather than
+and files smaller than one cluster have nothing to report rather than
 silently copied.
 
 ### Other Platforms
@@ -471,15 +471,19 @@ Read-only is determined by `FILE_ATTRIBUTE_READONLY`; Go normalizes this to the 
 ## 6. Symlinks and Reparse Points
 
 Links are detected via `d.Type()&os.ModeSymlink` and skipped unless `-j` is
-given. (A pattern that names a link directly is always resolved: the user asked
+given. (A pattern that names a *file* link directly is always resolved: the user asked
 for that path.) Following a link never uses the link's own metadata: `DirEntry.Info` is
 an `lstat`, so its `Size` is the length of the target path. With `-j` the link is
 resolved (`EvalSymlinks`) and classified by its target:
 
-- a link to a regular file is reported under the link's path with the target's
+- a link to a regular file is matched where the link sits and reported under the
+  resolved target's path with the target's
   size and physical identity, so it dedupes against the target instead of being
   treated as a tiny file;
-- a link to a directory is walked through the `seen` set, which is keyed by the
+- a link to a directory is walked at the position the link occupies (its target's
+  entries are matched where the link's contents appear, so a depth-limited pattern
+  behaves the same whether it reaches them through the link or directly), through
+  the `seen` set, which is keyed by the
   resolved path and also records plain directories, so a target that is already
   part of the tree is not walked twice and a loop (a link to an ancestor)
   terminates.

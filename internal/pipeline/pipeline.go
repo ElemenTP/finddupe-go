@@ -227,11 +227,10 @@ func (p *patternMisses) err() error {
 
 // fileOrder is the canonical order used wherever file order must not depend on
 // how the parallel hash workers happened to be scheduled: --ref files first
-// (they are the files the user marked as originals), then by path. It does not
-// decide which file becomes the keeper during elimination — that is still
-// whichever member's hash completes first — but it makes every report
-// reproducible and gives the user a way to pin the keeper for a run by naming
-// paths deliberately.
+// (they are the files the user marked as originals), then by path. The keeper
+// itself is chosen by the detector's policy once the whole scan is known (see
+// dupe.DefaultKeeperPolicy), not by this order; fileOrder only keeps reports and
+// inode groups reproducible.
 // reportWriter buffers the report: without it every line is a separate write(2),
 // and a slow stdout consumer (a pipe into a pager or a log collector) throttles
 // the scan itself, because the coordinator is the only writer. Every path that
@@ -596,8 +595,9 @@ func coordinate(
 		// Once the input is drained and nothing is queued or in flight, the
 		// detector state is final: ask it for end-of-scan work, in bounded
 		// batches, until it reports that nothing is left. The queue bound applies
-		// here too, so a scan with millions of duplicates never materializes all
-		// elimination tasks at once.
+		// here too, so the coordinator never holds more than one batch of
+		// elimination tasks (one content bucket with millions of members is still
+		// materialized as a whole when that bucket is decided).
 		if fiCh == nil && len(c.pending) == 0 && c.inFlight == 0 && !c.finalDone {
 			if c.final == nil {
 				c.finalDone = true

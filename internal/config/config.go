@@ -31,7 +31,7 @@ type Config struct {
 	RefPaths []string
 
 	// Threads is the number of scanner worker goroutines.
-	// Default: 0 (uses runtime.NumCPU).
+	// Default: 0 (uses twice runtime.NumCPU, capped).
 	Threads int
 
 	// Verbose enables detailed output.

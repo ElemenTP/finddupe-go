@@ -145,8 +145,9 @@ type WalkOptions struct {
 	// points found while walking. Without it they are skipped. When set, a link
 	// is resolved and classified by its target: links to directories are walked
 	// (with loop prevention) and links to regular files are reported with the
-	// target's size and identity under the link's path. A pattern that names a
-	// link directly always resolves it, with or without this option.
+	// target's size and identity under the resolved target's path. A pattern that
+	// names a *file* link directly always resolves it, with or without this
+	// option; a directory link named directly is only entered with this option.
 	FollowSymlinks bool
 
 	// IncludeZeroLen includes zero-length files (skipped by default).
@@ -372,8 +373,6 @@ func splitAtExistingDir(pattern string) (string, string) {
 // which case the entry is resolved and classified by what it points at — a
 // directory is walked through the loop-preventing seen set, a regular file is
 // reported with the target's metadata.
-//
-//nolint:gocognit // the walk callback handles many filesystem edge cases in one place
 func (w *Walker) createWalkFn(
 	ctx context.Context, baseDir, matchPattern string, opts WalkOptions, ch chan<- Result, st *walkState,
 ) fs.WalkDirFunc {
@@ -401,109 +400,133 @@ func (w *Walker) matchWalkFn(
 ) fs.WalkDirFunc {
 	return func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			// A directory whose contents cannot be read is reported once and
-			// skipped: repeating the error for every file inside it would only
-			// flood the log. Reporting it is what keeps it from looking like a
-			// pattern that matched nothing (or worse, passing silently).
-			if os.IsPermission(err) {
-				st.failed = true
-				sendResult(ctx, ch, Result{Info: dupe.FileInfo{Path: path}, Err: err})
-				return filepath.SkipDir
-			}
-			st.failed = true
-			sendResult(ctx, ch, Result{Err: err})
-			return nil
+			return w.reportWalkError(ctx, ch, st, path, err)
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return w.walkEntry(ctx, root, pattern, opts, ch, st, matchPrefix, depthOffset, path, d)
+	}
+}
 
-		// Check context cancellation.
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
+// reportWalkError reports an error WalkDir handed to the callback and tells it
+// whether to descend. A directory whose contents cannot be read is reported once
+// and skipped: repeating the error for every file inside it would only flood the
+// log, while reporting nothing made an unreadable subtree look like a pattern
+// that matched nothing (or worse, pass silently).
+func (w *Walker) reportWalkError(
+	ctx context.Context, ch chan<- Result, st *walkState, path string, err error,
+) error {
+	st.failed = true
+	if os.IsPermission(err) {
+		sendResult(ctx, ch, Result{Info: dupe.FileInfo{Path: path}, Err: err})
+		return filepath.SkipDir
+	}
+	sendResult(ctx, ch, Result{Err: err})
+	return nil
+}
 
-		// A directory symlink (a Windows junction reports ModeDir|ModeSymlink)
-		// must never be descended into by WalkDir: its target is walked
-		// explicitly below, so skipDir keeps the two from overlapping.
-		isSymlink := d.Type()&os.ModeSymlink != 0
-		skipDir := func() error {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		depth := pathDepth(root, path) + depthOffset
-		matchPath := path
-		if matchPrefix != "" {
-			matchPath = matchPrefix + strings.TrimPrefix(path, root)
-		}
+// walkEntry classifies one directory entry: a plain directory is descended into
+// by WalkDir, a link is resolved (and walked, or reported, or skipped), and a
+// regular file is matched and reported.
+func (w *Walker) walkEntry(
+	ctx context.Context, root string, pattern compiledPattern, opts WalkOptions,
+	ch chan<- Result, st *walkState, matchPrefix string, depthOffset int,
+	path string, d os.DirEntry,
+) error {
+	// A directory symlink (a Windows junction reports ModeDir|ModeSymlink)
+	// must never be descended into by WalkDir: its target is walked explicitly
+	// below, so skipEntry keeps the two from overlapping.
+	isSymlink := d.Type()&os.ModeSymlink != 0
+	depth := pathDepth(root, path) + depthOffset
+	matchPath := path
+	if matchPrefix != "" {
+		matchPath = matchPrefix + strings.TrimPrefix(path, root)
+	}
 
-		// Plain directories are walked by WalkDir itself; recording them keeps a
-		// symlink pointing at a directory that is already (or later) part of the
-		// tree from being walked twice (see skipVisitedDir).
-		if d.IsDir() && !isSymlink {
-			if skipVisitedDir(root, path, d, opts, st) {
-				return filepath.SkipDir
-			}
+	if d.IsDir() && !isSymlink {
+		return w.walkPlainDir(root, pattern, opts, st, path, d, depth)
+	}
+	if isSymlink && !opts.FollowSymlinks {
+		return skipEntry(d)
+	}
 
-			// Do not descend deeper than the pattern can match: "*.txt" needs one
-			// level below the base directory, "*/x.txt" two, "**" any number.
-			if !pattern.descends(depth) {
-				return filepath.SkipDir
-			}
-			return nil
+	info, resolved, infoErr := w.entryInfo(path, d, opts)
+	if infoErr != nil {
+		st.failed = true
+		sendResult(ctx, ch, Result{Err: infoErr})
+		return nil //nolint:nilerr // per-file errors are reported on the channel
+	}
+	if info == nil {
+		return skipEntry(d) // not a regular file, or an unreadable link
+	}
+	if info.IsDir() {
+		if !pattern.descends(depth) {
+			return skipEntry(d)
 		}
+		w.walkSymlinkTarget(ctx, resolved, pattern, opts, ch, st, matchPath, depth)
+		return skipEntry(d)
+	}
 
-		if isSymlink && !opts.FollowSymlinks {
-			return skipDir()
-		}
+	return w.reportFileEntry(ctx, pattern, opts, ch, st, info, path, matchPath, depth, resolved)
+}
 
-		info, resolved, infoErr := w.entryInfo(path, d, opts)
-		if infoErr != nil {
-			st.failed = true
-			sendResult(ctx, ch, Result{Err: infoErr})
-			return nil //nolint:nilerr // per-file errors are reported on the channel
-		}
-		if info == nil {
-			return skipDir() // not a regular file, or an unreadable link
-		}
+// skipEntry keeps WalkDir out of a symlink it must not descend into itself.
+func skipEntry(d os.DirEntry) error {
+	if d.IsDir() {
+		return filepath.SkipDir
+	}
+	return nil
+}
 
-		if info.IsDir() {
-			if !pattern.descends(depth) {
-				return skipDir()
-			}
-			w.walkSymlinkTarget(ctx, resolved, pattern, opts, ch, st, matchPath, depth)
-			return skipDir()
-		}
+// walkPlainDir records a directory WalkDir is about to descend into, so a symlink
+// pointing at a directory that is already (or later) part of the tree is not
+// walked twice (see skipVisitedDir), and stops the descent where the pattern can
+// no longer match.
+func (w *Walker) walkPlainDir(
+	root string, pattern compiledPattern, opts WalkOptions, st *walkState,
+	path string, d os.DirEntry, depth int,
+) error {
+	if skipVisitedDir(root, path, d, opts, st) {
+		return filepath.SkipDir
+	}
+	// "*.txt" needs one level below the base directory, "*/x.txt" two, "**" any.
+	if !pattern.descends(depth) {
+		return filepath.SkipDir
+	}
+	return nil
+}
 
-		// The entry is matched where it sits in the walk; a followed link is then
-		// reported under its resolved target, which is the file the action layer
-		// must operate on (os.Link on a symlink path would link the symlink, and
-		// removing it would delete the link instead of the duplicate).
-		if !pattern.matches(matchPath, depth) {
-			return nil
-		}
-		if resolved != "" {
-			path = resolved
-		}
-
-		// The pattern matched something usable, even if the file is later
-		// skipped as empty: that is not a "no files matched" situation.
-		st.matched++
-
-		// Skip zero-length files unless IncludeZeroLen is set. The same file can
-		// be reached twice (a link and its target, overlapping patterns): count it
-		// once, the way the rest of the run reports it once.
-		if info.Size() == 0 && !opts.IncludeZeroLen {
-			if opts.ZeroLen != nil && st.markZeroLen(path) {
-				opts.ZeroLen.AddZeroLen(1)
-			}
-			return nil
-		}
-
-		w.processFileEntry(ctx, path, info, ch)
+// reportFileEntry matches one regular file and reports it, counting a skipped
+// zero-length file once per Walk call.
+func (w *Walker) reportFileEntry(
+	ctx context.Context, pattern compiledPattern, opts WalkOptions, ch chan<- Result,
+	st *walkState, info os.FileInfo, path, matchPath string, depth int, resolved string,
+) error {
+	// The entry is matched where it sits in the walk; a followed link is then
+	// reported under its resolved target, which is the file the action layer must
+	// operate on (os.Link on a symlink path would link the symlink, and removing
+	// it would delete the link instead of the duplicate).
+	if !pattern.matches(matchPath, depth) {
 		return nil
 	}
+	if resolved != "" {
+		path = resolved
+	}
+
+	// The pattern matched something usable, even if the file is later skipped as
+	// empty: that is not a "no files matched" situation.
+	st.matched++
+
+	if info.Size() == 0 && !opts.IncludeZeroLen {
+		if opts.ZeroLen != nil && st.markZeroLen(path) {
+			opts.ZeroLen.AddZeroLen(1)
+		}
+		return nil
+	}
+
+	w.processFileEntry(ctx, path, info, ch)
+	return nil
 }
 
 // symlinkTarget returns the canonical target of path when path is itself a

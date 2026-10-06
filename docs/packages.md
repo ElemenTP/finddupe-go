@@ -126,6 +126,10 @@ type DefaultKeeperPolicy struct{}
 - `KeeperPolicy` — orders the members of one content bucket; the first is kept. `DefaultKeeperPolicy` prefers references, then more hardlinks, then the smallest path.
 - `KeeperChooser` — picks the keeper of one content bucket instead of the policy (`Choose(members) (keeper, ok)`); `dedupe --interactive` implements it by asking the user, and declining (or naming a non-member) leaves the bucket alone.
 - `InsertInode` / `InodeGroups` — `(Dev, Inode)` hardlink index used by `find --listlink`.
+- `WithHardlinkedAliases` — list the paths that already are the keeper's physical
+  file (`find` without `--hardlink`; every report sets it and the executor decides).
+- `WithCompressionPreference` — order compressed members first (after references) for
+  `dedupe --cow --prefer-compressed`.
 
 **Dependencies**: None (stdlib only)
 

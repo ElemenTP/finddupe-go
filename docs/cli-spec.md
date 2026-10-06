@@ -29,7 +29,7 @@ Scans the specified paths/patterns for duplicate files and reports them. No file
 | `--hardlink` | `-H` | bool | false | Skip already-hardlinked files when reporting duplicates. Files sharing the same `(Dev, Inode)` (already hardlinked to each other) are not reported; like every same-inode pair they are never counted as duplicate storage. |
 | `--listlink` | `-l` | bool | false | List hardlink groups (files sharing a physical inode) and exit. Skips duplicate detection entirely. |
 | `--cow` | `-c` | bool | false | CoW group mode: report every identical-content group with the per-file share of already-shared bytes. |
-| `--verbose` | `-v` | bool | false | Verbose output: show hardlink skip details, file index information |
+| `--verbose` | `-v` | bool | false | Verbose output: log the pairs an action skipped (already hardlinked, already shared, cross-device, changed) at info level |
 | `--zero` | `-z` | bool | false | Include zero-length files (skipped by default) |
 | `--no-progress` | `-p` | bool | false | Hide the progress indicator |
 | `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points: they are resolved and scanned as their target, under the target's own path |
