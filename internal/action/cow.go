@@ -34,16 +34,20 @@ func (e *Executor) cloneFile(ex dupe.Execution, keeperInfo, victimInfo os.FileIn
 	keeper := ex.Files[0]
 	victim := ex.Files[1]
 
-	if isReadOnly(victim.Path, victimInfo) && !e.opts.IncludeReadonly {
-		return ResultSkippedRO, nil
-	}
-
 	if !sameDevice(keeper, victim) {
 		return ResultSkippedCrossDevice, nil
 	}
 
+	// The already-shared answer comes before the read-only gate: it only reads
+	// extents, and a pair that shares all its storage holds one copy of the bytes,
+	// so it is not duplicate storage and must not be reported (or counted) as a
+	// read-only file that was left alone.
 	if e.alreadyShared(keeper, victim) {
 		return ResultAlreadyShared, nil
+	}
+
+	if isReadOnly(victim.Path, victimInfo) && !e.opts.IncludeReadonly {
+		return ResultSkippedRO, nil
 	}
 
 	if err := cloneReplace(keeper.Path, victim.Path, keeperInfo); err != nil {
@@ -248,6 +252,10 @@ func groupSharedBytes(files []dupe.FileInfo, groupExtents [][]extent.Extent) []i
 // cloneReplace writes a CoW clone of src to a free temporary name next to dst and
 // atomically replaces dst with it. On any failure dst is left untouched.
 func cloneReplace(src, dst string, srcInfo os.FileInfo) error {
+	// Set once the victim's write protection was cleared; a rename failure inside
+	// withTemporaryName runs it too, so the victim is never left unprotected.
+	var undo func()
+
 	return withTemporaryName(dst, func(tmpPath string) error {
 		if cloneErr := clonePlatformFile(src, tmpPath); cloneErr != nil {
 			// A clone that failed after creating (part of) the file leaves it
@@ -281,6 +289,9 @@ func cloneReplace(src, dst string, srcInfo os.FileInfo) error {
 			_ = os.Remove(tmpPath)
 			return err
 		}
+		// The rename runs after this callback returns, so it cannot call abandon:
+		// it is handed the same rollback instead.
+		undo = func() { restoreWriteProtection(dst, victimInfo, cleared) }
 
 		// A clone must hold as many bytes as the file it was cloned from. This is
 		// what stands between a filesystem that silently produced an unusable clone
@@ -290,6 +301,10 @@ func cloneReplace(src, dst string, srcInfo os.FileInfo) error {
 			return abandon(sizeErr)
 		}
 		return nil
+	}, func() {
+		if undo != nil {
+			undo()
+		}
 	})
 }
 

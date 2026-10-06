@@ -289,7 +289,8 @@ type startRef struct {
 }
 
 // sharedEncodedStarts adds the bytes of encoded and opaque extents whose physical
-// start appears in another member of the group, capped to the shorter extent.
+// start appears in another member of the group, capped to the widest overlap with
+// one of them.
 func sharedEncodedStarts(group [][]Extent, shared []int64) {
 	starts := collectPhysicalStarts(group)
 	for i, extents := range group {
@@ -322,26 +323,29 @@ func encodedSharedBytes(extents []Extent, starts map[uint64][]startRef, self int
 		if e.Physical == 0 || e.Length == 0 {
 			continue
 		}
-		if shortest := shortestOther(starts[e.Physical], self); shortest > 0 {
-			shared += int64(min(e.Length, shortest)) //nolint:gosec // bounded by the file size
+		if widest := longestOther(starts[e.Physical], self); widest > 0 {
+			shared += int64(min(e.Length, widest)) //nolint:gosec // bounded by the file size
 		}
 	}
 	return shared
 }
 
-// shortestOther returns the length of the shortest extent at a physical start
-// that belongs to a member other than self.
-func shortestOther(refs []startRef, self int) uint64 {
-	shortest := uint64(0)
+// longestOther returns the length of the longest extent at a physical start that
+// belongs to a member other than self. An extent's bytes are counted as shared
+// with the *union* of the other members, so the widest overlap at that start
+// decides; taking the shortest one under-counted the sharing as soon as three
+// members met at one start with different lengths.
+func longestOther(refs []startRef, self int) uint64 {
+	longest := uint64(0)
 	for _, ref := range refs {
 		if ref.member == self {
 			continue
 		}
-		if shortest == 0 || ref.length < shortest {
-			shortest = ref.length
+		if ref.length > longest {
+			longest = ref.length
 		}
 	}
-	return shortest
+	return longest
 }
 
 // interval is a half-open byte range used for overlap arithmetic.

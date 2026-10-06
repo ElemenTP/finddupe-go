@@ -16,8 +16,11 @@ import (
 // usageExitCode is returned when no path was given, like a flag error.
 const usageExitCode = 2
 
+// minArgs is the program name plus at least one path.
+const minArgs = 2
+
 func main() {
-	if len(os.Args) < usageExitCode-1 {
+	if len(os.Args) < minArgs {
 		fmt.Fprintf(os.Stderr, "usage: %s <path> [path...]\n", os.Args[0])
 		os.Exit(usageExitCode)
 	}

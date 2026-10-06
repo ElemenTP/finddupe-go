@@ -28,7 +28,11 @@ const (
 // take the name, so the create fails and the cleanup removes *their* file. The
 // name is therefore never reserved: create is retried on [fs.ErrExist], and
 // nothing is left behind when it fails.
-func withTemporaryName(dst string, create func(tmpPath string) error) error {
+//
+// create may report how to undo what it already did to dst (undo); it runs when
+// the rename fails, so the temporary file's removal and the caller's rollback are
+// not two different failure paths.
+func withTemporaryName(dst string, create func(tmpPath string) error, undo func()) error {
 	dir := filepath.Dir(dst)
 
 	for range tempNameAttempts {
@@ -44,6 +48,9 @@ func withTemporaryName(dst string, create func(tmpPath string) error) error {
 
 		if replaceErr := replaceFile(tmpPath, dst); replaceErr != nil {
 			_ = os.Remove(tmpPath) // best effort: report the replacement failure
+			if undo != nil {
+				undo()
+			}
 			return fmt.Errorf("replace %s: %w", dst, replaceErr)
 		}
 		return nil

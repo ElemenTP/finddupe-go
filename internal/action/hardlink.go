@@ -1,6 +1,7 @@
 package action
 
 import (
+	"errors"
 	"os"
 
 	"finddupe/internal/dupe"
@@ -45,6 +46,9 @@ func (e *Executor) createHardlink(ex dupe.Execution, victimInfo os.FileInfo) (Re
 		// The victim is untouched (the link is made under a temporary name and
 		// only renamed over it on success): put its mode back.
 		restoreWriteProtection(victim.Path, victimInfo, changed)
+		if errors.Is(err, ErrCrossDevice) {
+			return ResultSkippedCrossDevice, nil
+		}
 		return ResultError, err
 	}
 

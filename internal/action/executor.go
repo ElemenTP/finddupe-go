@@ -15,6 +15,7 @@ import (
 
 	"finddupe/internal/config"
 	"finddupe/internal/dupe"
+	"finddupe/internal/fileid"
 )
 
 const (
@@ -552,8 +553,20 @@ func ensureUnchanged(f *os.File, fi dupe.FileInfo) error {
 	if info.Size() != fi.Size {
 		return fmt.Errorf("%w: size is %d, scanned %d", dupe.ErrFileChanged, info.Size(), fi.Size)
 	}
-	if fi.HashOffset > 0 && !fi.ModTime.IsZero() && !info.ModTime().Equal(fi.ModTime) {
-		return fmt.Errorf("%w: modified since it was partially hashed", dupe.ErrFileChanged)
+	if fi.HashOffset > 0 {
+		if !fi.ModTime.IsZero() && !info.ModTime().Equal(fi.ModTime) {
+			return fmt.Errorf("%w: modified since it was partially hashed", dupe.ErrFileChanged)
+		}
+		// The saved state describes the bytes of one physical file. A replacement
+		// that keeps the size and the modification time (`cp -p`, a temporary file
+		// renamed over the path) would otherwise be hashed as a mix of the old
+		// prefix and the new suffix, and the resulting digest would describe
+		// neither version.
+		if fi.Inode != 0 {
+			if dev, inode, _, ok := fileid.FromFileInfo(info); ok && (dev != fi.Dev || inode != fi.Inode) {
+				return fmt.Errorf("%w: replaced since it was partially hashed", dupe.ErrFileChanged)
+			}
+		}
 	}
 	return nil
 }

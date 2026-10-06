@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"finddupe/internal/extent"
@@ -298,6 +299,26 @@ func TestSharedFlagBytes(t *testing.T) {
 	}
 	if got := extent.SharedFlagBytes(extents); got != 150 {
 		t.Fatalf("SharedFlagBytes = %d, want 150", got)
+	}
+}
+
+// TestSharedWithGroup_EncodedWidestOverlap covers three members meeting at one
+// physical start with different lengths: an extent's bytes are shared with the
+// *union* of the other members, so the widest overlap decides. Counting the
+// shortest other extent reported 40/40/40 instead of 70/40/70.
+func TestSharedWithGroup_EncodedWidestOverlap(t *testing.T) {
+	t.Parallel()
+
+	group := [][]extent.Extent{
+		{{Logical: 0, Physical: 100, Length: 100, Encoded: true}},
+		{{Logical: 0, Physical: 100, Length: 40, Encoded: true}},
+		{{Logical: 0, Physical: 100, Length: 70, Encoded: true}},
+	}
+
+	got := extent.SharedWithGroup(group)
+	want := []int64{70, 40, 70}
+	if !slices.Equal(got, want) {
+		t.Fatalf("SharedWithGroup = %v, want %v", got, want)
 	}
 }
 
