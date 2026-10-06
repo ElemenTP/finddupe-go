@@ -2,6 +2,9 @@ package action
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -115,6 +118,57 @@ func TestCopyTailAt_DestinationOffset(t *testing.T) {
 	want := []byte("............DDDD")
 	if !bytes.Equal(got, want) {
 		t.Fatalf("destination = %q, want %q (tail written at the wrong offset)", got, want)
+	}
+}
+
+// TestCompareStreams_EndsEarlyIsChangedNotASpin is the regression test for a
+// stream that ends before the size recorded for it (a file truncated while the
+// comparison ran): the loop fed zero bytes into both digests forever, so the run
+// hung at 100% CPU instead of reporting the pair as changed.
+func TestCompareStreams_EndsEarlyIsChangedNotASpin(t *testing.T) {
+	t.Parallel()
+
+	orig := dupe.FileInfo{Path: "a", Size: 10}
+	cand := dupe.FileInfo{Path: "b", Size: 10}
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := compareStreams(context.Background(),
+			bytes.NewReader([]byte("abc")), bytes.NewReader([]byte("abc")),
+			orig, cand, 4)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, dupe.ErrFileChanged) {
+			t.Fatalf("err = %v, want ErrFileChanged for a stream that ends early", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("compareStreams made no progress on a stream that ends early")
+	}
+}
+
+// TestCompareStreams_EqualContentCompletes keeps the normal path honest: two
+// equal streams of the recorded size finish with the same digest.
+func TestCompareStreams_EqualContentCompletes(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("identical-bytes")
+	orig := dupe.FileInfo{Path: "a", Size: int64(len(content))}
+	cand := dupe.FileInfo{Path: "b", Size: int64(len(content))}
+
+	gotOrig, gotCand, err := compareStreams(context.Background(),
+		bytes.NewReader(content), bytes.NewReader(content), orig, cand, 4)
+	if err != nil {
+		t.Fatalf("compareStreams: %v", err)
+	}
+	if gotOrig.SHA256 != gotCand.SHA256 || gotOrig.SHA256 != sha256.Sum256(content) {
+		t.Fatal("two equal streams must finish with the digest of their content")
+	}
+	if gotOrig.HashOffset != orig.Size || gotCand.HashOffset != cand.Size {
+		t.Fatalf("offsets = %d/%d, want %d/%d",
+			gotOrig.HashOffset, gotCand.HashOffset, orig.Size, cand.Size)
 	}
 }
 

@@ -306,6 +306,23 @@ func hashCompare(
 		return orig, cand, changedErr
 	}
 
+	if _, seekErr := fOrig.Seek(orig.HashOffset, io.SeekStart); seekErr != nil {
+		return orig, cand, seekErr
+	}
+	if _, seekErr := fCand.Seek(cand.HashOffset, io.SeekStart); seekErr != nil {
+		return orig, cand, seekErr
+	}
+
+	return compareStreams(ctx, fOrig, fCand, orig, cand, chunkSize)
+}
+
+// compareStreams hashes and compares two streams that are positioned at
+// HashOffset and must deliver Size-HashOffset bytes each. It stops at the first
+// chunk whose accumulated digests differ, storing the partial state so a later
+// attempt resumes instead of re-reading.
+func compareStreams(
+	ctx context.Context, rOrig, rCand io.Reader, orig, cand dupe.FileInfo, chunkSize int64,
+) (dupe.FileInfo, dupe.FileInfo, error) {
 	hOrig, err := restoreHasher(orig.HashState)
 	if err != nil {
 		return orig, cand, err
@@ -313,13 +330,6 @@ func hashCompare(
 	hCand, err := restoreHasher(cand.HashState)
 	if err != nil {
 		return orig, cand, err
-	}
-
-	if _, seekErr := fOrig.Seek(orig.HashOffset, io.SeekStart); seekErr != nil {
-		return orig, cand, seekErr
-	}
-	if _, seekErr := fCand.Seek(cand.HashOffset, io.SeekStart); seekErr != nil {
-		return orig, cand, seekErr
 	}
 
 	remaining := orig.Size - orig.HashOffset
@@ -340,7 +350,7 @@ func hashCompare(
 
 		toRead := min(chunkSize, remaining)
 
-		nOrig, nCand, readErr := readCompareChunk(fOrig, fCand, bufOrig[:toRead], bufCand[:toRead])
+		nOrig, nCand, readErr := readCompareChunk(rOrig, rCand, bufOrig[:toRead], bufCand[:toRead])
 		if readErr != nil {
 			return orig, cand, readErr
 		}
@@ -350,6 +360,13 @@ func hashCompare(
 			// and no resume state is recorded: the two offsets would no longer
 			// describe prefixes of the same length.
 			return orig, cand, fmt.Errorf("file changed while comparing: %w", dupe.ErrFileChanged)
+		}
+
+		if int64(nOrig) < toRead {
+			// Both streams ended before the size recorded for them, so both were
+			// truncated while the comparison ran. This must be an error: without it
+			// the loop would read EOF forever without making progress.
+			return orig, cand, fmt.Errorf("file ended early while comparing: %w", dupe.ErrFileChanged)
 		}
 
 		hOrig.Write(bufOrig[:nOrig])
@@ -373,10 +390,11 @@ func hashCompare(
 	return orig, cand, nil
 }
 
-// readCompareChunk reads one chunk from both files. A short read is not an error
-// here: the caller detects the length mismatch from the two counts, while a real
-// read failure must not be mistaken for one of the files ending early.
-func readCompareChunk(fOrig, fCand *os.File, bufOrig, bufCand []byte) (int, int, error) {
+// readCompareChunk reads one chunk from both streams. A short read is not an
+// error here: the caller detects the length mismatch from the two counts (and an
+// early end from the requested length), while a real read failure must not be
+// mistaken for one of the files ending early.
+func readCompareChunk(fOrig, fCand io.Reader, bufOrig, bufCand []byte) (int, int, error) {
 	nOrig, errOrig := io.ReadFull(fOrig, bufOrig)
 	nCand, errCand := io.ReadFull(fCand, bufCand)
 
