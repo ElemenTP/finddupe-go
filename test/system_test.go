@@ -461,6 +461,37 @@ func TestFind_LargeFiles(t *testing.T) {
 	}
 }
 
+// TestFind_ThirdFileAfterADifferentPair is the regression test for a weak group
+// whose first two files were compared directly and proved different *before* a
+// third file with the same weak key arrived: the group stayed marked as settled,
+// the pair was never hashed, and the third file — identical to one of the two —
+// was never reported. The filler files only delay the third file so that verdict
+// lands first, which is what any tree with more files ahead of it does.
+func TestFind_ThirdFileAfterADifferentPair(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	early := makeDir(t, dir, "early")
+	late := makeDir(t, dir, "late")
+
+	prefix := strings.Repeat("H", 32768) // one byte past the scan-time SHA-256 window
+	content := prefix + "A"
+	makeFile(t, early, "a.bin", content)
+	makeFile(t, early, "b.bin", prefix+"B") // same weak signature, differs at the last byte
+	for i := range 1200 {
+		makeFile(t, late, fmt.Sprintf("%04d.filler", i), fmt.Sprintf("filler-%04d", i))
+	}
+	makeFile(t, late, "zzz.bin", content) // walked last: identical to a.bin
+
+	out, _, code := run(t, "find", early, late, "--no-progress")
+	if code != 0 {
+		t.Fatalf("find exited %d:\n%s", code, out)
+	}
+	if n := countDuplicates(out); n != 1 {
+		t.Fatalf("find reported %d duplicates, want the identical pair a.bin/zzz.bin:\n%s", n, out)
+	}
+}
+
 func TestFind_SameFirstChunkDifferentAfter(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

@@ -97,7 +97,7 @@ hold several unrelated contents that happen to share a weak signature and a size
 | Files sharing the key | Action |
 |-----------------------|--------|
 | 1 file | Store it. No hashing — unique files cost nothing beyond the weak checksum, and the per-bucket maps are not even allocated. |
-| Exactly 2 unhashed files | Emit one `HashComp` (chunked comparison with early-stop). A verdict of "the two differ" settles the pair: neither file is hashed further. |
+| Exactly 2 unhashed files | Emit one `HashComp` (chunked comparison with early-stop). A verdict of "the two differ" settles the pair: neither file is hashed further, *as long as the group still has only those two members*. A third file with the same weak key can be identical to one of them, so the pair is hashed by `NextFinal` once the group grows (a sticky "settled" flag silently dropped that duplicate). |
 | 3 or more files | Emit `HashCalc` for the file just inserted — O(1) per insert, whatever the group size. Files an early-stopped comparison left behind are completed by `NextFinal`. |
 
 ### Pseudocode
@@ -234,9 +234,12 @@ Given: fileA, fileB, chunk size derived from the file size
 3. remaining = size - HashOffset
 4. While remaining > 0:
    a. Read up to chunkSize bytes from each file
-   b. If either read is short/zero → truncated: stop, keep partial state
-      (the bytes that were read are fed into the digests first, so HashOffset
-      never runs ahead of the hasher)
+   b. If either read is short (or returns nothing while bytes remain) → that file
+      ended before the size recorded for it, so it was truncated while the
+      comparison ran: stop with dupe.ErrFileChanged and record no new partial
+      state, so the stored HashOffset stays at a prefix that really was hashed.
+      Zero bytes are never treated as progress — doing so made the loop read EOF
+      forever and the run hang at 100% CPU instead of reporting the pair
    c. Feed both chunks to their SHA-256 hashers
    d. If the accumulated hashes differ → stop early, keep partial state
    e. remaining -= bytes read

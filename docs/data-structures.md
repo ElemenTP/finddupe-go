@@ -226,7 +226,7 @@ func (d *Detector) InodeGroups() map[InodeKey][]FileInfo
 
 **Strategy by group size** (files sharing one `GroupKey`):
 1. **1 file** → store it; no SHA-256 work yet (avoids unnecessary I/O), and no per-bucket map is allocated.
-2. **Exactly 2 unhashed files** → emit one `HashComp` (chunked comparison with early-stop). A verdict of "different" settles the pair; an interrupted attempt keeps its partial state and is resumed by `NextFinal`.
+2. **Exactly 2 unhashed files** → emit one `HashComp` (chunked comparison with early-stop). A verdict of "different" settles the pair *while the group has exactly those two members* — a third file with the same weak key can be identical to one of them, so the pending pair is hashed once `count` grows past `MinGroupSize`; an interrupted attempt keeps its partial state and is resumed by `NextFinal`.
 3. **3+ files** → emit `HashCalc` for the file just inserted only (O(1) per insert); leftovers from an early-stopped comparison are completed by `NextFinal`.
 
 **Consistency rules**:

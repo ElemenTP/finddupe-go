@@ -102,7 +102,9 @@ type keyState struct {
 	count int
 
 	// settled marks a two-file group whose direct comparison proved that the two
-	// files differ, so neither has to be hashed.
+	// files differ, so neither has to be hashed. It only holds while the group
+	// still has those two members: a third file with the same weak key may be
+	// identical to one of them, so the pending pair is hashed once count grows.
 	settled bool
 
 	// plan is the remaining end-of-scan work of the group: one DupeElim per
@@ -389,7 +391,12 @@ func (d *Detector) NextFinal(limit int) ([]Execution, bool) {
 // completeHashesLocked schedules a HashCalc for the files of a group whose
 // digest is still unknown and has not already failed too often.
 func (d *Detector) completeHashesLocked(key GroupKey, st *keyState, limit int) []Execution {
-	if st.settled || len(st.pending) == 0 || limit <= 0 {
+	// settled only says "the direct comparison of *these two* files proved they
+	// differ". It must not stop hashing once a third file has joined the group:
+	// the two pending files were never hashed, so one of them can still be a
+	// duplicate of that third file. Only a group that still has exactly those two
+	// members is settled.
+	if len(st.pending) == 0 || limit <= 0 || (st.settled && st.count == MinGroupSize) {
 		return nil
 	}
 

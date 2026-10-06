@@ -47,6 +47,7 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDetector_ThreeIdenticalFiles_AllReported` | Three identical files → two eliminations, one keeper, no victim twice |
 | `TestDetector_EarlyStoppedCompareIsCompleted` | Regression: files stranded by an early-stopped comparison are hashed by `NextFinal`, so a duplicate against a later-finished file is found |
 | `TestDetector_SettledPairNotHashed` | A two-file comparison that proved a difference needs no hashing |
+| `TestDetector_SettledPairIsHashedWhenTheGroupGrows` | Regression: a third file with the same weak key after that verdict is hashed against the pending pair instead of being silently unmatched |
 | `TestDetector_FailedCompareIsRetried` | A comparison that could not run leads to a hash attempt, and unhashable files stop being retried |
 | `TestDetector_KeeperPolicyPrefersReference` | A reference wins the keeper choice even when it was inserted last |
 | `TestDetector_KeeperPolicyPrefersMoreHardlinks` | The victim is the file whose removal actually frees storage |
@@ -80,6 +81,8 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDoExecution_HashCalc_Resumes` | Hashing resumes from `HashState`/`HashOffset` |
 | `TestDoExecution_HashComp_Identical` | Identical pair → both SHA-256 complete and equal |
 | `TestDoExecution_HashComp_EarlyStop` | Differing chunks stop early and save partial state |
+| `TestCompareStreams_EndsEarlyIsChangedNotASpin` | Regression: a stream that ends before its recorded size (a file truncated mid-comparison) is reported as changed instead of feeding zero bytes forever |
+| `TestCompareStreams_EqualContentCompletes` | Two equal streams of the recorded size finish with the same digest |
 | `TestDoExecution_DupeElim_Delete` | Victim deleted, keeper preserved |
 | `TestDoExecution_DupeElim_RefVictimSkipped` | Reference victim → `ResultSkippedRef`, file preserved |
 | `TestDoExecution_DupeElim_SkipHardlinked` | Same `(Dev, Inode)` pair → `ResultAlreadyHardlinked` |
@@ -227,14 +230,14 @@ so `/dev/null` is no longer mistaken for a terminal.
 
 System tests build the `finddupe` binary once in `TestMain` and run it against real temp directories. The package is split: `test/doc.go` declares `package test` while the tests use `package test_test`.
 
-There are **63 test functions** in `test/system_test.go` plus the `TestMain`
-harness — `grep -c '^func Test' test/system_test.go` reports **64** because it
+There are **64 test functions** in `test/system_test.go` plus the `TestMain`
+harness — `grep -c '^func Test' test/system_test.go` reports **65** because it
 also matches `TestMain` — and one more in `test/output_unix_test.go` (Unix only,
 because the crafted file name needs a control character that Windows forbids).
 
 ### Find Mode (19 tests)
 
-Basic duplicates, no duplicates, empty directory, zero-length files (skipped/included), verbose mode, threads flag, multiple paths, glob patterns, recursive glob, large files, CRC near-collision (same first chunk, different after), binary files, many duplicates, single file, multiple duplicate groups, `TestFind_ThreeOrMoreIdenticalFiles` (the regression test that 4 identical files yield exactly 3 duplicate reports), `TestFind_DuplicatePathArgs_NoSelfDuplicate` (a directory passed twice must not report a file against itself), and `TestFind_ReportsAlreadyHardlinkedPair` (an already-hardlinked pair is listed with the `(hardlinked instances of same file)` tag and only `--hardlink` suppresses it).
+Basic duplicates, no duplicates, empty directory, zero-length files (skipped/included), verbose mode, threads flag, multiple paths, glob patterns, recursive glob, large files, CRC near-collision (same first chunk, different after), binary files, many duplicates, single file, multiple duplicate groups, `TestFind_ThreeOrMoreIdenticalFiles` (the regression test that 4 identical files yield exactly 3 duplicate reports), `TestFind_DuplicatePathArgs_NoSelfDuplicate` (a directory passed twice must not report a file against itself), `TestFind_ReportsAlreadyHardlinkedPair` (an already-hardlinked pair is listed with the `(hardlinked instances of same file)` tag and only `--hardlink` suppresses it), and `TestFind_ThirdFileAfterADifferentPair` (the regression test that a third file with the same weak key, arriving after the first two were proven different, is still matched against them).
 
 ### Dedupe `--delete` (10 tests)
 

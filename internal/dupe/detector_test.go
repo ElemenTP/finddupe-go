@@ -57,6 +57,35 @@ func finalAll(t *testing.T, d *dupe.Detector) []dupe.Execution {
 	return nil
 }
 
+// finalizeWithDigests drains the end-of-scan work the way the coordinator does:
+// every HashCalc is answered with the digest the callback gives it, and the
+// elimination work is returned. It lets a test simulate a group whose files are
+// only hashed by finalization.
+func finalizeWithDigests(
+	t *testing.T, d *dupe.Detector, digest func(dupe.FileInfo) [32]byte,
+) []dupe.Execution {
+	t.Helper()
+
+	var out []dupe.Execution
+	for range 1000 {
+		execs, done := d.NextFinal(1024)
+		for _, ex := range execs {
+			if ex.Type != dupe.HashCalc || len(ex.Files) != 1 {
+				out = append(out, ex)
+				continue
+			}
+			fi := ex.Files[0]
+			fi.SHA256, fi.HashOffset = digest(fi), fi.Size
+			d.OnHashDone(ex.Key, fi, false)
+		}
+		if done {
+			return out
+		}
+	}
+	t.Fatal("NextFinal never reported completion")
+	return nil
+}
+
 // victimsOf returns the victim paths of the DupeElim executions, and the set of
 // distinct keepers.
 func victimsOf(execs []dupe.Execution) ([]string, map[string]bool) {
@@ -261,6 +290,52 @@ func TestDetector_SettledPairNotHashed(t *testing.T) {
 	execs, done := d.NextFinal(8)
 	if len(execs) != 0 || !done {
 		t.Fatalf("NextFinal = (%v, %v), want no work and completion", execTypes(execs), done)
+	}
+}
+
+// TestDetector_SettledPairIsHashedWhenTheGroupGrows is the regression test for a
+// three-file weak group whose first two members were proven different by the
+// direct comparison: the group stayed marked as settled, finalization never
+// hashed the pending pair, and a third file identical to one of them was never
+// matched, so the duplicate was silently missed.
+func TestDetector_SettledPairIsHashedWhenTheGroupGrows(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats())
+	a, b, c := fi("/a", 4096), fi("/b", 4096), fi("/c", 4096)
+
+	d.Insert(a)
+	if execs := d.Insert(b); len(execs) != 1 || execs[0].Type != dupe.HashComp {
+		t.Fatalf("second insert = %v, want one HashComp", execTypes(execs))
+	}
+
+	// The comparison proves /a and /b differ and leaves both without a digest.
+	partialA, partialB := a, b
+	partialA.HashOffset, partialB.HashOffset = 1024, 1024
+	d.OnCompareDone(key1, partialA, partialB, false)
+
+	// A third file with the same weak key arrives after that verdict.
+	execs := d.Insert(c)
+	if len(execs) != 1 || execs[0].Type != dupe.HashCalc {
+		t.Fatalf("third insert = %v, want one HashCalc for the new file", execTypes(execs))
+	}
+	hashedC := c
+	hashedC.SHA256, hashedC.HashOffset = shaOf(7), hashedC.Size
+	d.OnHashDone(key1, hashedC, false)
+
+	// /a and /c hold the same content, so finalization must finish the two
+	// pending digests and decide the pair.
+	plan := finalizeWithDigests(t, d, func(f dupe.FileInfo) [32]byte {
+		if f.Path == "/b" {
+			return shaOf(9)
+		}
+		return shaOf(7)
+	})
+
+	victims, _ := victimsOf(plan)
+	if len(victims) != 1 || (victims[0] != "/a" && victims[0] != "/c") {
+		t.Fatalf("plan = %v, want exactly one of /a, /c as the victim of the other",
+			execTypes(plan))
 	}
 }
 
