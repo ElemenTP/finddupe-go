@@ -30,10 +30,23 @@ const (
 	maxClusterSize = 64 * 1024 * 1024
 )
 
-// fileFsSizeInformationClass is the FILE_INFO_BY_HANDLE_CLASS value for
-// FILE_FS_SIZE_INFORMATION. The value collides with another information class,
-// which is why the answer is validated below.
+// fileFsSizeInformationClass is the FS_INFORMATION_CLASS value for
+// FILE_FS_SIZE_INFORMATION. It is *not* a FILE_INFO_BY_HANDLE_CLASS value: 3 is
+// FileRenameInfo there, which GetFileInformationByHandleEx rejects (or answers
+// with FILE_NAME_INFO), so the volume query must go through
+// NtQueryVolumeInformationFile — which is what the class belongs to. The answer
+// is validated below, because a wrong information class is exactly the kind of
+// mistake that used to slip through here.
 const fileFsSizeInformationClass = 3
+
+// ioStatusBlock mirrors IO_STATUS_BLOCK for NtQueryVolumeInformationFile.
+type ioStatusBlock struct {
+	Status      uintptr
+	Information uintptr
+}
+
+var procNtQueryVolumeInformationFile = windows.NewLazySystemDLL("ntdll.dll").
+	NewProc("NtQueryVolumeInformationFile")
 
 // fileFsSizeInformation mirrors FILE_FS_SIZE_INFORMATION.
 type fileFsSizeInformation struct {
@@ -201,15 +214,24 @@ func clusterSizeFromHandle(abs string) (uint64, error) {
 	}
 	defer file.Close()
 
-	var info fileFsSizeInformation
-	infoErr := windows.GetFileInformationByHandleEx(
-		windows.Handle(file.Fd()),
-		fileFsSizeInformationClass,
-		(*byte)(unsafe.Pointer(&info)),
-		uint32(unsafe.Sizeof(info)),
+	var (
+		info   fileFsSizeInformation
+		status ioStatusBlock
 	)
-	if infoErr != nil {
-		return 0, infoErr
+	ntStatus, _, _ := procNtQueryVolumeInformationFile.Call(
+		file.Fd(),
+		uintptr(unsafe.Pointer(&status)),
+		uintptr(unsafe.Pointer(&info)),
+		unsafe.Sizeof(info),
+		fileFsSizeInformationClass,
+	)
+	// The call reports through both its NTSTATUS return value and the
+	// IO_STATUS_BLOCK; either one being non-zero means the buffer was not filled.
+	if windows.NTStatus(ntStatus) != windows.STATUS_SUCCESS {
+		return 0, windows.NTStatus(ntStatus)
+	}
+	if windows.NTStatus(status.Status) != windows.STATUS_SUCCESS {
+		return 0, windows.NTStatus(status.Status)
 	}
 
 	size := uint64(info.SectorsPerAllocationUnit) * uint64(info.BytesPerSector)

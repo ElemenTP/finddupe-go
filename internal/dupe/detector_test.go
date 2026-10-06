@@ -754,6 +754,35 @@ func TestDetector_HardlinkedAliasesAreReported(t *testing.T) {
 	}
 }
 
+// TestDetector_CompressionPreferenceKeepsReference verifies that the compression
+// hint cannot turn a --ref file into a victim: the executor refuses to eliminate
+// one, so such a group would silently be left alone.
+func TestDetector_CompressionPreferenceKeepsReference(t *testing.T) {
+	t.Parallel()
+
+	for _, order := range [][]string{{"/work/compressed", "/ref/orig"}, {"/ref/orig", "/work/compressed"}} {
+		d := dupe.NewDetector(dupe.NewStats(), dupe.WithCompressionPreference(func(fi dupe.FileInfo) bool {
+			return fi.Path == "/work/compressed"
+		}))
+		for _, path := range order {
+			fi := fiSha(path, 100, 5)
+			fi.IsRef = path == "/ref/orig"
+			d.Insert(fi)
+		}
+
+		execs := finalAll(t, d)
+		if len(execs) != 1 {
+			t.Fatalf("order %v: final work = %v, want one DupeElim", order, execTypes(execs))
+		}
+		if got := execs[0].Files[0].Path; got != "/ref/orig" {
+			t.Fatalf("order %v: keeper = %q, want the reference", order, got)
+		}
+		if got := execs[0].Files[1].Path; got != "/work/compressed" {
+			t.Fatalf("order %v: victim = %q, want the compressed copy", order, got)
+		}
+	}
+}
+
 func TestDetector_CRCCollisionSeparatesBuckets(t *testing.T) {
 	t.Parallel()
 

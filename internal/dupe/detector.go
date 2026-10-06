@@ -169,9 +169,9 @@ func WithCoWDetect() Option {
 // keeper's physical file. They hold no separate storage and no action can change
 // them, so every mode but a plain report drops them: the report lists them,
 // because to the user a hardlinked second name is still a duplicate file (the
-// original C tool lists it too). Skipping those pairs is what `find --hardlink`
-// asks for, which is why the pipeline only sets this option for a report that
-// did not.
+// original C tool lists it too). The pipeline sets it for every report, so
+// `find --hardlink` is a decision the executor makes — it skips those pairs (and
+// logs them in verbose mode) instead of never receiving them.
 func WithHardlinkedAliases() Option {
 	return func(d *Detector) { d.hardlinkedAliases = true }
 }
@@ -428,10 +428,17 @@ func (d *Detector) orderMembersLocked(members []FileInfo) {
 		compressed[fi.Path] = d.compressionProbe(fi)
 	}
 	sort.Slice(members, func(i, j int) bool {
-		if compressed[members[i].Path] != compressed[members[j].Path] {
-			return compressed[members[i].Path]
+		a, b := members[i], members[j]
+		// Reference files stay first: `--ref` asks for that file to be kept and
+		// the executor never eliminates one, so a compression hint must not turn
+		// one into a victim (the group would then be silently left alone).
+		if a.IsRef != b.IsRef {
+			return a.IsRef
 		}
-		return d.policy.Less(members[i], members[j])
+		if compressed[a.Path] != compressed[b.Path] {
+			return compressed[a.Path]
+		}
+		return d.policy.Less(a, b)
 	})
 }
 
