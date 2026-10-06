@@ -136,10 +136,20 @@ func (d *Detector) Insert(fi FileInfo) []Execution {
   the hardlink and path rules (the probe runs once per member of a content group).
   The choice no longer depends on which hash finished first, so a run is
   reproducible; `--ref` remains the way to force a specific original.
-- **No double elimination**: each bucket's plan is built once (one task per victim) and
-  drained in bounded batches. Hardlinked aliases are collapsed *after* the policy
-  ordering, so the surviving path of an inode is the preferred one and a path can
-  never be both keeper and victim.
+- **One task per victim path**: each bucket's plan is built once and drained in
+  bounded batches. A victim is a *path*, not a physical file: deleting or replacing
+  one path of an inode leaves its other paths on the old inode, so a physical file
+  that owns several paths inside the group needs one task per path — otherwise the
+  group still holds two copies after the run and the next run has that work to do.
+  Hardlinked aliases are collapsed *after* the policy ordering only to choose the
+  keeper (so the surviving path of an inode is the preferred one and a path can never
+  be both keeper and victim) and to build the CoW group, whose sharing ratios are
+  computed from one member per physical file.
+- **Already hardlinked paths**: a path that is the keeper's own physical file is
+  dropped from the plan — no action can change it and it holds no separate storage.
+  A report without `--hardlink` keeps those pairs so they are listed (the original C
+  tool lists them as well, tagged `(hardlinked instances of same file)`); with
+  `--hardlink` the executor skips them before anything is printed.
 - **No concurrent double hashing**: only the file just inserted is scheduled while
   streaming, and `NextFinal` is called only when nothing is in flight.
 - **Partial resume**: when a comparison stops early (or a hash attempt is interrupted),
@@ -442,6 +452,13 @@ extents (already shared) is not duplicate storage, and a pair whose decision was
 withdrawn because a file changed during the scan is not a duplicate any more. The
 action-specific counters (`N files deleted`, `N reference files skipped`, …) are
 reported separately, so both questions stay answerable.
+
+A pair that turned out to be the same inode is still *listed* by `find` unless
+`--hardlink` asked to skip it, tagged `(hardlinked instances of same file)`.
+Listing it and counting it are different questions: the list answers "which names
+are duplicates", the count answers "how many bytes exist twice". A tree full of
+hardlinked copies therefore prints more pairs than `Dupes:` counts — the original
+C tool prints those pairs too but counts them as duplicate files.
 
 On filesystems without extent reporting `FileShared` stays nil: the group members
 are still listed, with a note that extent information is unavailable. The

@@ -26,7 +26,7 @@ Scans the specified paths/patterns for duplicate files and reports them. No file
 
 | Flag | Short | Type | Default | Description |
 |------|-------|------|---------|-------------|
-| `--hardlink` | `-H` | bool | false | Skip already-hardlinked files when reporting duplicates. Files sharing the same `(Dev, Inode)` (already hardlinked to each other) are not reported or counted. |
+| `--hardlink` | `-H` | bool | false | Skip already-hardlinked files when reporting duplicates. Files sharing the same `(Dev, Inode)` (already hardlinked to each other) are not reported; like every same-inode pair they are never counted as duplicate storage. |
 | `--listlink` | `-l` | bool | false | List hardlink groups (files sharing a physical inode) and exit. Skips duplicate detection entirely. |
 | `--cow` | `-c` | bool | false | CoW group mode: report every identical-content group with the per-file share of already-shared bytes. |
 | `--verbose` | `-v` | bool | false | Verbose output: show hardlink skip details, file index information |
@@ -60,11 +60,11 @@ One or more path/pattern arguments. Each can be:
 - Never eliminated: the executor returns `ResultSkippedRef` when a duplicate victim is a reference file (unless the action is `find`'s report-only mode). They are counted in `SkippedRefFiles`.
 
 `--ref` is also the only way to control **which** of several identical files
-survives. Without it the keeper is whichever member's hash completes first, which
-depends on how the parallel workers were scheduled and is therefore not
-reproducible from one run to the next. Reports list the members of a group in a
-canonical order (references first, then by path), but that ordering does not
-change which file is kept.
+survives. Without it the keeper is the first member in the keeper policy's order
+(references first, then the file with more hardlinks, then the smallest path), so
+the choice is reproducible and does not depend on how the parallel workers were
+scheduled. The policy is applied once the whole scan is known, at the end of the
+run, so no member is decided before its group is complete.
 
 This differs from the original Windows finddupe, where `-ref` was a terminator
 ("everything after this argument is a reference") and references were walked
@@ -77,12 +77,21 @@ the surviving file.
 ```
 Duplicate: '/path/to/original.jpg'
 With:      '/path/to/copy.jpg'
+Duplicate: '/path/to/original.jpg'
+With:      '/path/to/hardlinked-copy.jpg'
+    (hardlinked instances of same file)
 
 Files:    1234 MB in  5000 files
 Dupes:     100 MB in   234 files
   5 files of zero length were skipped
   2 files could not be opened
 ```
+
+A pair whose two paths are the same physical file (the same non-zero `(Dev, Inode)`,
+i.e. an existing hardlink) is listed with the `(hardlinked instances of same file)`
+tag, the way the original Windows tool tags it. It is a duplicate *name*, not a
+second copy of the bytes, so it never counts in `Dupes:` — see
+[algorithm.md](algorithm.md#what-the-dupes-line-counts).
 
 ### Output (Verbose Mode, `-v`)
 
@@ -96,7 +105,7 @@ With:      '/path/to/copy.jpg'
 
 ### Output (With `--hardlink`)
 
-Duplicates with different `(Dev, Inode)` are reported as usual. Pairs that are already the same physical file (same non-zero `Dev` and `Inode`) are silently skipped and not counted as duplicates; with `-v` each pair is logged as `already hardlinked`. Without `--hardlink`, such a pair is still reported as a duplicate.
+Duplicates with different `(Dev, Inode)` are reported as usual. Pairs that are already the same physical file (same non-zero `Dev` and `Inode`) are not reported at all; with `-v` each pair is logged as `already hardlinked`. Without `--hardlink`, such a pair is listed with the `(hardlinked instances of same file)` tag shown above.
 
 ### Output (`--listlink`)
 
@@ -234,6 +243,11 @@ characters in a path are escaped, so a crafted file name cannot forge extra
 result lines.
 
 Read-only victims that are skipped print `Skipping duplicate readonly file '<path>'.` and increment `SkippedROFiles`. Reference victims increment `SkippedRefFiles` and print nothing. Pairs that are already the same physical file (a hardlink) are never touched: `--delete` and `--hardlink` return `ResultAlreadyHardlinked`, and `--cow` returns `ResultAlreadyHardlinked` for the same physical file or `ResultAlreadyShared` when the two extent layouts are provably identical on the same device; in verbose mode these are logged (`already hardlinked` / `already shared`) and nothing is printed otherwise.
+
+An action runs once per **duplicate path**, not once per physical file. If a file that
+is being replaced or deleted still has other hardlinks, those other names are acted on
+too: replacing one name of an inode only moves that name, so leaving the rest behind
+would keep a second copy of the content and the next run would find it again.
 
 Two safety skips protect a live filesystem:
 

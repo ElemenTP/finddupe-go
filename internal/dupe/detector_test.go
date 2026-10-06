@@ -2,6 +2,8 @@ package dupe_test
 
 import (
 	"crypto/sha256"
+	"slices"
+	"sort"
 	"sync"
 	"testing"
 
@@ -612,6 +614,68 @@ func TestDetector_HardlinkedAliasesCollapse(t *testing.T) {
 	// The reference alias survives the collapse and is the keeper.
 	if got := execs[0].Files[0].Path; got != "/ref/a" {
 		t.Fatalf("keeper = %q, want the collapsed reference /ref/a", got)
+	}
+}
+
+// twoPathFile builds a FileInfo of the shared content whose physical file owns
+// one path of the group's first inode; inode distinguishes the physical files.
+func twoPathFile(path string, inode uint64, links uint64) dupe.FileInfo {
+	out := fiSha(path, 100, 5)
+	out.Dev, out.Inode, out.NumLinks = 1, inode, links
+	return out
+}
+
+// TestDetector_EveryPathOfAVictimInodeIsAVictim is the regression test for a plan
+// that acted once per *physical file*: deleting or replacing one path of an inode
+// leaves its other paths on the old inode, so the group still holds two copies and
+// a later run has the rest of the work to do. One action per path.
+func TestDetector_EveryPathOfAVictimInodeIsAVictim(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats())
+
+	// Two physical files with the same content; both own two paths, so the keeper
+	// policy has no hardlink count to prefer and keeps the smallest path of the
+	// first inode.
+	d.Insert(twoPathFile("/a1", 1, 2))
+	d.Insert(twoPathFile("/a2", 1, 2))
+	d.Insert(twoPathFile("/b1", 2, 2))
+	d.Insert(twoPathFile("/b2", 2, 2))
+
+	victims, keepers := victimsOf(finalAll(t, d))
+	sort.Strings(victims)
+	if !slices.Equal(victims, []string{"/b1", "/b2"}) {
+		t.Fatalf("victims = %v, want every path of the other physical file", victims)
+	}
+	if len(keepers) != 1 || !keepers["/a1"] {
+		t.Fatalf("keepers = %v, want only /a1", keepers)
+	}
+}
+
+// TestDetector_HardlinkedAliasesAreReported verifies the report-only option: with
+// it the pair (keeper, a hardlink of the keeper) is in the plan; without it that
+// pair is dropped, because no action can change it.
+func TestDetector_HardlinkedAliasesAreReported(t *testing.T) {
+	t.Parallel()
+
+	newDetector := func(t *testing.T, opts ...dupe.Option) *dupe.Detector {
+		t.Helper()
+		d := dupe.NewDetector(dupe.NewStats(), opts...)
+		d.Insert(twoPathFile("/a1", 1, 2))
+		d.Insert(twoPathFile("/a2", 1, 2))
+		d.Insert(twoPathFile("/b", 2, 1))
+		return d
+	}
+
+	reported, _ := victimsOf(finalAll(t, newDetector(t, dupe.WithHardlinkedAliases())))
+	sort.Strings(reported)
+	if !slices.Equal(reported, []string{"/a2", "/b"}) {
+		t.Fatalf("reported victims = %v, want the alias /a2 and the copy /b", reported)
+	}
+
+	acted, _ := victimsOf(finalAll(t, newDetector(t)))
+	if !slices.Equal(acted, []string{"/b"}) {
+		t.Fatalf("action victims = %v, want only the separate physical file /b", acted)
 	}
 }
 

@@ -47,6 +47,11 @@ type Detector struct {
 	// DupeElim (find --cow).
 	coWDetect bool
 
+	// hardlinkedAliases makes the plan list the paths that already are the
+	// keeper's physical file (find without --hardlink). Every other mode drops
+	// them: they carry no separate storage and no action can change them.
+	hardlinkedAliases bool
+
 	// policy orders the members of a content group; the first one is kept.
 	policy KeeperPolicy
 
@@ -156,6 +161,17 @@ type Option func(*Detector)
 // identical files instead of elimination tasks.
 func WithCoWDetect() Option {
 	return func(d *Detector) { d.coWDetect = true }
+}
+
+// WithHardlinkedAliases makes the plan include the paths that already are the
+// keeper's physical file. They hold no separate storage and no action can change
+// them, so every mode but a plain report drops them: the report lists them,
+// because to the user a hardlinked second name is still a duplicate file (the
+// original C tool lists it too). Skipping those pairs is what `find --hardlink`
+// asks for, which is why the pipeline only sets this option for a report that
+// did not.
+func WithHardlinkedAliases() Option {
+	return func(d *Detector) { d.hardlinkedAliases = true }
 }
 
 // WithKeeperPolicy replaces the keeper order used to pick the file that is kept.
@@ -479,6 +495,14 @@ func (d *Detector) decideLocked(key GroupKey, st *keyState, limit int) ([]Execut
 // buildPlanLocked decides a group whose content is complete: for every content
 // bucket, the keeper policy picks the file to keep and every other member of that
 // bucket becomes a victim.
+//
+// A victim is a *path*, not a physical file. Deleting or replacing one path of an
+// inode never touches its other paths, so an inode that owns several paths inside
+// the group needs one action per path; deciding per inode would leave the other
+// paths behind on the old inode and the group would still hold two copies. A path
+// that already *is* the keeper's physical file needs no action at all — only a
+// report without `--hardlink` lists it, as a duplicate name. See
+// [WithHardlinkedAliases].
 func (d *Detector) buildPlanLocked(st *keyState) []Execution {
 	shas := make([][32]byte, 0, len(st.buckets))
 	for sha := range st.buckets {
@@ -490,38 +514,55 @@ func (d *Detector) buildPlanLocked(st *keyState) []Execution {
 
 	var plan []Execution
 	for _, sha := range shas {
-		files := st.buckets[sha]
-		if len(files) < MinGroupSize {
+		plan = append(plan, d.bucketPlanLocked(st.buckets[sha])...)
+	}
+	return plan
+}
+
+// bucketPlanLocked decides one content bucket: the keeper policy keeps one path
+// and every other path of the bucket becomes a victim, or — in CoW-detect mode —
+// the whole group becomes one CoWDetect execution.
+func (d *Detector) bucketPlanLocked(files []FileInfo) []Execution {
+	if len(files) < MinGroupSize {
+		return nil
+	}
+
+	// Order first, then collapse hardlinked aliases, so the surviving path of an
+	// inode is the one the policy prefers.
+	members := append([]FileInfo(nil), files...)
+	d.orderMembersLocked(members)
+	distinct := dedupeByInode(members)
+
+	// A bucket that holds one physical file has no duplicate storage and no work
+	// an action could do; only the report's alias pairs are left.
+	if len(distinct) < MinGroupSize && !d.hardlinkedAliases {
+		return nil
+	}
+
+	keeper, keep := d.chooseKeeperLocked(distinct)
+	if !keep {
+		return nil
+	}
+
+	if d.coWDetect {
+		// The action layer needs the whole group; the keeper leads it so the
+		// report and the clone source agree on which member is the original.
+		// Hardlinked aliases stay collapsed: they are one member's storage.
+		if len(distinct) < MinGroupSize {
+			return nil
+		}
+		return []Execution{{Type: CoWDetect, Files: keeperFirst(distinct, keeper)}}
+	}
+
+	plan := make([]Execution, 0, len(members)-1)
+	for _, victim := range members {
+		if victim.Path == keeper.Path {
 			continue
 		}
-
-		// Order first, then collapse hardlinked aliases, so the surviving path of
-		// an inode is the one the policy prefers.
-		members := append([]FileInfo(nil), files...)
-		d.orderMembersLocked(members)
-		members = dedupeByInode(members)
-		if len(members) < MinGroupSize {
+		if victim.SameInode(keeper) && !d.hardlinkedAliases {
 			continue
 		}
-
-		keeper, keep := d.chooseKeeperLocked(members)
-		if !keep {
-			continue
-		}
-
-		if d.coWDetect {
-			// The action layer needs the whole group; the keeper leads it so the
-			// report and the clone source agree on which member is the original.
-			plan = append(plan, Execution{Type: CoWDetect, Files: keeperFirst(members, keeper)})
-			continue
-		}
-
-		for _, victim := range members {
-			if victim.Path == keeper.Path {
-				continue
-			}
-			plan = append(plan, Execution{Type: DupeElim, Files: []FileInfo{keeper, victim}})
-		}
+		plan = append(plan, Execution{Type: DupeElim, Files: []FileInfo{keeper, victim}})
 	}
 	return plan
 }

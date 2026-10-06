@@ -60,6 +60,8 @@ type InodeKey struct {
 
 Used by the detector's hardlink index (`map[InodeKey][]FileInfo`) for `find --listlink`, and by the executor to decide whether two paths are already hardlinked. Grouping by a bare inode number would merge unrelated files on different volumes.
 
+`FileInfo.SameInode(other)` is that comparison with the `Inode != 0` guard folded in: it is false when the scan could not determine a physical identity, which is why the action layer falls back to comparing the paths as the operating system sees them (`samePhysicalFile`/`sameFileByStat`) before it touches a file.
+
 ## `GroupKey` — Duplicate Bucket Key
 
 ```go
@@ -229,7 +231,7 @@ func (d *Detector) InodeGroups() map[InodeKey][]FileInfo
 
 **Consistency rules**:
 - Elimination is deferred to `NextFinal`. For every content bucket whose content is fully known, the members are ordered by the **keeper policy** and the first one is kept; every other member becomes a victim. The keeper is therefore reproducible, not "whichever hash finished first".
-- Hardlinked aliases are collapsed after the policy ordering, so the surviving path of an inode is the preferred one and a path can never be both keeper and victim.
+- Hardlinked aliases are collapsed after the policy ordering only to pick the keeper: the surviving path of an inode is the preferred one and a path can never be both keeper and victim. The plan itself keeps one `DupeElim` per non-keeper **path**, because deleting or replacing one path of an inode leaves its other paths on the old inode (see `WithHardlinkedAliases`).
 - A file whose hash cannot be completed is retried at most `maxFailedHashRetries` times and then left alone: a file whose content was never verified is never eliminated.
 - With `WithCoWDetect()` (`find --cow`), `NextFinal` emits one `CoWDetect` per bucket that has at least two distinct physical files, keeping one path per `(Dev, Inode)` so hardlinked aliases collapse to a single member.
 - `InsertInode` ignores files with `Inode == 0` or `NumLinks < 2`, and groups by `InodeKey` (Dev + Inode).

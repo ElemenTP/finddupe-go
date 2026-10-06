@@ -61,6 +61,8 @@ All tests run with the `-race` flag (see [Race Detection](#race-detection)).
 | `TestDetector_PartialProgressKeepsLargerOffset` | The most advanced partial offset wins |
 | `TestDetector_CRCCollisionSeparatesBuckets` | Different sizes stay separate groups |
 | `TestDetector_HardlinkedAliasesCollapse` | Aliases of one inode never eliminate each other, and the preferred path survives |
+| `TestDetector_EveryPathOfAVictimInodeIsAVictim` | A victim is a path: both paths of the other physical file are acted on (the regression that left a hardlink behind on the old inode) |
+| `TestDetector_HardlinkedAliasesAreReported` | `WithHardlinkedAliases` lists the keeper's own alias; without it that pair is dropped |
 | `TestDetector_CoWDetectMode` | One `CoWDetect` per content bucket, members in keeper order |
 | `TestDetector_InsertInodeGroups` | `InsertInode`/`InodeGroups` group by `(Dev, Inode)` |
 | `TestDetector_Empty` | Zero state: no executions, no inode groups, non-nil stats |
@@ -225,22 +227,22 @@ so `/dev/null` is no longer mistaken for a terminal.
 
 System tests build the `finddupe` binary once in `TestMain` and run it against real temp directories. The package is split: `test/doc.go` declares `package test` while the tests use `package test_test`.
 
-There are **53 test functions** in `test/system_test.go` plus the `TestMain`
-harness — `grep -c '^func Test' test/system_test.go` reports **54** because it
+There are **63 test functions** in `test/system_test.go` plus the `TestMain`
+harness — `grep -c '^func Test' test/system_test.go` reports **64** because it
 also matches `TestMain` — and one more in `test/output_unix_test.go` (Unix only,
 because the crafted file name needs a control character that Windows forbids).
 
-### Find Mode (18 tests)
+### Find Mode (19 tests)
 
-Basic duplicates, no duplicates, empty directory, zero-length files (skipped/included), verbose mode, threads flag, multiple paths, glob patterns, recursive glob, large files, CRC near-collision (same first chunk, different after), binary files, many duplicates, single file, multiple duplicate groups, `TestFind_ThreeOrMoreIdenticalFiles` (the regression test that 4 identical files yield exactly 3 duplicate reports), and `TestFind_DuplicatePathArgs_NoSelfDuplicate` (a directory passed twice must not report a file against itself).
+Basic duplicates, no duplicates, empty directory, zero-length files (skipped/included), verbose mode, threads flag, multiple paths, glob patterns, recursive glob, large files, CRC near-collision (same first chunk, different after), binary files, many duplicates, single file, multiple duplicate groups, `TestFind_ThreeOrMoreIdenticalFiles` (the regression test that 4 identical files yield exactly 3 duplicate reports), `TestFind_DuplicatePathArgs_NoSelfDuplicate` (a directory passed twice must not report a file against itself), and `TestFind_ReportsAlreadyHardlinkedPair` (an already-hardlinked pair is listed with the `(hardlinked instances of same file)` tag and only `--hardlink` suppresses it).
 
-### Dedupe `--delete` (9 tests)
+### Dedupe `--delete` (10 tests)
 
-Basic deletion, content preservation, missing action flag error, multiple actions error, read-only handling (skipped, forced with `-r`), many duplicates, `TestDedupeDelete_ThreeIdenticalFiles` (3 identical files → 2 deletions, 1 survivor), and `TestDedupeDelete_DuplicatePathArgs_NoDataLoss` (overlapping patterns must not delete every copy).
+Basic deletion, content preservation, missing action flag error, multiple actions error, read-only handling (skipped, forced with `-r`), many duplicates, `TestDedupeDelete_ThreeIdenticalFiles` (3 identical files → 2 deletions, 1 survivor), `TestDedupeDelete_DuplicatePathArgs_NoDataLoss` (overlapping patterns must not delete every copy), and `TestDedupeDelete_RemovesEveryPathOfAVictimInode` (every path of the duplicate's physical file is removed, the keeper's own hardlinks survive).
 
-### Dedupe `--hardlink` (4 tests)
+### Dedupe `--hardlink` (5 tests)
 
-Hardlink creation, content preservation, same-inode verification, read-only handling.
+Hardlink creation, content preservation, same-inode verification, read-only handling, and `TestDedupeHardlink_LinksEveryPathOfAVictimInode` (the regression test that one run links every path of the victim's physical file, so a second run finds nothing).
 
 ### CoW (4 tests)
 

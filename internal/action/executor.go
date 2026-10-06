@@ -549,7 +549,7 @@ func ensureUnchanged(f *os.File, fi dupe.FileInfo) error {
 // only remaining copy of its content.
 func samePhysicalFile(a, b dupe.FileInfo) bool {
 	if a.Inode != 0 && b.Inode != 0 {
-		return a.Dev == b.Dev && a.Inode == b.Inode
+		return a.SameInode(b)
 	}
 	return sameFileByStat(a.Path, b.Path)
 }

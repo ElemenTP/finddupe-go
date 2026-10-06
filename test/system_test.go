@@ -134,6 +134,32 @@ func sameInode(t *testing.T, a, b string) bool {
 	return os.SameFile(infoA, infoB)
 }
 
+// makeHardlink creates name as a second path of target's physical file.
+func makeHardlink(t *testing.T, dir, name, target string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.Link(target, path); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+	return path
+}
+
+// countDuplicates counts the reported duplicate pairs in a find run.
+func countDuplicates(out string) int {
+	return strings.Count(out, "Duplicate: '")
+}
+
+// summaryLine returns the whitespace-normalized line of a run's output that
+// starts with prefix, ignoring the column padding of the summary.
+func summaryLine(out, prefix string) string {
+	for line := range strings.SplitSeq(out, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.Join(strings.Fields(line), " ")
+		}
+	}
+	return ""
+}
+
 // =============================================================================
 // Symlink Tests
 // =============================================================================
@@ -793,6 +819,113 @@ func TestDedupeHardlink_SameInode(t *testing.T) {
 	// After hardlinking, both files should share the same inode.
 	if !sameInode(t, path1, path2) {
 		t.Error("expected files to share the same inode after hardlink")
+	}
+}
+
+// TestFind_ReportsAlreadyHardlinkedPair is the end-to-end regression test for
+// `find` silently dropping every already-hardlinked duplicate. Without
+// `--hardlink` such a pair is a duplicate *name* and is listed, tagged the way
+// the original Windows tool tags it; `--hardlink` is what asks for it to be
+// skipped.
+func TestFind_ReportsAlreadyHardlinkedPair(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := "hardlinked duplicate pair content"
+	original := makeFile(t, dir, "original.txt", content)
+	alias := makeHardlink(t, dir, "alias.txt", original)
+
+	out, _, code := run(t, "find", dir, "--no-progress")
+	if code != 0 {
+		t.Fatalf("find exited %d:\n%s", code, out)
+	}
+	if countDuplicates(out) != 1 {
+		t.Fatalf("find reported %d duplicates, want the hardlinked pair:\n%s",
+			countDuplicates(out), out)
+	}
+	if !strings.Contains(out, "(hardlinked instances of same file)") {
+		t.Errorf("find did not tag the hardlinked pair:\n%s", out)
+	}
+	for _, path := range []string{original, alias} {
+		if !strings.Contains(out, path) {
+			t.Errorf("find did not name %q:\n%s", path, out)
+		}
+	}
+	// A hardlink is a duplicate name, not a second copy of the bytes.
+	if got := summaryLine(out, "Dupes:"); got != "Dupes: 0 B in 0 files" {
+		t.Errorf("find counted a hardlinked pair as duplicate storage: %q\n%s", got, out)
+	}
+
+	skipped, _, code := run(t, "find", dir, "--hardlink", "--no-progress")
+	if code != 0 {
+		t.Fatalf("find --hardlink exited %d:\n%s", code, skipped)
+	}
+	if n := countDuplicates(skipped); n != 0 {
+		t.Errorf("find --hardlink reported %d duplicates, want none:\n%s", n, skipped)
+	}
+}
+
+// TestDedupeHardlink_LinksEveryPathOfAVictimInode is the end-to-end regression
+// test for the elimination plan acting once per physical file. Replacing one path
+// of a victim leaves that path's hardlinks on the old inode, so the group still
+// held two copies and a second `dedupe` run had more work to do. Every path of a
+// victim is acted on, so one run is enough.
+func TestDedupeHardlink_LinksEveryPathOfAVictimInode(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := "one physical file, two names"
+	keeper := makeFile(t, dir, "a1.txt", content)
+	keeperAlias := makeHardlink(t, dir, "a2.txt", keeper)
+	victim := makeFile(t, dir, "b1.txt", content)
+	victimAlias := makeHardlink(t, dir, "b2.txt", victim)
+
+	if _, _, code := run(t, "dedupe", "--hardlink", dir, "--no-progress"); code != 0 {
+		t.Fatalf("dedupe --hardlink exited %d", code)
+	}
+
+	for _, path := range []string{keeperAlias, victim, victimAlias} {
+		if !sameInode(t, keeper, path) {
+			t.Errorf("%s was left on another physical file than %s", path, keeper)
+		}
+	}
+
+	// Nothing is left for a second run to do.
+	left, _, code := run(t, "find", dir, "--hardlink", "--no-progress")
+	if code != 0 {
+		t.Fatalf("find --hardlink exited %d:\n%s", code, left)
+	}
+	if n := countDuplicates(left); n != 0 {
+		t.Errorf("find --hardlink reported %d duplicates after one dedupe run:\n%s", n, left)
+	}
+}
+
+// TestDedupeDelete_RemovesEveryPathOfAVictimInode covers the same plan for
+// `--delete`: the keeper's own hardlinks stay, every path of the other physical
+// file goes away.
+func TestDedupeDelete_RemovesEveryPathOfAVictimInode(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := "one physical file, two names"
+	keeper := makeFile(t, dir, "a1.txt", content)
+	keeperAlias := makeHardlink(t, dir, "a2.txt", keeper)
+	victim := makeFile(t, dir, "b1.txt", content)
+	victimAlias := makeHardlink(t, dir, "b2.txt", victim)
+
+	if _, _, code := run(t, "dedupe", "--delete", dir, "--no-progress"); code != 0 {
+		t.Fatalf("dedupe --delete exited %d", code)
+	}
+
+	for _, path := range []string{keeper, keeperAlias} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("keeper path %s was removed: %v", path, err)
+		}
+	}
+	for _, path := range []string{victim, victimAlias} {
+		if _, err := os.Stat(path); err == nil {
+			t.Errorf("duplicate path %s survived --delete", path)
+		}
 	}
 }
 

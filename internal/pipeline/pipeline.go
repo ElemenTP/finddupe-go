@@ -302,6 +302,12 @@ func detectorOptions(cfg *config.Config) []dupe.Option {
 	if cfg.CoWDetect {
 		opts = append(opts, dupe.WithCoWDetect())
 	}
+	// A report has no action that would cover a hardlinked path, so it lists every
+	// path of a physical file — unless --hardlink asked to skip those pairs, which
+	// is the only thing that option does in find mode.
+	if cfg.Action == config.ActionReport && !cfg.SkipHardlinked && !cfg.CoWDetect {
+		opts = append(opts, dupe.WithHardlinkedAliases())
+	}
 	// The compression preference is about the clone source: a CoW clone inherits
 	// the keeper's extent layout, so keeping a compressed member keeps the group
 	// compressed. Other actions do not change the data layout, and the CLI
@@ -669,6 +675,12 @@ func reportElimination(
 	keeper := out.Files[0]
 	victim := out.Files[1]
 
+	// A reported pair that is the same physical file is a duplicate *name*, not
+	// duplicate storage: the bytes exist once. It is listed — the original
+	// Windows tool lists it too, tagged — but it never counts in Dupes. `find
+	// --hardlink` suppresses those pairs before they reach the report.
+	hardlinkAlias := out.Result == action.ResultVerifiedDuplicate && keeper.SameInode(victim)
+
 	// Duplicate accounting follows the decision, not the action: a pair whose
 	// content was verified identical is a duplicate even when the elimination was
 	// skipped or failed (read-only, reference, cross-device, link limit, error),
@@ -676,7 +688,7 @@ func reportElimination(
 	// that turned out to share storage already — the same inode (already
 	// hardlinked) or the same extents (already shared) — and the pairs whose
 	// decision was withdrawn because a file changed during the scan.
-	if countsAsDuplicateStorage(out.Result) {
+	if countsAsDuplicateStorage(out.Result) && !hardlinkAlias {
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 	}
@@ -685,6 +697,9 @@ func reportElimination(
 	case action.ResultVerifiedDuplicate:
 		report.printf("Duplicate: '%s'\n", resultPath(keeper.Path))
 		report.printf("With:      '%s'\n", resultPath(victim.Path))
+		if hardlinkAlias {
+			report.printf("    (hardlinked instances of same file)\n")
+		}
 	case action.ResultDeleted:
 		report.printf("Deleted:    '%s'\n", resultPath(victim.Path))
 		stats.DeletedFiles.Add(1)

@@ -57,6 +57,14 @@ type FileInfo struct {
 	IsRef bool
 }
 
+// SameInode reports whether two records name the same physical file according to
+// the identity captured during the scan. It is false when that identity is
+// unavailable (Inode == 0); callers that must be sure then have to compare the
+// paths as the filesystem sees them.
+func (fi FileInfo) SameInode(other FileInfo) bool {
+	return fi.Inode != 0 && other.Inode != 0 && fi.Dev == other.Dev && fi.Inode == other.Inode
+}
+
 // InodeKey identifies a physical file across the whole scan.
 // Inode numbers are only unique per device, so Dev must be part of the key.
 type InodeKey struct {

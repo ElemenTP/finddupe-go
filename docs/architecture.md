@@ -65,7 +65,7 @@ This replaces the older design in which the detector and executor were each a si
 │                                                           │
 │ End of scan: input drained && inFlight == 0               │
 │   → detector.NextFinal(limit) until it reports done       │
-│     DupeElim (one per victim) or CoWDetect (one per       │
+│     DupeElim (one per victim path) or CoWDetect (one per  │
 │     content bucket)                                       │
 │   → close(executionCh)                                    │
 └───────────┬───────────────────────────────────────────────┘
@@ -270,9 +270,13 @@ only hashes. Once the input is drained and `inFlight == 0`, the coordinator repe
 calls `detector.NextFinal(limit)` until it reports completion, dispatching the bounded
 batches it returns:
 
-- **dedupe**: one `DupeElim` per victim, with the keeper chosen by `KeeperPolicy`
+- **dedupe**: one `DupeElim` per victim *path*, with the keeper chosen by `KeeperPolicy`
   (references first, then more hardlinks, then the smallest path) instead of by
-  whichever hash finished first.
+  whichever hash finished first. One task per path, not per physical file: replacing
+  or deleting one path of an inode leaves its other paths on the old inode, so the
+  group would still hold two copies. A path that already is the keeper's own physical
+  file is dropped — no action can change it, but a report without `--hardlink` lists
+  it as a duplicate name.
 - **`find --cow`**: one `CoWDetect` per content bucket with at least two distinct
   physical files, reporting the whole identical-content set at once — one path per
   `(Dev, Inode)` (hardlinked aliases collapse) with a per-member already-shared byte
