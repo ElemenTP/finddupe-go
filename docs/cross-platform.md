@@ -83,7 +83,7 @@ The NTFS file index serves the same role as the Unix inode, and the volume seria
 
 ### Fallback
 
-If identity retrieval fails, `Dev`, `Inode`, and `NumLinks` are 0. Duplicate detection still works via checksum, but `--hardlink`/`--listlink` are ineffective and CoW detection cannot compare physical extents.
+If identity retrieval fails (a handle without `FILE_READ_ATTRIBUTES`, a redirector that reports no file IDs, `GetFileInformationByHandle` refusing), `Dev`, `Inode`, and `NumLinks` are 0 and the scan continues: duplicate detection still works via checksum, but `--listlink` silently omits those files from every hardlink group, reports cannot tag an already-hardlinked pair (`(hardlinked instances of same file)` needs the identity, so such a pair is listed as two independent duplicates and counted once for the storage), the freshness check loses its identity half and keeps size+mtime, and `dedupeByInode` cannot collapse aliases (extra no-op actions, never a wrong one). Nothing is acted on incorrectly; the run just knows less. `find -v` is the way to notice, because the "hardlinked instances" lines stop appearing for those files.
 
 ## 2. Hardlink Creation
 
@@ -244,6 +244,16 @@ Verified on a Darwin 27.0.0 / macOS 27 ARM64 APFS data volume:
 - APFS native compression is exposed through the `SF_COMPRESSED` flag (`ls -lO`
   prints `compressed`, `stat -f %Sf` lists it as a flag), not as a readable
   `com.apple.decmpfs` xattr;
+- a clone whose source stores its payload *inline* in `com.apple.decmpfs` (no
+  `com.apple.ResourceFork`) makes `dedupe --cow` **fail the action instead of
+  producing a clone that reads back as zero bytes**: the layout pass copies the
+  decmpfs header, and a header whose payload lives in a resource fork that is not
+  there would describe data that does not exist. The victim is left untouched
+  (temp name + atomic rename) and the run exits non-zero. `clonefile` normally
+  carries the whole compressed attribute set across, so this is a defensive
+  fail-closed path; the fix if a real Mac hits it is to copy the decmpfs header
+  and the resource fork as one unit, or to compare the clone's own layout before
+  accepting it;
 - a clone whose first 256 KiB were rewritten reports **75.0% (768 KiB of 1 MiB)**,
   and `dedupe --cow` brings it back to 100%: the partial-ratio path is exercised
   on real APFS, not just in the unit tests;

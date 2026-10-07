@@ -1104,6 +1104,22 @@ func TestOutputStreams(t *testing.T) {
 	}
 }
 
+// TestError_BareInvocation verifies that running the tool with no arguments at
+// all does not look like a successful run: it prints the help and exits non-zero.
+func TestError_BareInvocation(t *testing.T) {
+	t.Parallel()
+
+	stdout, _, code := run(t)
+	if code == 0 {
+		t.Error("expected non-zero exit for a bare invocation")
+	}
+	for _, want := range []string{"find", "dedupe"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("the help printed for a bare invocation does not mention %q", want)
+		}
+	}
+}
+
 func TestError_NoSubcommand(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

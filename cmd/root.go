@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"errors"
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -27,6 +29,17 @@ Original C version by Matthias Wandel, Go rewrite with multi-threading support.`
 	// Runtime failures (I/O errors, cancellation) should not dump the full
 	// usage text; cobra still reports argument errors.
 	SilenceUsage: true,
+
+	// A bare invocation does nothing, so it must not look like a successful run:
+	// print the help and report the missing subcommand as a usage error. An
+	// unknown argument is reported by cobra itself before this runs.
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			_ = cmd.Help()
+			return errors.New("no subcommand given: use 'find' or 'dedupe'")
+		}
+		return fmt.Errorf("unknown command %q: use 'find' or 'dedupe'", args[0])
+	},
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.

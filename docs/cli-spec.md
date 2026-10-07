@@ -189,7 +189,7 @@ Exactly one action flag must be specified for `dedupe` mode:
 | `--no-progress` | `-p` | bool | false | Hide the progress indicator |
 | `--follow-symlinks` | `-j` | bool | false | Follow symbolic links / reparse points: they are resolved and scanned as their target, under the target's own path |
 | `--threads` | `-t` | int | `0` (→ `runtime.NumCPU() × 2`, capped at 1024) | Number of scanner workers |
-| `--rdonly` | `-r` | bool | false | Also operate on read-only files (skipped by default on every platform) |
+| `--rdonly` | `-r` | bool | false | Also operate on read-only files (skipped by default). The check is "can the current user write it", so a file with mode 0444 is still writable to root (EUID 0) and is acted on without the flag |
 | `--prefer-compressed` | `-C` | bool | false | `--cow` only: keep a compressed member as the clone source (see below) |
 | `--interactive` | `-i` | bool | false | Ask which file to keep for every identical-content group (needs a terminal on stdin) |
 | `--ref` | — | string (repeatable) | — | Consume the following path/pattern as a reference (compare against, but never act on) |
@@ -306,12 +306,16 @@ CPUs: 16
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| Non-zero (1) | Error (invalid arguments, I/O failure, a pattern that matched no files), an elimination that failed (the summary reports `N files could not be processed`, the log has the reason), or interruption via SIGINT/SIGTERM |
+| Non-zero (1) | Error (invalid arguments, I/O failure, a pattern that matched no files, a bare invocation with no subcommand), an elimination that failed (the summary reports `N files could not be processed`, the log has the reason), or interruption via SIGINT/SIGTERM |
 
-Files that could not be *read* during the scan stay a warning: they are skipped and
-counted, but they never change the exit code. A failed action is different — the
-victim was left in place — so a script can rely on a zero exit meaning every
-duplicate decision was carried out.
+Files that could not be *read* — during the scan, or later while their content was
+being verified before any action — stay a warning: they are skipped, logged as
+`content verification failed`, counted once per file in `N files could not be
+opened`, and they never change the exit code. A file whose content was never
+verified is never eliminated, so that number is also the explanation for a
+duplicate the run left in place. A failed action is different — the victim was
+left in place — so a script can rely on a zero exit meaning every duplicate
+decision was carried out.
 
 On SIGINT/SIGTERM the context is cancelled, `pipeline.Run` returns the context error, and `cmd.Execute` exits non-zero.
 

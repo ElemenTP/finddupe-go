@@ -483,30 +483,48 @@ type coordinator struct {
 	pending     []dupe.Execution
 	inFlight    int
 	execClosed  bool
-	victims     victimCounter
+	accounting  accounting
 }
 
-// victimCounter tracks the physical files already counted as duplicate storage.
-// A victim inode that owns several paths inside its group is acted on once per
-// path (each one is a real file to replace or remove), but the bytes exist twice
-// once: the Dupes totals must not grow with the number of names.
-type victimCounter struct {
+// accounting keeps the per-run sets the summary depends on.
+type accounting struct {
+	// counted holds the physical files already counted as duplicate storage. A
+	// victim inode that owns several paths inside its group is acted on once per
+	// path (each one is a real file to replace or remove), but the bytes exist
+	// twice once: the Dupes totals must not grow with the number of names.
 	counted map[dupe.InodeKey]struct{}
+
+	// unreadable holds the files whose content could not be read, so a file that
+	// fails the scan and then each of its retries is counted once, not once per
+	// attempt.
+	unreadable map[string]struct{}
 }
 
-// count reports whether fi adds duplicate storage that was not counted yet.
-func (v *victimCounter) count(fi dupe.FileInfo) bool {
+// countVictim reports whether fi adds duplicate storage that was not counted yet.
+func (a *accounting) countVictim(fi dupe.FileInfo) bool {
 	if fi.Inode == 0 {
 		return true // no identity: every path is its own physical file
 	}
 	key := dupe.InodeKey{Dev: fi.Dev, Inode: fi.Inode}
-	if _, ok := v.counted[key]; ok {
+	if _, ok := a.counted[key]; ok {
 		return false
 	}
-	if v.counted == nil {
-		v.counted = make(map[dupe.InodeKey]struct{})
+	if a.counted == nil {
+		a.counted = make(map[dupe.InodeKey]struct{})
 	}
-	v.counted[key] = struct{}{}
+	a.counted[key] = struct{}{}
+	return true
+}
+
+// noteUnreadable reports whether this file has not been counted as unreadable yet.
+func (a *accounting) noteUnreadable(path string) bool {
+	if _, ok := a.unreadable[path]; ok {
+		return false
+	}
+	if a.unreadable == nil {
+		a.unreadable = make(map[string]struct{})
+	}
+	a.unreadable[path] = struct{}{}
 	return true
 }
 
@@ -582,7 +600,7 @@ func coordinate(
 			if !ok {
 				outCh = nil
 			} else {
-				reportOutcome(ctx, out, c.stats, c.logger, c.report, &c.victims)
+				reportOutcome(ctx, out, c.stats, c.logger, c.report, &c.accounting)
 				completeExecution(c.detector, out)
 				c.inFlight--
 			}
@@ -687,22 +705,57 @@ func runExecutor(
 // reportOutcome prints results and updates statistics for a finished execution.
 func reportOutcome(
 	ctx context.Context, out action.Outcome, stats *dupe.Stats, logger *slog.Logger,
-	report *reportWriter, victims *victimCounter,
+	report *reportWriter, accounting *accounting,
 ) {
 	switch out.Kind {
 	case dupe.DupeElim:
-		reportElimination(ctx, out, stats, logger, report, victims)
+		reportElimination(ctx, out, stats, logger, report, accounting)
 	case dupe.CoWDetect:
 		reportCoW(out, stats, report)
 	case dupe.HashCalc, dupe.HashComp:
-		// No user-visible result.
+		reportHashFailure(out, stats, logger, accounting)
 	}
+}
+
+// reportHashFailure counts and logs a hash or comparison that could not produce a
+// verdict. The scan already counts a file whose checksum could not be read; the
+// executor stage (the retries that verify content before anything is acted on)
+// did not, so "N files could not be opened" under-reported exactly the files whose
+// content was never verified — and an unverified file is never eliminated, so the
+// number is what explains a duplicate that stayed in place.
+func reportHashFailure(out action.Outcome, stats *dupe.Stats, logger *slog.Logger, a *accounting) {
+	if out.Err == nil || errors.Is(out.Err, context.Canceled) || errors.Is(out.Err, context.DeadlineExceeded) {
+		return // a cancelled run is not a read failure
+	}
+
+	unread := make([]string, 0, len(out.Files))
+	for _, fi := range out.Files {
+		if fi.SHA256 != ([32]byte{}) {
+			continue // this file's digest was computed: it is not the unreadable one
+		}
+		unread = append(unread, fi.Path)
+		if a.noteUnreadable(fi.Path) {
+			stats.CantReadFiles.Add(1)
+		}
+	}
+
+	if len(unread) == 0 {
+		// The execution failed before a file could be identified (a malformed
+		// execution, or a comparison that failed for a reason of its own): the
+		// failure must still be visible in the summary and the log.
+		if a.noteUnreadable("") {
+			stats.CantReadFiles.Add(1)
+		}
+		logger.Warn("content verification failed", "error", out.Err)
+		return
+	}
+	logger.Warn("content verification failed", "files", unread, "error", out.Err)
 }
 
 // reportElimination handles the reported result of a DupeElim execution.
 func reportElimination(
 	ctx context.Context, out action.Outcome, stats *dupe.Stats, logger *slog.Logger,
-	report *reportWriter, victims *victimCounter,
+	report *reportWriter, accounting *accounting,
 ) {
 	if len(out.Files) < dupe.FilesPerExecution {
 		return
@@ -724,7 +777,7 @@ func reportElimination(
 	// that turned out to share storage already — the same inode (already
 	// hardlinked) or the same extents (already shared) — and the pairs whose
 	// decision was withdrawn because a file changed during the scan.
-	if countsAsDuplicateStorage(out.Result) && !hardlinkAlias && victims.count(victim) {
+	if countsAsDuplicateStorage(out.Result) && !hardlinkAlias && accounting.countVictim(victim) {
 		stats.DuplicateFiles.Add(1)
 		stats.DuplicateBytes.Add(victim.Size)
 	}

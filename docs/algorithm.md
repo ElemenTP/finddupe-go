@@ -209,6 +209,46 @@ touch a path that is already the same physical file as the keeper. Acting on suc
 a pair would break the existing hardlink — in particular, cloning one name of a
 hardlinked pair would replace it with an unshared copy.
 
+### Files That Change While the Run Works (TOCTOU)
+
+Every check above is a check at a point in time, so a tree that is being written to
+during the run has windows in which a file can change after it was verified:
+
+| Window | What can slip through | Consequence |
+|--------|----------------------|-------------|
+| Between the scan's stat and the read (`ComputeFileInfo`) | a shrink or grow | refused (`dupe.ErrFileChanged`), counted as unreadable |
+| Between the scan and the end-of-scan decision | any change | a duplicate decision made from content that is no longer there |
+| Between the decision and the action (`unchanged`) | a change that keeps the size **and** the modification time, or a stat failure | the pair is skipped (`ResultSkippedChanged`), nothing is touched |
+| Between `unchanged` and the rename, and while a file is being read | a same-size replacement, a truncation | a clone/hash of different bytes than the decision used; a comparison stops (and now fails) instead of looping |
+| Between `dedupe --cow`'s extent query and the clone | a rewrite of the keeper | the clone copies the new bytes; the size invariant still holds |
+
+The design keeps every one of these fail-safe rather than fail-wrong: an
+unverified or changed file is never eliminated, a failed step leaves the victim in
+place (temporary name + atomic rename, rollback of the write protection), and a
+comparison that cannot reach a verdict reports `dupe.ErrFileChanged`. What it
+cannot do is make a decision about bytes that changed after the bytes were read —
+no tool can without a snapshot or a lock.
+
+Mitigations, in the order they are usually worth the effort:
+
+1. **Run when the tree is quiescent** (a backup, a stopped service, a copy that is
+   not being written). This removes every window above at once.
+2. **`--ref`** marks the files that must survive. A reference is never eliminated,
+   so even a stale decision cannot remove it, and it is the keeper of its group.
+3. **Re-run `find` after a `dedupe`** and treat a non-empty result as "something
+   changed or could not be verified" — the second run is cheap (the weak checksum
+   only) and it prints the files that were left alone.
+4. **Prefer `--hardlink` over `--delete`** when the tree is live: a hardlink keeps
+   the victim's bytes reachable through the keeper, while a delete does not. Both
+   are decided on the same verified content.
+5. **Snapshot the filesystem** (VSS on Windows, `btrfs subvolume snapshot`, an APFS
+   snapshot, a ZFS snapshot) and run the tool against the snapshot; the copy is
+   immutable while the run works.
+6. **Watch the summary**: `content verification failed` in the log plus
+   `N files could not be opened` is the tool telling you which files it could not
+   verify — those are exactly the ones a live write touched or a permission
+   blocked.
+
 This means:
 - Files with **same content + same `(Dev, Inode)`** (already hardlinked) →
   `ResultAlreadyHardlinked` (silently skipped; in verbose mode logged as

@@ -206,3 +206,56 @@ func TestRunListLinkCancelledContextIsReported(t *testing.T) {
 		t.Fatalf("runListLink returned %v, want context.Canceled", err)
 	}
 }
+
+// TestReportHashFailureCountsUnreadableFiles verifies that a hash or comparison
+// that could not produce a verdict is counted (once per file, across retries) and
+// logged, so "N files could not be opened" explains a duplicate that stayed in
+// place because its content was never verified.
+func TestReportHashFailureCountsUnreadableFiles(t *testing.T) {
+	t.Parallel()
+
+	stats := dupe.NewStats()
+	logger := slog.New(slog.DiscardHandler)
+	accounting := &accounting{}
+
+	// A failed comparison: neither digest is known, so both files are counted.
+	out := action.Outcome{
+		Kind:  dupe.HashComp,
+		Files: []dupe.FileInfo{{Path: "/a"}, {Path: "/b"}},
+		Err:   errors.New("read /a: input/output error"),
+	}
+	reportHashFailure(out, stats, logger, accounting)
+	reportHashFailure(out, stats, logger, accounting) // a retry must not count twice
+	if got := stats.CantReadFiles.Load(); got != 2 {
+		t.Fatalf("CantReadFiles = %d, want 2 (once per file, across retries)", got)
+	}
+
+	// A successful hash of one file and a failed one for the other counts only
+	// the file whose digest is still unknown.
+	out = action.Outcome{
+		Kind: dupe.HashComp,
+		Files: []dupe.FileInfo{
+			{Path: "/a", SHA256: [32]byte{1}},
+			{Path: "/d"},
+		},
+		Err: errors.New("read /d: permission denied"),
+	}
+	reportHashFailure(out, stats, logger, accounting)
+	if got := stats.CantReadFiles.Load(); got != 3 {
+		t.Fatalf("CantReadFiles = %d, want 3 (only the unverified file)", got)
+	}
+
+	// A cancellation is not a read failure.
+	out = action.Outcome{Kind: dupe.HashCalc, Files: []dupe.FileInfo{{Path: "/c"}}, Err: context.Canceled}
+	reportHashFailure(out, stats, logger, accounting)
+	if got := stats.CantReadFiles.Load(); got != 3 {
+		t.Fatalf("CantReadFiles = %d, want 3 after a cancelled attempt", got)
+	}
+
+	// A plain success changes nothing.
+	reportHashFailure(action.Outcome{Kind: dupe.HashCalc, Files: []dupe.FileInfo{{Path: "/a"}}},
+		stats, logger, accounting)
+	if got := stats.CantReadFiles.Load(); got != 3 {
+		t.Fatalf("CantReadFiles = %d, want 3 after a successful attempt", got)
+	}
+}
