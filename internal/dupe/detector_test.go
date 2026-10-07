@@ -2,237 +2,889 @@ package dupe_test
 
 import (
 	"crypto/sha256"
+	"slices"
+	"sort"
+	"sync"
 	"testing"
 
 	"finddupe/internal/dupe"
 )
 
+// key1 is a reusable composite key for tests.
+var key1 = dupe.GroupKey{Signature: 0xABCD, Size: 4096}
+
+// fi builds a FileInfo for the shared test key.
+func fi(path string, size int64) dupe.FileInfo {
+	return dupe.FileInfo{Path: path, Size: size, Signature: key1.Signature}
+}
+
+// fiSha builds a fully hashed FileInfo for the shared test key.
+func fiSha(path string, size int64, seed byte) dupe.FileInfo {
+	out := fi(path, size)
+	out.SHA256 = shaOf(seed)
+	out.HashOffset = size
+	return out
+}
+
+// shaOf returns a non-zero SHA-256 for the given seed.
+func shaOf(seed byte) [32]byte {
+	return sha256.Sum256([]byte{seed})
+}
+
+// execTypes lists the execution types in order.
+func execTypes(execs []dupe.Execution) []dupe.ExecutionType {
+	out := make([]dupe.ExecutionType, len(execs))
+	for i, ex := range execs {
+		out[i] = ex.Type
+	}
+	return out
+}
+
+// finalAll drains the detector's end-of-scan work. It must only be used when the
+// emitted work needs no simulation (every file has a known SHA-256).
+func finalAll(t *testing.T, d *dupe.Detector) []dupe.Execution {
+	t.Helper()
+
+	var out []dupe.Execution
+	for range 1000 {
+		execs, done := d.NextFinal(1024)
+		out = append(out, execs...)
+		if done {
+			return out
+		}
+	}
+	t.Fatal("NextFinal never reported completion")
+	return nil
+}
+
+// finalizeWithDigests drains the end-of-scan work the way the coordinator does:
+// every HashCalc is answered with the digest the callback gives it, and the
+// elimination work is returned. It lets a test simulate a group whose files are
+// only hashed by finalization.
+func finalizeWithDigests(
+	t *testing.T, d *dupe.Detector, digest func(dupe.FileInfo) [32]byte,
+) []dupe.Execution {
+	t.Helper()
+
+	var out []dupe.Execution
+	for range 1000 {
+		execs, done := d.NextFinal(1024)
+		for _, ex := range execs {
+			if ex.Type != dupe.HashCalc || len(ex.Files) != 1 {
+				out = append(out, ex)
+				continue
+			}
+			fi := ex.Files[0]
+			fi.SHA256, fi.HashOffset = digest(fi), fi.Size
+			d.OnHashDone(ex.Key, fi, false)
+		}
+		if done {
+			return out
+		}
+	}
+	t.Fatal("NextFinal never reported completion")
+	return nil
+}
+
+// victimsOf returns the victim paths of the DupeElim executions, and the set of
+// distinct keepers.
+func victimsOf(execs []dupe.Execution) ([]string, map[string]bool) {
+	var victims []string
+	keepers := make(map[string]bool)
+	for _, ex := range execs {
+		if ex.Type != dupe.DupeElim {
+			continue
+		}
+		keepers[ex.Files[0].Path] = true
+		victims = append(victims, ex.Files[1].Path)
+	}
+	return victims, keepers
+}
+
 func TestDetector_FirstInsert(t *testing.T) {
 	t.Parallel()
-	d := dupe.NewDetector(dupe.NewStats())
-	fi := dupe.FileInfo{Path: "/a", Size: 100, Signature: 0xABCD}
 
-	groups := d.Insert(fi)
-	if groups != nil {
-		t.Errorf("expected nil for first insert, got %v", groups)
-	}
-	if d.Len() != 1 {
-		t.Errorf("expected 1 entry, got %d", d.Len())
-	}
-}
+	stats := dupe.NewStats()
+	d := dupe.NewDetector(stats)
 
-func TestDetector_TwoFiles_EmitsGroup(t *testing.T) {
-	t.Parallel()
-	d := dupe.NewDetector(dupe.NewStats())
-	fi1 := dupe.FileInfo{Path: "/a", Size: 100, Signature: 0xABCD}
-	fi2 := dupe.FileInfo{Path: "/b", Size: 100, Signature: 0xABCD}
-
-	d.Insert(fi1)
-	groups := d.Insert(fi2)
-
-	if groups == nil {
-		t.Fatal("expected non-nil groups for second file")
+	if execs := d.Insert(fi("/a", 4096)); len(execs) != 0 {
+		t.Fatalf("first insert returned %v, want no executions", execTypes(execs))
 	}
-	if len(groups) != 1 {
-		t.Fatalf("expected 1 group, got %d", len(groups))
-	}
-	if groups[0].Original.Path != "/a" {
-		t.Errorf("expected original /a, got %s", groups[0].Original.Path)
-	}
-	if groups[0].Key != (dupe.GroupKey{Signature: 0xABCD, Size: 100}) {
-		t.Errorf("expected composite key, got %+v", groups[0].Key)
+	// The group the insert registered is observed through the stats and the
+	// executions it produces; there is no accessor for the detector's own map.
+	if stats.TotalFiles.Load() != 1 || stats.TotalBytes.Load() != 4096 {
+		t.Fatalf("stats = (%d files, %d bytes), want (1, 4096)",
+			stats.TotalFiles.Load(), stats.TotalBytes.Load())
 	}
 }
 
-func TestDetector_CompositeKey_DifferentSizes(t *testing.T) {
+func TestDetector_TwoUnhashedFiles_EmitHashComp(t *testing.T) {
 	t.Parallel()
+
 	d := dupe.NewDetector(dupe.NewStats())
+	d.Insert(fi("/a", 4096))
 
-	// Same signature, different sizes → different groups (composite key).
-	d.Insert(dupe.FileInfo{Path: "/a", Size: 100, Signature: 0xABCD})
-	d.Insert(dupe.FileInfo{Path: "/b", Size: 200, Signature: 0xABCD})
-
-	if d.Len() != 2 {
-		t.Errorf("expected 2 separate groups (different sizes), got %d", d.Len())
+	execs := d.Insert(fi("/b", 4096))
+	if len(execs) != 1 || execs[0].Type != dupe.HashComp {
+		t.Fatalf("second insert = %v, want one HashComp", execTypes(execs))
+	}
+	if execs[0].Files[0].Path != "/a" || execs[0].Files[1].Path != "/b" {
+		t.Fatalf("HashComp files = %q/%q, want /a and /b",
+			execs[0].Files[0].Path, execs[0].Files[1].Path)
 	}
 }
 
-func TestDetector_ThreePlusFiles(t *testing.T) {
+func TestDetector_ThirdUnhashedFile_EmitHashCalc(t *testing.T) {
 	t.Parallel()
+
 	d := dupe.NewDetector(dupe.NewStats())
-	sig := uint64(0xBEEF)
-	fi1 := dupe.FileInfo{Path: "/a", Size: 100, Signature: sig}
-	fi2 := dupe.FileInfo{Path: "/b", Size: 100, Signature: sig}
-	fi3 := dupe.FileInfo{Path: "/c", Size: 100, Signature: sig}
+	d.Insert(fi("/a", 4096))
+	d.Insert(fi("/b", 4096))
 
-	d.Insert(fi1)
-	d.Insert(fi2)
-
-	// Third file: should emit at least 1 group (against zero-SHA representative).
-	groups := d.Insert(fi3)
-	if len(groups) < 1 {
-		t.Fatalf("expected at least 1 group for 3+ files, got %d", len(groups))
+	execs := d.Insert(fi("/c", 4096))
+	// Only the new file is scheduled: Insert stays O(1) in the group size, and
+	// files an early-stopped comparison left behind are completed by NextFinal.
+	if len(execs) != 1 || execs[0].Type != dupe.HashCalc {
+		t.Fatalf("third insert = %v, want one HashCalc", execTypes(execs))
 	}
-	if d.GroupSize(dupe.GroupKey{Signature: sig, Size: 100}) != 3 {
-		t.Errorf("expected group size 3, got %d", d.GroupSize(dupe.GroupKey{Signature: sig, Size: 100}))
-	}
-
-	// All files should be in zero bucket (no SHA computed yet).
-	unhashed := d.UnhashedFiles(dupe.GroupKey{Signature: sig, Size: 100})
-	if len(unhashed) != 3 {
-		t.Errorf("expected 3 unhashed files, got %d", len(unhashed))
+	if execs[0].Files[0].Path != "/c" {
+		t.Fatalf("HashCalc file = %q, want /c", execs[0].Files[0].Path)
 	}
 }
 
-func TestDetector_DifferentSignatures(t *testing.T) {
+func TestDetector_KnownShaMatch_DeferredToFinal(t *testing.T) {
 	t.Parallel()
+
 	d := dupe.NewDetector(dupe.NewStats())
+	if execs := d.Insert(fiSha("/a", 100, 1)); len(execs) != 0 {
+		t.Fatalf("first insert returned %v", execTypes(execs))
+	}
 
-	d.Insert(dupe.FileInfo{Path: "/a", Size: 100, Signature: 1})
-	d.Insert(dupe.FileInfo{Path: "/b", Size: 200, Signature: 2})
-	d.Insert(dupe.FileInfo{Path: "/c", Size: 300, Signature: 3})
+	// Inserting a duplicate does not decide anything: the keeper is chosen once
+	// the whole group is known.
+	if execs := d.Insert(fiSha("/b", 100, 1)); len(execs) != 0 {
+		t.Fatalf("matching insert = %v, want no executions during the scan", execTypes(execs))
+	}
 
-	if d.Len() != 3 {
-		t.Errorf("expected 3 entries, got %d", d.Len())
+	execs := finalAll(t, d)
+	if len(execs) != 1 || execs[0].Type != dupe.DupeElim {
+		t.Fatalf("final work = %v, want one DupeElim", execTypes(execs))
+	}
+	if execs[0].Files[0].Path != "/a" || execs[0].Files[1].Path != "/b" {
+		t.Fatalf("DupeElim files = %q/%q, want keeper /a and victim /b",
+			execs[0].Files[0].Path, execs[0].Files[1].Path)
 	}
 }
 
-func TestDetector_StatsUpdate(t *testing.T) {
+func TestDetector_KnownShaMismatch_NoExec(t *testing.T) {
 	t.Parallel()
+
 	d := dupe.NewDetector(dupe.NewStats())
+	d.Insert(fiSha("/a", 100, 1))
+	d.Insert(fiSha("/b", 100, 2))
 
-	d.Insert(dupe.FileInfo{Path: "/a", Size: 100, Signature: 1})
-	d.Insert(dupe.FileInfo{Path: "/b", Size: 200, Signature: 2})
-
-	stats := d.Stats()
-	if stats.TotalFiles.Load() != 2 {
-		t.Errorf("expected TotalFiles=2, got %d", stats.TotalFiles.Load())
-	}
-	if stats.TotalBytes.Load() != 300 {
-		t.Errorf("expected TotalBytes=300, got %d", stats.TotalBytes.Load())
+	if execs := finalAll(t, d); len(execs) != 0 {
+		t.Fatalf("mismatching group produced %v, want no executions", execTypes(execs))
 	}
 }
 
-func TestDetector_EmptyDetector(t *testing.T) {
+// TestDetector_ThreeIdenticalFiles_AllReported verifies that identical files
+// yield one elimination per extra member, all against the same keeper.
+func TestDetector_ThreeIdenticalFiles_AllReported(t *testing.T) {
 	t.Parallel()
-	d := dupe.NewDetector(dupe.NewStats())
 
-	if d.Len() != 0 {
-		t.Errorf("expected 0 entries, got %d", d.Len())
+	d := dupe.NewDetector(dupe.NewStats())
+	for _, path := range []string{"/a", "/b", "/c"} {
+		d.Insert(fiSha(path, 100, 9))
 	}
 
-	stats := d.Stats()
-	if stats.TotalFiles.Load() != 0 {
-		t.Errorf("expected TotalFiles=0, got %d", stats.TotalFiles.Load())
+	execs := finalAll(t, d)
+	victims, keepers := victimsOf(execs)
+	if len(victims) != 2 {
+		t.Fatalf("victims = %v, want two eliminations", victims)
+	}
+	if len(keepers) != 1 {
+		t.Fatalf("keepers = %v, want exactly one keeper", keepers)
+	}
+	if !keepers["/a"] {
+		t.Fatalf("keeper = %v, want the smallest path /a", keepers)
+	}
+	if victims[0] == victims[1] {
+		t.Fatalf("victim %q eliminated twice", victims[0])
 	}
 }
 
-func TestDetector_SHA256InstantMatch(t *testing.T) {
+// TestDetector_EarlyStoppedCompareIsCompleted is the regression test for the
+// missed duplicates: a comparison that stops early leaves both files without a
+// SHA-256, and a third file that finishes hashing in the meantime used to
+// condemn them to never being hashed again — so a genuine duplicate between the
+// stranded file and the finished one was never reported.
+func TestDetector_EarlyStoppedCompareIsCompleted(t *testing.T) {
 	t.Parallel()
+
 	d := dupe.NewDetector(dupe.NewStats())
-	key := dupe.GroupKey{Signature: 0xABCD, Size: 100}
-	hash1 := sha256.Sum256([]byte("content A"))
 
-	// Simulate: file stored, verified, SHA-256 completed, moved to SHA bucket.
-	fi1 := dupe.FileInfo{Path: "/a", Size: 100, Signature: 0xABCD}
-	d.Insert(fi1)
-	d.UpdateFileState(key, "/a", nil, 100, hash1)
+	a, b := fi("/a", 4096), fi("/b", 4096)
+	d.Insert(a)
+	d.Insert(b)
+	d.Insert(fi("/c", 4096))
 
-	// Second file arrives with matching SHA-256 → instant confirmed duplicate.
-	fi2 := dupe.FileInfo{Path: "/b", Size: 100, Signature: 0xABCD, SHA256: hash1}
-	groups := d.Insert(fi2)
+	partialA := a
+	partialA.HashOffset = 1024
+	partialB := b
+	partialB.HashOffset = 1024
+	d.OnCompareDone(key1, partialA, partialB, false)
+	d.OnHashDone(key1, fiSha("/c", 4096, 7), false)
 
-	if groups == nil {
-		t.Fatal("expected instant match with known SHA-256")
+	// The detector must ask for the two stranded files to be hashed; simulate the
+	// executor: /a is identical to /c, /b differs from both.
+	var hashed []string
+	var decided []dupe.Execution
+	for range 10 {
+		execs, done := d.NextFinal(8)
+		for _, ex := range execs {
+			if ex.Type != dupe.HashCalc {
+				decided = append(decided, ex)
+				continue
+			}
+			hashed = append(hashed, ex.Files[0].Path)
+			sha := byte(7)
+			if ex.Files[0].Path == "/b" {
+				sha = 8
+			}
+			d.OnHashDone(key1, fiSha(ex.Files[0].Path, 4096, sha), false)
+		}
+		if done {
+			break
+		}
 	}
-	if len(groups) != 1 {
-		t.Fatalf("expected 1 group, got %d", len(groups))
+
+	if len(hashed) != 2 {
+		t.Fatalf("hashed %v, want the two stranded files /a and /b", hashed)
 	}
-	if groups[0].Original.Path != "/a" {
-		t.Errorf("expected original /a, got %s", groups[0].Original.Path)
+
+	victims, keepers := victimsOf(decided)
+	if len(victims) != 1 || victims[0] != "/c" {
+		t.Fatalf("victims = %v, want the duplicate /c eliminated against /a", victims)
+	}
+	if !keepers["/a"] {
+		t.Fatalf("keeper = %v, want /a", keepers)
 	}
 }
 
-func TestDetector_SHA256CRCCollision(t *testing.T) {
+// TestDetector_SettledPairNotHashed verifies that the early-stop optimisation
+// survives: a two-file comparison that proves the files differ leaves nothing
+// for finalization to do.
+func TestDetector_SettledPairNotHashed(t *testing.T) {
 	t.Parallel()
+
 	d := dupe.NewDetector(dupe.NewStats())
-	key := dupe.GroupKey{Signature: 0xABCD, Size: 100}
-	hashA := sha256.Sum256([]byte("content A"))
-	hashB := sha256.Sum256([]byte("different content B"))
+	a, b := fi("/a", 4096), fi("/b", 4096)
+	d.Insert(a)
+	d.Insert(b)
 
-	// File A with known SHA.
-	fiA := dupe.FileInfo{Path: "/a", Size: 100, Signature: 0xABCD}
-	d.Insert(fiA)
-	d.UpdateFileState(key, "/a", nil, 100, hashA)
+	partialA, partialB := a, b
+	partialA.HashOffset, partialB.HashOffset = 1024, 1024
+	d.OnCompareDone(key1, partialA, partialB, false)
 
-	// File B: different SHA-256 → CRC collision, stored in new bucket.
-	fiB := dupe.FileInfo{Path: "/b", Size: 100, Signature: 0xABCD, SHA256: hashB}
-	groups := d.Insert(fiB)
-	if groups != nil {
-		t.Error("expected nil (CRC collision with known different SHA-256)")
-	}
-
-	// File C matches B's SHA-256 → instant match against B.
-	fiC := dupe.FileInfo{Path: "/c", Size: 100, Signature: 0xABCD, SHA256: hashB}
-	groups = d.Insert(fiC)
-	if groups == nil {
-		t.Fatal("expected instant match for C against B's SHA-256")
-	}
-	if groups[0].Original.Path != "/b" {
-		t.Errorf("expected original /b, got %s", groups[0].Original.Path)
+	execs, done := d.NextFinal(8)
+	if len(execs) != 0 || !done {
+		t.Fatalf("NextFinal = (%v, %v), want no work and completion", execTypes(execs), done)
 	}
 }
 
-func TestDetector_UpdateFileState_PartialProgress(t *testing.T) {
+// TestDetector_SettledPairIsHashedWhenTheGroupGrows is the regression test for a
+// three-file weak group whose first two members were proven different by the
+// direct comparison: the group stayed marked as settled, finalization never
+// hashed the pending pair, and a third file identical to one of them was never
+// matched, so the duplicate was silently missed.
+func TestDetector_SettledPairIsHashedWhenTheGroupGrows(t *testing.T) {
 	t.Parallel()
+
 	d := dupe.NewDetector(dupe.NewStats())
-	key := dupe.GroupKey{Signature: 0xABCD, Size: 100}
-	hash1 := sha256.Sum256([]byte("content A"))
+	a, b, c := fi("/a", 4096), fi("/b", 4096), fi("/c", 4096)
 
-	fi := dupe.FileInfo{Path: "/a", Size: 100, Signature: 0xABCD}
-	d.Insert(fi)
-
-	// Save partial state (first 50 bytes hashed, no complete SHA).
-	d.UpdateFileState(key, "/a", []byte{1, 2, 3}, 50, [32]byte{})
-
-	// File should still be in zero-SHA bucket (incomplete).
-	unhashed := d.UnhashedFiles(key)
-	if len(unhashed) != 1 {
-		t.Fatalf("expected 1 file in zero bucket, got %d", len(unhashed))
-	}
-	if unhashed[0].HashOffset != 50 {
-		t.Errorf("expected HashOffset=50, got %d", unhashed[0].HashOffset)
+	d.Insert(a)
+	if execs := d.Insert(b); len(execs) != 1 || execs[0].Type != dupe.HashComp {
+		t.Fatalf("second insert = %v, want one HashComp", execTypes(execs))
 	}
 
-	// Complete the hash.
-	d.UpdateFileState(key, "/a", nil, 100, hash1)
+	// The comparison proves /a and /b differ and leaves both without a digest.
+	partialA, partialB := a, b
+	partialA.HashOffset, partialB.HashOffset = 1024, 1024
+	d.OnCompareDone(key1, partialA, partialB, false)
 
-	// File should now be in SHA bucket.
-	unhashed = d.UnhashedFiles(key)
-	if len(unhashed) != 0 {
-		t.Errorf("expected 0 files in zero bucket after complete, got %d", len(unhashed))
+	// A third file with the same weak key arrives after that verdict.
+	execs := d.Insert(c)
+	if len(execs) != 1 || execs[0].Type != dupe.HashCalc {
+		t.Fatalf("third insert = %v, want one HashCalc for the new file", execTypes(execs))
+	}
+	hashedC := c
+	hashedC.SHA256, hashedC.HashOffset = shaOf(7), hashedC.Size
+	d.OnHashDone(key1, hashedC, false)
+
+	// /a and /c hold the same content, so finalization must finish the two
+	// pending digests and decide the pair.
+	plan := finalizeWithDigests(t, d, func(f dupe.FileInfo) [32]byte {
+		if f.Path == "/b" {
+			return shaOf(9)
+		}
+		return shaOf(7)
+	})
+
+	victims, _ := victimsOf(plan)
+	if len(victims) != 1 || (victims[0] != "/a" && victims[0] != "/c") {
+		t.Fatalf("plan = %v, want exactly one of /a, /c as the victim of the other",
+			execTypes(plan))
 	}
 }
 
-func TestDetector_UpdateFileState_KeepsLargerOffset(t *testing.T) {
+// TestDetector_FailedCompareIsRetried verifies that a comparison which could not
+// run (an I/O error, not a verdict) leads to a full hash attempt instead of being
+// silently treated as "different", and that unhashable files stop being retried.
+func TestDetector_FailedCompareIsRetried(t *testing.T) {
 	t.Parallel()
+
 	d := dupe.NewDetector(dupe.NewStats())
-	key := dupe.GroupKey{Signature: 0xABCD, Size: 100}
+	a, b := fi("/a", 4096), fi("/b", 4096)
+	d.Insert(a)
+	d.Insert(b)
 
-	fi := dupe.FileInfo{Path: "/a", Size: 100, Signature: 0xABCD}
-	d.Insert(fi)
+	d.OnCompareDone(key1, a, b, true)
 
-	// Save partial state at offset 30.
-	d.UpdateFileState(key, "/a", []byte{1, 2, 3}, 30, [32]byte{})
-
-	// Try to update with smaller offset — should be ignored.
-	d.UpdateFileState(key, "/a", []byte{4, 5, 6}, 10, [32]byte{})
-
-	unhashed := d.UnhashedFiles(key)
-	if len(unhashed) != 1 {
-		t.Fatal("expected file in zero bucket")
+	attempts := 0
+	for range 20 {
+		execs, done := d.NextFinal(8)
+		if len(execs) == 0 {
+			if done {
+				break
+			}
+			continue
+		}
+		for _, ex := range execs {
+			if ex.Type != dupe.HashCalc {
+				t.Fatalf("unexpected work %v", execTypes(execs))
+			}
+			attempts++
+			// The file cannot be hashed: report it as still incomplete.
+			d.OnHashDone(key1, ex.Files[0], true)
+		}
 	}
-	if unhashed[0].HashOffset != 30 {
-		t.Errorf("expected HashOffset=30 (larger kept), got %d", unhashed[0].HashOffset)
+
+	if attempts == 0 {
+		t.Fatal("a failed comparison must lead to a hash attempt")
+	}
+	if attempts > 4 {
+		t.Fatalf("unhashable files were retried %d times, want at most 2 per file", attempts)
+	}
+}
+
+func TestDetector_KeeperPolicyPrefersReference(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats())
+	// The reference arrives second, which used to be irrelevant for any file
+	// larger than the scan-time checksum window (its hash was zero at insert).
+	d.Insert(fiSha("/work/copy", 100, 3))
+	ref := fiSha("/ref/orig", 100, 3)
+	ref.IsRef = true
+	d.Insert(ref)
+
+	execs := finalAll(t, d)
+	if len(execs) != 1 {
+		t.Fatalf("final work = %v, want one DupeElim", execTypes(execs))
+	}
+	if got := execs[0].Files[0].Path; got != "/ref/orig" {
+		t.Fatalf("keeper = %q, want the reference /ref/orig", got)
+	}
+	if got := execs[0].Files[1].Path; got != "/work/copy" {
+		t.Fatalf("victim = %q, want the non-reference copy", got)
+	}
+}
+
+func TestDetector_KeeperPolicyPrefersMoreHardlinks(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats())
+	single := fiSha("/a", 100, 3)
+	single.NumLinks = 1
+	multi := fiSha("/b", 100, 3)
+	multi.NumLinks = 4
+	d.Insert(single)
+	d.Insert(multi)
+
+	execs := finalAll(t, d)
+	if len(execs) != 1 {
+		t.Fatalf("final work = %v, want one DupeElim", execTypes(execs))
+	}
+	// Keeping the file with more links means the victim is the one whose
+	// removal actually frees storage.
+	if got := execs[0].Files[0].Path; got != "/b" {
+		t.Fatalf("keeper = %q, want /b (4 hardlinks)", got)
+	}
+}
+
+func TestDetector_KeeperPolicyIsStableRegardlessOfInsertOrder(t *testing.T) {
+	t.Parallel()
+
+	for _, order := range [][]string{{"/b", "/a"}, {"/a", "/b"}} {
+		d := dupe.NewDetector(dupe.NewStats())
+		for _, path := range order {
+			d.Insert(fiSha(path, 100, 5))
+		}
+
+		execs := finalAll(t, d)
+		if len(execs) != 1 {
+			t.Fatalf("order %v: final work = %v, want one DupeElim", order, execTypes(execs))
+		}
+		if got := execs[0].Files[0].Path; got != "/a" {
+			t.Fatalf("order %v: keeper = %q, want /a", order, got)
+		}
+	}
+}
+
+// customPolicy keeps the lexicographically largest path.
+type customPolicy struct{}
+
+func (customPolicy) Less(a, b dupe.FileInfo) bool { return a.Path > b.Path }
+
+func TestDetector_CustomKeeperPolicy(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats(), dupe.WithKeeperPolicy(customPolicy{}))
+	d.Insert(fiSha("/a", 100, 5))
+	d.Insert(fiSha("/b", 100, 5))
+
+	execs := finalAll(t, d)
+	if len(execs) != 1 {
+		t.Fatalf("final work = %v, want one DupeElim", execTypes(execs))
+	}
+	if got := execs[0].Files[0].Path; got != "/b" {
+		t.Fatalf("keeper = %q, want /b with the custom policy", got)
+	}
+}
+
+// TestDetector_CompressionPreference verifies that a compressed member is kept
+// when the preference is enabled, ahead of the path order that would otherwise
+// win, and that the probe is consulted once per member.
+func TestDetector_CompressionPreference(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats(), dupe.WithCompressionPreference(func(fi dupe.FileInfo) bool {
+		return fi.Path == "/z-compressed"
+	}))
+	d.Insert(fiSha("/a", 100, 5))
+	d.Insert(fiSha("/z-compressed", 100, 5))
+
+	execs := finalAll(t, d)
+	if len(execs) != 1 {
+		t.Fatalf("final work = %v, want one DupeElim", execTypes(execs))
+	}
+	if got := execs[0].Files[0].Path; got != "/z-compressed" {
+		t.Fatalf("keeper = %q, want the compressed member", got)
+	}
+	if got := execs[0].Files[1].Path; got != "/a" {
+		t.Fatalf("victim = %q, want /a", got)
+	}
+}
+
+// TestDetector_CompressionPreferenceIsNotProbedPerComparison verifies that the
+// probe runs once per member, not once per comparison: a sort that probed on
+// every comparison would open and query the same files O(n log n) times.
+func TestDetector_CompressionPreferenceIsNotProbedPerComparison(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	calls := make(map[string]int)
+	d := dupe.NewDetector(dupe.NewStats(), dupe.WithCompressionPreference(func(fi dupe.FileInfo) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		calls[fi.Path]++
+		return false
+	}))
+
+	paths := []string{"/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h"}
+	for _, path := range paths {
+		d.Insert(fiSha(path, 100, 5))
+	}
+	finalAll(t, d)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, path := range paths {
+		if calls[path] != 1 {
+			t.Errorf("probe called %d times for %s, want 1", calls[path], path)
+		}
+	}
+}
+
+// fixedChooser keeps a named path when it is a member of the group.
+type fixedChooser struct {
+	keep string
+}
+
+func (c fixedChooser) Choose(members []dupe.FileInfo) (dupe.FileInfo, bool) {
+	for _, member := range members {
+		if member.Path == c.keep {
+			return member, true
+		}
+	}
+	return dupe.FileInfo{}, false
+}
+
+// TestDetector_KeeperChooser verifies that the chooser decides the keeper instead
+// of the policy, that declining a group leaves it alone, and that an answer which
+// is not one of the members is refused.
+func TestDetector_KeeperChooser(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats(), dupe.WithKeeperChooser(fixedChooser{keep: "/c"}))
+	for _, path := range []string{"/a", "/b", "/c"} {
+		d.Insert(fiSha(path, 100, 5))
+	}
+
+	chosen := finalAll(t, d)
+	victims, keepers := victimsOf(chosen)
+	if len(victims) != 2 || !keepers["/c"] {
+		t.Fatalf("victims=%v keepers=%v, want /c kept", victims, keepers)
+	}
+	if victims[0] == "/c" || victims[1] == "/c" {
+		t.Fatalf("the chosen keeper was eliminated: %v", victims)
+	}
+
+	// Declining leaves the group untouched.
+	declined := dupe.NewDetector(dupe.NewStats(), dupe.WithKeeperChooser(fixedChooser{keep: "/not-there"}))
+	declined.Insert(fiSha("/a", 100, 5))
+	declined.Insert(fiSha("/b", 100, 5))
+	if declinedExecs := finalAll(t, declined); len(declinedExecs) != 0 {
+		t.Fatalf("a declined group produced %v, want nothing", execTypes(declinedExecs))
+	}
+}
+
+// declineChooser refuses every group.
+type declineChooser struct{}
+
+func (declineChooser) Choose([]dupe.FileInfo) (dupe.FileInfo, bool) {
+	return dupe.FileInfo{}, false
+}
+
+// TestDetector_KeeperChooserDeclines verifies the explicit "leave it alone" answer.
+func TestDetector_KeeperChooserDeclines(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats(), dupe.WithKeeperChooser(declineChooser{}))
+	d.Insert(fiSha("/a", 100, 5))
+	d.Insert(fiSha("/b", 100, 5))
+
+	if execs := finalAll(t, d); len(execs) != 0 {
+		t.Fatalf("declined group produced %v, want nothing", execTypes(execs))
+	}
+}
+
+// TestDetector_KeeperChooserCoWDetect verifies that the CoW group is handed over
+// with the chosen keeper first, which is the clone source.
+func TestDetector_KeeperChooserCoWDetect(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(
+		dupe.NewStats(),
+		dupe.WithCoWDetect(),
+		dupe.WithKeeperChooser(fixedChooser{keep: "/c"}),
+	)
+	for _, path := range []string{"/a", "/b", "/c"} {
+		d.Insert(fiSha(path, 100, 5))
+	}
+
+	execs := finalAll(t, d)
+	if len(execs) != 1 || execs[0].Type != dupe.CoWDetect {
+		t.Fatalf("final work = %v, want one CoWDetect", execTypes(execs))
+	}
+	if got := execs[0].Files[0].Path; got != "/c" {
+		t.Fatalf("clone source = %q, want the chosen /c", got)
+	}
+	if len(execs[0].Files) != 3 {
+		t.Fatalf("CoWDetect carries %d members, want 3", len(execs[0].Files))
+	}
+}
+
+// TestDetector_FinalBatchesAreBounded verifies that a large group is emitted in
+// bounded batches instead of materializing every elimination task at once.
+func TestDetector_FinalBatchesAreBounded(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats())
+	for _, path := range []string{"/a", "/b", "/c", "/d", "/e"} {
+		d.Insert(fiSha(path, 100, 5))
+	}
+
+	total := 0
+	calls := 0
+	for range 20 {
+		execs, done := d.NextFinal(2)
+		calls++
+		if len(execs) > 2 {
+			t.Fatalf("NextFinal(2) returned %d executions", len(execs))
+		}
+		total += len(execs)
+		if done {
+			break
+		}
+	}
+	if total != 4 {
+		t.Fatalf("emitted %d eliminations, want 4", total)
+	}
+	if calls < 3 {
+		t.Fatalf("expected the group to be emitted over several calls, got %d", calls)
+	}
+}
+
+func TestDetector_CoWDetectMode(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats(), dupe.WithCoWDetect())
+	for _, path := range []string{"/b", "/a", "/c"} {
+		d.Insert(fiSha(path, 100, 5))
+	}
+
+	execs := finalAll(t, d)
+	if len(execs) != 1 || execs[0].Type != dupe.CoWDetect {
+		t.Fatalf("final work = %v, want one CoWDetect", execTypes(execs))
+	}
+	if len(execs[0].Files) != 3 {
+		t.Fatalf("CoWDetect files = %d, want all three members", len(execs[0].Files))
+	}
+	// The group is handed over in keeper order, so the first entry is the keeper.
+	if got := execs[0].Files[0].Path; got != "/a" {
+		t.Fatalf("first member = %q, want /a", got)
+	}
+}
+
+// TestDetector_HardlinkedAliasesCollapse verifies that two paths to the same
+// inode are never eliminated against each other, and that the surviving path is
+// the one the keeper policy prefers.
+func TestDetector_HardlinkedAliasesCollapse(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats())
+
+	aliasA := fiSha("/data/a", 100, 5)
+	aliasA.Dev, aliasA.Inode = 1, 42
+	aliasB := fiSha("/data/z-alias", 100, 5)
+	aliasB.Dev, aliasB.Inode = 1, 42
+	refAlias := fiSha("/ref/a", 100, 5)
+	refAlias.Dev, refAlias.Inode = 1, 42
+	refAlias.IsRef = true
+	other := fiSha("/data/other", 100, 5)
+	other.Dev, other.Inode = 1, 43
+
+	d.Insert(aliasA)
+	d.Insert(aliasB)
+	d.Insert(refAlias)
+	d.Insert(other)
+
+	execs := finalAll(t, d)
+	if len(execs) != 1 {
+		t.Fatalf("final work = %v, want exactly one DupeElim", execTypes(execs))
+	}
+	// The reference alias survives the collapse and is the keeper.
+	if got := execs[0].Files[0].Path; got != "/ref/a" {
+		t.Fatalf("keeper = %q, want the collapsed reference /ref/a", got)
+	}
+}
+
+// twoPathFile builds a FileInfo of the shared content whose physical file owns
+// one path of the group's first inode; inode distinguishes the physical files.
+func twoPathFile(path string, inode uint64, links uint64) dupe.FileInfo {
+	out := fiSha(path, 100, 5)
+	out.Dev, out.Inode, out.NumLinks = 1, inode, links
+	return out
+}
+
+// TestDetector_EveryPathOfAVictimInodeIsAVictim is the regression test for a plan
+// that acted once per *physical file*: deleting or replacing one path of an inode
+// leaves its other paths on the old inode, so the group still holds two copies and
+// a later run has the rest of the work to do. One action per path.
+func TestDetector_EveryPathOfAVictimInodeIsAVictim(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats())
+
+	// Two physical files with the same content; both own two paths, so the keeper
+	// policy has no hardlink count to prefer and keeps the smallest path of the
+	// first inode.
+	d.Insert(twoPathFile("/a1", 1, 2))
+	d.Insert(twoPathFile("/a2", 1, 2))
+	d.Insert(twoPathFile("/b1", 2, 2))
+	d.Insert(twoPathFile("/b2", 2, 2))
+
+	victims, keepers := victimsOf(finalAll(t, d))
+	sort.Strings(victims)
+	if !slices.Equal(victims, []string{"/b1", "/b2"}) {
+		t.Fatalf("victims = %v, want every path of the other physical file", victims)
+	}
+	if len(keepers) != 1 || !keepers["/a1"] {
+		t.Fatalf("keepers = %v, want only /a1", keepers)
+	}
+}
+
+// TestDetector_HardlinkedAliasesAreReported verifies the report-only option: with
+// it the pair (keeper, a hardlink of the keeper) is in the plan; without it that
+// pair is dropped, because no action can change it.
+func TestDetector_HardlinkedAliasesAreReported(t *testing.T) {
+	t.Parallel()
+
+	newDetector := func(t *testing.T, opts ...dupe.Option) *dupe.Detector {
+		t.Helper()
+		d := dupe.NewDetector(dupe.NewStats(), opts...)
+		d.Insert(twoPathFile("/a1", 1, 2))
+		d.Insert(twoPathFile("/a2", 1, 2))
+		d.Insert(twoPathFile("/b", 2, 1))
+		return d
+	}
+
+	reported, _ := victimsOf(finalAll(t, newDetector(t, dupe.WithHardlinkedAliases())))
+	sort.Strings(reported)
+	if !slices.Equal(reported, []string{"/a2", "/b"}) {
+		t.Fatalf("reported victims = %v, want the alias /a2 and the copy /b", reported)
+	}
+
+	acted, _ := victimsOf(finalAll(t, newDetector(t)))
+	if !slices.Equal(acted, []string{"/b"}) {
+		t.Fatalf("action victims = %v, want only the separate physical file /b", acted)
+	}
+}
+
+// TestDetector_CompressionPreferenceKeepsReference verifies that the compression
+// hint cannot turn a --ref file into a victim: the executor refuses to eliminate
+// one, so such a group would silently be left alone.
+func TestDetector_CompressionPreferenceKeepsReference(t *testing.T) {
+	t.Parallel()
+
+	for _, order := range [][]string{{"/work/compressed", "/ref/orig"}, {"/ref/orig", "/work/compressed"}} {
+		d := dupe.NewDetector(dupe.NewStats(), dupe.WithCompressionPreference(func(fi dupe.FileInfo) bool {
+			return fi.Path == "/work/compressed"
+		}))
+		for _, path := range order {
+			fi := fiSha(path, 100, 5)
+			fi.IsRef = path == "/ref/orig"
+			d.Insert(fi)
+		}
+
+		execs := finalAll(t, d)
+		if len(execs) != 1 {
+			t.Fatalf("order %v: final work = %v, want one DupeElim", order, execTypes(execs))
+		}
+		if got := execs[0].Files[0].Path; got != "/ref/orig" {
+			t.Fatalf("order %v: keeper = %q, want the reference", order, got)
+		}
+		if got := execs[0].Files[1].Path; got != "/work/compressed" {
+			t.Fatalf("order %v: victim = %q, want the compressed copy", order, got)
+		}
+	}
+}
+
+func TestDetector_CRCCollisionSeparatesBuckets(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats())
+	d.Insert(fiSha("/small", 100, 5))
+
+	// Same signature but a different size: a distinct group.
+	big := fiSha("/big", 200, 5)
+	d.Insert(big)
+
+	if execs := finalAll(t, d); len(execs) != 0 {
+		t.Fatalf("different sizes produced %v, want no executions", execTypes(execs))
+	}
+}
+
+func TestDetector_PartialProgressKeepsLargerOffset(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats())
+	a, b := fi("/a", 4096), fi("/b", 4096)
+	d.Insert(a)
+	d.Insert(b)
+
+	// Two interrupted attempts for the same file: the more advanced resume state
+	// must win, and an interrupted streaming attempt does not consume the
+	// finalization retry budget.
+	first := a
+	first.HashOffset = 512
+	d.OnHashDone(key1, first, true)
+	second := a
+	second.HashOffset = 1024
+	d.OnHashDone(key1, second, true)
+	stale := a
+	stale.HashOffset = 256
+	d.OnHashDone(key1, stale, true)
+
+	execs, _ := d.NextFinal(4)
+	if len(execs) == 0 {
+		t.Fatal("expected the unhashed files to be scheduled")
+	}
+	seen := false
+	for _, ex := range execs {
+		if ex.Files[0].Path == "/a" {
+			seen = true
+			if ex.Files[0].HashOffset != 1024 {
+				t.Fatalf("/a resumes at %d, want 1024", ex.Files[0].HashOffset)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("/a was not scheduled for hashing")
+	}
+}
+
+func TestDetector_InsertInodeGroups(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats())
+
+	a := fi("/a", 100)
+	a.Dev, a.Inode, a.NumLinks = 1, 10, 2
+	b := fi("/b", 100)
+	b.Dev, b.Inode, b.NumLinks = 1, 10, 2
+	c := fi("/c", 100)
+	c.Dev, c.Inode, c.NumLinks = 1, 11, 1
+
+	d.InsertInode(a)
+	d.InsertInode(b)
+	d.InsertInode(c)
+
+	groups := d.InodeGroups()
+	if len(groups) != 1 || len(groups[0]) != 2 {
+		t.Fatalf("InodeGroups() = %v, want one group of two", groups)
+	}
+}
+
+func TestDetector_Empty(t *testing.T) {
+	t.Parallel()
+
+	d := dupe.NewDetector(dupe.NewStats())
+	if execs, done := d.NextFinal(8); len(execs) != 0 || !done {
+		t.Fatalf("NextFinal = (%v, %v), want nothing and completion", execTypes(execs), done)
+	}
+	if groups := d.InodeGroups(); len(groups) != 0 {
+		t.Fatalf("InodeGroups() = %v, want none", groups)
+	}
+}
+
+func TestDetector_SamePathInsertedTwice(t *testing.T) {
+	t.Parallel()
+
+	stats := dupe.NewStats()
+	d := dupe.NewDetector(stats)
+	d.Insert(fiSha("/a", 100, 5))
+	d.Insert(fiSha("/a", 100, 5))
+
+	if execs := finalAll(t, d); len(execs) != 0 {
+		t.Fatalf("a path inserted twice produced %v, want no executions", execTypes(execs))
+	}
+	// The second insert must be rejected before it is counted, otherwise the same
+	// file would be part of two decisions.
+	if stats.TotalFiles.Load() != 1 {
+		t.Fatalf("TotalFiles = %d after inserting one path twice, want 1", stats.TotalFiles.Load())
 	}
 }

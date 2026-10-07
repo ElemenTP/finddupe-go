@@ -1,61 +1,55 @@
 package action
 
 import (
+	"errors"
 	"os"
 
 	"finddupe/internal/dupe"
 )
 
-// createHardlink replaces the duplicate file with a hardlink to the original.
-// Strategy: delete the duplicate, then create a hardlink at its path pointing to the original.
-func (e *Executor) createHardlink(group dupe.DupeGroup) (Result, error) {
-	candidatePath := group.Candidate.Path
-	originalPath := group.Original.Path
+// createHardlink replaces the duplicate file (Files[1]) with a hardlink to the
+// original (Files[0]).
+//
+// The link is created under a temporary name next to the victim and then
+// renamed over it. Renaming is atomic within a filesystem, so the victim is
+// either the untouched original file or the finished hardlink — never a
+// half-finished state, and never missing. Deleting first (which is what a
+// plain remove-then-link does) would destroy the victim whenever linking
+// fails, for example across devices or on a filesystem without hard links.
+//
+// Hard links share the keeper's inode and therefore its permissions and
+// timestamps. The victim's own metadata cannot be preserved and is not
+// restored: doing so would silently rewrite the keeper's metadata as well.
+func (e *Executor) createHardlink(ex dupe.Execution, victimInfo os.FileInfo) (Result, error) {
+	keeper := ex.Files[0]
+	victim := ex.Files[1]
 
-	// Check NTFS hardlink limit (1023 links per file on Windows).
-	if group.Original.NumLinks >= MaxHardlinks {
+	// Check the hardlink limit again here: the count in the scan listing is
+	// stale, because every link created during this run has raised the real
+	// one, and NTFS rejects the link that crosses the limit.
+	if hardlinkLimitReached(keeper.Path) {
 		return ResultHardlinkLimit, nil
 	}
 
-	// Check if candidate is read-only.
-	readOnly := isReadOnly(candidatePath)
-	if readOnly && !e.opts.IncludeReadonly {
+	if isReadOnly(victim.Path, victimInfo) && !e.opts.IncludeReadonly {
 		return ResultSkippedRO, nil
 	}
 
-	// Save the original mode for restoration.
-	origInfo, statErr := os.Stat(candidatePath)
-	if statErr != nil {
-		return ResultError, statErr
+	// Windows refuses to replace a read-only file; clear the write protection
+	// before the rename.
+	changed, protectErr := clearWriteProtection(victim.Path, victimInfo)
+	if protectErr != nil {
+		return ResultError, protectErr
 	}
-	origMode := origInfo.Mode()
-	origModTime := origInfo.ModTime()
 
-	// Make writable if needed. Only add user-write permission
-	// (mode | 0200) rather than 0666 to avoid a TOCTOU window where
-	// the file is temporarily world-writable on multi-user systems.
-	if readOnly {
-		if chmodErr := os.Chmod(candidatePath, origMode|0200); chmodErr != nil {
-			return ResultError, chmodErr
+	if err := linkReplace(keeper.Path, victim.Path); err != nil {
+		// The victim is untouched (the link is made under a temporary name and
+		// only renamed over it on success): put its mode back.
+		restoreWriteProtection(victim.Path, victimInfo, changed)
+		if errors.Is(err, ErrCrossDevice) {
+			return ResultSkippedCrossDevice, nil
 		}
-	}
-
-	// Delete the duplicate.
-	if removeErr := os.Remove(candidatePath); removeErr != nil {
-		return ResultError, removeErr
-	}
-
-	// Create hardlink to the original.
-	if linkErr := createPlatformHardlink(candidatePath, originalPath); linkErr != nil {
-		return ResultError, linkErr
-	}
-
-	// Restore original mode and modification time.
-	if chmodErr := os.Chmod(candidatePath, origMode); chmodErr != nil {
-		return ResultError, chmodErr
-	}
-	if chtimesErr := os.Chtimes(candidatePath, origModTime, origModTime); chtimesErr != nil {
-		return ResultError, chtimesErr
+		return ResultError, err
 	}
 
 	return ResultHardlinked, nil

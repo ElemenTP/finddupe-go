@@ -2,101 +2,111 @@
 
 ## Overview
 
-finddupe-go uses a **producer-consumer pipeline** architecture with a shared worker pool for parallel file I/O and checksum computation. This design decouples filesystem traversal, checksum computation, duplicate detection, and action execution into independent stages connected by buffered channels.
+finddupe-go uses a **coordinator/executor pipeline**. A shared worker pool performs parallel file I/O and checksum computation, while a single **coordinator** goroutine owns all duplicate state in the `dupe.Detector` state machine. The coordinator turns executor completions into follow-up work, and a pool of stateless **executor** goroutines runs the resulting `dupe.Execution` items.
+
+This replaces the older design in which the detector and executor were each a single pipeline stage: duplicate state still has a single writer (the coordinator), but hashing and comparison now run in parallel across N executor workers.
 
 ## Pipeline Topology
 
 ```
-                    ┌──────────────────────────────────────────────┐
-                    │              main goroutine                  │
-                    │  - Parse CLI → Config                        │
-                    │  - Create channels, pool, detector, stats    │
-                    │  - Handle SIGINT/SIGTERM → cancel ctx        │
-                    │  - Print final summary                       │
-                    └──────────────────────────────────────────────┘
+                    ┌────────────────────────────────────────────────────┐
+                    │                pipeline.Run                        │
+                    │  - Parse CLI → Config                              │
+                    │  - Create channels, worker pool, detector, executor│
+                    │  - SIGINT/SIGTERM → cancel ctx                     │
+                    │  - Print final summary                             │
+                    └────────────────────────────────────────────────────┘
                                         │
-                    ┌───────────────────┼───────────────────┐
-                    ▼                   ▼                    ▼
-┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────────┐
-│   Walker (1 goroutine) │ │ Progress reporter (1) │ │  Signal handler (1)   │
-│                       │ │                       │ │                       │
-│ filepath.WalkDir      │ │ Reads dupe.Stats      │ │ SIGINT/SIGTERM →      │
-│   + ** glob matching  │ │ Prints every 500ms    │ │   cancel()            │
-│   + stat only         │ │ via ANSI escape codes │ │                       │
-│   → walkResultCh      │ │                       │ │                       │
-└───────────┬───────────┘ └───────────────────────┘ └───────────────────────┘
+        ┌───────────────────────────────┼───────────────────────────────┐
+        ▼                               ▼                               ▼
+┌───────────────────────┐   ┌───────────────────────┐   ┌───────────────────────┐
+│ walkAll (1 goroutine) │   │ Progress (1 goroutine)│   │ Signal handler        │
+│                       │   │                       │   │                       │
+│ Walk(RefPaths) first  │   │ Reads dupe.Stats      │   │ SIGINT/SIGTERM →      │
+│   (IsRef = true)      │   │ Prints every 500ms    │   │   cancel()            │
+│ then Walk(Paths)      │   │ via ANSI escape codes │   │                       │
+│ → walkResultCh        │   │                       │   │                       │
+└───────────┬───────────┘   └───────────────────────┘   └───────────────────────┘
             │
             ▼ walkResultCh (buffered, threads*4)
 ┌───────────────────────────────────────────────────────────┐
-│        Scanner Feeder (1 goroutine)                       │
+│        scanChecksums (1 feeder goroutine)                 │
 │                                                           │
-│ For each Result from walker:                              │
-│   1. Check for errors → log, count                       │
-│   2. pending.Add(1)                                       │
-│   3. pool.Submit(checksumWork) ← blocks if pool full     │
-│   4. On completion: pending.Wait(), close(fileCh)        │
+│ For each Result from the walker:                          │
+│   1. Check for errors → log, count CantReadFiles          │
+│   2. Drain the whole reference phase (pending.Wait())     │
+│      before submitting the first normal file              │
+│   3. pool.Submit(checksum.ComputeFileInfo)                │
+│ → fileInfoCh                                              │
 └───────────────────────────┬───────────────────────────────┘
                             │
-                            ▼
+                            ▼ worker pool (N = threads goroutines)
 ┌───────────────────────────────────────────────────────────┐
-│           Worker Pool (N = threads goroutines)             │
-│                                                           │
-│ For each task:                                            │
-│   1. checksum.ComputeFileInfo(path, size)                 │
-│      → opens file once                                    │
-│      → reads 32KB, computes CRC + sum                     │
-│      → gets inode (Unix: f.Stat; Windows: GetFileInfo...) │
-│   2. Set fi.Signature, fi.Inode, fi.NumLinks              │
-│   3. Send FileInfo to fileCh                              │
+│  checksum.ComputeFileInfo(path, size)                     │
+│    → opens the file once                                  │
+│    → reads 32KB, computes CRC + sum → Signature           │
+│    → statFile(f) → Dev, Inode, NumLinks               │
+│    → SHA-256 at zero extra cost for files ≤ 32KB          │
+│  Set fi fields, send FileInfo on fileInfoCh               │
 └───────────────────────────┬───────────────────────────────┘
                             │
-                            ▼ fileCh (buffered, threads*4)
+                            ▼ fileInfoCh (buffered, threads*4)
 ┌───────────────────────────────────────────────────────────┐
-│                Detector (1 goroutine)                      │
+│         coordinator (1 goroutine) — owns Detector         │
 │                                                           │
-│ Reads FileInfo from fileCh:                                │
-│   1. detector.Insert(fi) → DupeGroup or nil               │
-│   2. If DupeGroup → send to groupCh                       │
-│   3. Update stats (TotalFiles, TotalBytes)                │
+│ On FileInfo:                                              │
+│   detector.Insert(fi) → []Execution → executionCh         │
 │                                                           │
-│ Uses hash map (map[uint64][]FileInfo) keyed by checksum.  │
-│ Collision chain via slice append for same-signature files.│
+│ On Outcome from outcomeCh:                                │
+│   reportOutcome(...)                                      │
+│   HashCalc → detector.OnHashDone(key, fi, err != nil)     │
+│   HashComp → detector.OnCompareDone(key, a, b, err != nil)│
+│   DupeElim / CoWDetect → nothing further                  │
+│                                                           │
+│ End of scan: input drained && inFlight == 0               │
+│   → detector.NextFinal(limit) until it reports done       │
+│     DupeElim (one per victim path) or CoWDetect (one per  │
+│     content bucket)                                       │
+│   → close(executionCh)                                    │
+└───────────┬───────────────────────────────────────────────┘
+            │
+            ▼ executionCh (buffered, threads*4)
+┌───────────────────────────────────────────────────────────┐
+│      executor workers (N = threads goroutines)            │
+│                                                           │
+│ action.Executor.DoExecution(ctx, ex) → Outcome            │
+│   HashCalc: full SHA-256 (resume from HashState/Offset)   │
+│   HashComp: chunked compare with early-stop               │
+│   DupeElim: delete / hardlink / CoW clone / report        │
+│   CoWDetect: per-file shared bytes for one content group  │
+│ → outcomeCh                                               │
 └───────────────────────────┬───────────────────────────────┘
                             │
-                            ▼ groupCh (buffered, threads)
-┌───────────────────────────────────────────────────────────┐
-│              Executor (1 goroutine)                        │
-│                                                           │
-│ For each DupeGroup:                                        │
-│   1. If SkipHardlinked: check inodes → skip if same       │
-│   2. Full byte-by-byte verification (64KB chunks)         │
-│   3. If confirmed duplicate:                               │
-│      - find mode:  print group, update stats              │
-│      - dedupe mode: execute action (delete/hardlink/CoW)  │
-│   4. If false positive: add to collision chain            │
-└───────────────────────────────────────────────────────────┘
+                            ▼ outcomeCh (buffered, threads*4) → coordinator
 ```
 
 ## Goroutine Responsibilities
 
 | Goroutine | Count | Input | Output | Notes |
 |-----------|-------|-------|--------|-------|
-| Walker | 1 | Config.Paths | walkResultCh | I/O bound, sequential. Stat only — no file opens |
-| Scanner feeder | 1 | walkResultCh | pool.Submit | Lightweight; feeds tasks to pool |
-| Worker pool | N (--threads) | pool.Submit | fileCh | CPU+I/O bound. Opens files, computes checksums, gets inodes |
-| Detector | 1 | fileCh | groupCh | Sequential for correctness, hash map O(1) |
-| Executor | 1 | groupCh | stats | I/O bound (full file compare + action) |
-| Progress | 1 | stats (atomics) | stdout | Runs on ticker, no channel |
-| Signal handler | 1 | OS signals | cancel() | Side channel |
+| Walker | 1 | `Config.RefPaths` then `Config.Paths` | walkResultCh | I/O bound, sequential. Stat only — no file opens |
+| Scanner feeder | 1 | walkResultCh | pool.Submit → fileInfoCh | Drains the reference phase before normal files |
+| Worker pool | N (`--threads`) | pool.Submit | fileInfoCh | Opens files, computes checksums and `(Dev, Inode, NumLinks)` |
+| Coordinator | 1 | fileInfoCh, outcomeCh | executionCh, stats | Sole owner/writer of the `Detector`; decides termination |
+| Executor | N (`--threads`) | executionCh | outcomeCh | Stateless; hashing, comparison, elimination, CoW detection |
+| Progress | 1 | stats (atomics) | stderr (terminal only) | Runs on a ticker, no channel; stopped before the summary |
+| Signal handler | 1 | OS signals | cancel() | `signal.NotifyContext` side channel |
 
 ## Channel Buffer Sizing
 
 | Channel | Size | Rationale |
 |---------|------|-----------|
-| walkResultCh | threads * 4 | Decouple walker from scanner feeder |
-| fileCh | threads * 4 | Decouple worker pool from detector |
-| groupCh | threads | Detector is much faster than executor |
-| errCh | 1 | Only first fatal error matters |
+| walkResultCh | threads * 4 | Decouple the sequential walker from the scanner feeder |
+| fileInfoCh | threads * 4 | Decouple the worker pool from the coordinator |
+| executionCh | threads * 4 | Decouple the coordinator from the executor workers |
+| outcomeCh | threads * 4 | Decouple executor completion from coordinator feedback |
+
+All buffers use the same `channelBufferFactor = 4`. There is no error channel: per-file errors are logged and counted, and cancellation propagates through `context.Context`.
 
 ## Data Flow
 
@@ -109,45 +119,49 @@ config.Config ──────────────────────
   ▼                                                         │
 pipeline.Run(ctx, cfg)                                      │
   │                                                         │
-  ├── fswalker.Walk(paths, opts) → chan fswalker.Result     │
-  │     │                                                   │
-  │     ▼ (per file, sequential)                            │
-  │   os.Stat → FileInfo{Path, Size}                        │
+  ├── fswalker.Walk(RefPaths) → chan fswalker.Result        │
+  │     (IsRef = true; walked and drained first)            │
+  ├── fswalker.Walk(Paths)    → chan fswalker.Result        │
   │     │                                                   │
   │     ▼ (per file, parallel in pool)                      │
-  │   checksum.ComputeFileInfo(path, size)                  │
+  │   checksum.ComputeFileInfo(path, size) → checksum.Info  │
   │     ├── os.Open (once per file)                         │
-  │     ├── Read 32KB → CRC + sum → uint64                  │
-  │     └── fileInode(f) → inode, numLinks                  │
+  │     ├── Read 32KB → CRC + sum → Signature               │
+  │     ├── statFile(f) → Dev, Inode, NumLinks          │
+  │     └── SHA-256 for files ≤ 32KB                        │
   │     │                                                   │
   │     ▼                                                   │
-  │   dupe.FileInfo{Path, Size, Signature, Inode, NumLinks} │
+  │   dupe.FileInfo{Path, Size, Signature, SHA256,          │
+  │                 Dev, Inode, NumLinks, IsRef}            │
   │     │                                                   │
   │     ▼                                                   │
-  │   dupe.Detector.Insert(fi)                              │
+  │   coordinator: detector.Insert(fi) → []Execution        │
   │     │                                                   │
-  │     ├── nil: stored in hash map (first occurrence)      │
-  │     │                                                   │
-  │     └── DupeGroup: checksum collision detected          │
+  │     ├── nil: stored in (GroupKey → SHA-256) buckets     │
+  │     ├── HashComp: exactly two unhashed files            │
+  │     └── HashCalc: the file just inserted (3+ files)     │
+  │           │                                             │
+  │   after the input drains (and nothing is in flight):    │
+  │     detector.NextFinal(limit) → DupeElim / CoWDetect    │
+  │       keeper chosen now, by policy, per content bucket  │
   │           │                                             │
   │           ▼                                             │
-  │   action.Executor.VerifyAndExecute(group)               │
+  │   executor workers: action.Executor.DoExecution         │
   │           │                                             │
-  │           ├── SkipHardlinked check (same inode?)        │
+  │           ├── HashCalc / HashComp → Outcome →           │
+  │           │     coordinator → OnHashDone/OnCompareDone  │
   │           │                                             │
-  │           ├── false positive → add to collision chain   │
-  │           │                                             │
-  │           └── confirmed duplicate                       │
-  │                 │                                       │
-  │                 ├── find mode: print to stderr          │
-  │                 │                                       │
-  │                 └── dedupe mode:                        │
-  │                       ├── delete:  os.Remove            │
-  │                       ├── hardlink: os.Remove + os.Link │
-  │                       └── cow:      unsupported (stub)  │
+  │           └── DupeElim → report / act:                  │
+  │                 ├── report:  "Duplicate: / With:"       │
+  │                 ├── delete:  os.Remove                  │
+  │                 ├── hardlink: os.Link + atomic rename   │
+  │                 └── cow:      cloneReplace (FICLONE/…)  │
+  │                                                         │
+  │   CoWDetect → extent.Query + SharedFlagBytes/           │
+  │              SharedWithGroup → "shared: N%" per member │
   │                                                         │
   ▼                                                         │
-Final summary (stats + results) printed to stderr           │
+Results + final summary printed to stdout                    │
 ```
 
 ## Component Diagram
@@ -164,7 +178,8 @@ Final summary (stats + results) printed to stderr           │
         │ root.go  │  │  find.go   │  │ dedupe.go  │
         │          │  │            │  │            │
         │ Version  │  │ Flags      │  │ Flags      │
-        │ Execute  │  │ Config     │  │ Config     │
+        │ Execute  │  │ Config     │  │ Config +   │
+        │          │  │            │  │ validation │
         └──────────┘  └─────┬──────┘  └─────┬──────┘
                             │               │
                             └───────┬───────┘
@@ -179,7 +194,8 @@ Final summary (stats + results) printed to stderr           │
                     ┌───────────────────────────────┐
                     │    internal/pipeline          │
                     │    Run(ctx, cfg) error        │
-                    │    runNormalMode(...)         │
+                    │    runListLink(...)           │
+                    │    coordinate(...)            │
                     │    printSummary(...)          │
                     └───┬───────┬───────┬───────┬───┘
                         │       │       │       │
@@ -189,19 +205,21 @@ Final summary (stats + results) printed to stderr           │
   │ internal/       │ │ internal/    │ │ internal/  │ │ internal/    │
   │ fswalker        │ │ checksum     │ │ dupe       │ │ action       │
   │                 │ │              │ │            │ │              │
-  │ - Walk()        │ │ - Compute()  │ │ - Detector │ │ - Executor   │
-  │ - ** matcher    │ │ - ComputeFile│ │ - Stats    │ │ - Delete     │
-  │ - inode (unix)  │ │   Info()     │ │ - FileInfo │ │ - Hardlink   │
-  │                 │ │ - fileInode  │ │ - DupeGroup│ │ - CoW (stub) │
-  └─────────────────┘ │   (per OS)   │ └────────────┘ │ -       │
-                       └──────────────┘                └──────────────┘
-                            ┌──────────────┐
-                            │ internal/    │
-                            │ worker       │
-                            │ Pool         │
-                            └──────────────┘
-                            ┌──────────────┐
-                            │ internal/    │
+  │ - Walk()        │ │ - ComputeFI()│ │ - Detector │ │ - Executor   │
+  │ - ** matcher    │ │ - ComputeFile│ │ - Execution│ │ - Outcome    │
+  │ - fileid.From   │ │   Info()    │ │ - FileInfo │ │ - Delete     │
+  │   (per OS)      │ │ - statFile│ │ - Stats    │ │ - Hardlink   │
+  │                 │ │   (per OS)   │ │ - InodeKey │ │ - CoW clone  │
+  └─────────────────┘ └──────────────┘ └────────────┘ │   (per OS)   │
+                                                      │ - CoW detect │
+                                                      └──────┬───────┘
+                            ┌──────────────┐                 │
+                            │ internal/    │        ┌────────▼───────┐
+                            │ worker       │        │ internal/      │
+                            │ Pool         │        │ extent         │
+                            └──────────────┘        │ Query/Equal/   │
+                            ┌──────────────┐        │ Shared* (OS)   │
+                            │ internal/    │        └────────────────┘
                             │ progress     │
                             │ Reporter     │
                             └──────────────┘
@@ -209,34 +227,85 @@ Final summary (stats + results) printed to stderr           │
 
 ## Key Design Decisions
 
-### 1. Hash Map over Binary Search Tree
+### 1. Two-Level Hash Map instead of a Binary Search Tree
 
-The C version uses a binary search tree for storing file signatures. The Go version uses `map[uint64][]FileInfo` keyed by the 64-bit checksum. This is:
-- **Simpler**: ~30 lines vs ~100 lines of tree traversal code
-- **Faster**: O(1) average lookup vs O(log n)
-- **More idiomatic**: Go's hash map is highly optimized
+The C version uses a binary search tree for storing file signatures. The Go version uses `map[GroupKey]*keyState`:
 
-For collision handling (different files with the same checksum), the slice value in the map serves as the "same chain" — identical semantics to the C version's `Same` pointer.
+- The **outer** map is keyed by the composite `(Signature, Size)`, which is the weak-checksum candidate set.
+- Each state holds one **bucket** per known SHA-256 plus a **pending** set for files whose full hash is not yet known (possibly a partial state). The bucket is the unit of content identity: only files inside the same bucket are duplicates.
+- The maps of a state are allocated only when its second file arrives, so a scan of unique files does not pay for an inner map per file.
+
+For collision handling (different files with the same weak checksum), the bucket serves as the same chain. The composite key removes size-wrap collisions that a signature-only key would keep together.
 
 ### 2. Single File-Open Per Scan
 
-Files are opened **once** in the worker pool goroutines via `checksum.ComputeFileInfo`. This function returns the checksum signature, inode, and hardlink count from a single `os.Open` call. On Windows, `GetFileInformationByHandle` is called on the same handle — avoiding a second `CreateFile` that would serialize I/O in the single-threaded walker.
+Files are opened **once** in the worker-pool goroutines via `checksum.ComputeFileInfo`. It returns a `checksum.Info{Signature, Dev, Inode, NumLinks, SHA256}` from one `os.Open`. On Windows, `GetFileInformationByHandle` is called on the same handle — avoiding a second `CreateFile` that would serialize I/O in the single-threaded walker. Files ≤ 32KB also get their SHA-256 for free because the whole file is already in the CRC buffer.
 
 ### 3. Checksum Computation as the Parallelization Point
 
-The checksum computation (reading 32KB + CRC + inode retrieval) is the most I/O-intensive per-file operation. The worker pool parallelizes this stage, while the walker (stat only) and detector (hash map insert) remain sequential.
+Reading 32KB + CRC + `(Dev, Inode, NumLinks)` retrieval is the most I/O-intensive per-file operation. The worker pool parallelizes this stage, while the walker (stat only) stays sequential.
 
-### 4. Cancel-on-Signal
+### 4. Detector as a Pure State Machine
 
-The pipeline listens for SIGINT and SIGTERM. On signal, the context is cancelled, which propagates through all goroutines via `ctx.Done()`. Each stage checks context before processing the next item, enabling clean shutdown.
+`dupe.Detector` performs no I/O. Its methods take a file or an outcome and return the next `[]Execution`; all mutation happens under one mutex. This makes the duplicate state trivially race-free: only the coordinator goroutine ever calls the detector. Executors are stateless and can therefore run in parallel without sharing duplicate state.
 
-### 5. Single Uniform Pipeline
+### 5. Work Strategy by Group Size
 
-The pipeline always uses the same checksum-based duplicate detection path. There is no separate "hardlink search mode." Instead, the `--hardlink` flag in find mode enables a **pre-verification inode check** in the executor that skips already-hardlinked file pairs.
+- **1 file**: store, no hashing (cheapest possible path for unique files).
+- **Exactly 2 unhashed files**: one `HashComp` compares them in chunks and stops at the first difference, saving partial hash state. This avoids hashing two full files when they are usually different.
+- **3+ files**: `HashCalc` for the file just inserted — O(1) per insert — then O(1) matching against completed SHA-256 buckets. This is what guarantees that all of N identical files are reported (N−1 eliminations). Files an early-stopped comparison left unfinished are completed by `NextFinal` before the group is decided.
+
+### 6. Reference Files Are Walked First (and Never Eliminated)
+
+`walkAll` walks `RefPaths` before `Paths` and marks them `IsRef`; `scanChecksums` drains the entire reference phase before submitting any normal file. The keeper policy puts reference files first, so a referenced original is kept whatever order hashes finish in (this used to hold only for files whose SHA-256 was known at scan time). In addition, the executor refuses to eliminate a reference victim (`ResultSkippedRef`) unless the action is `ActionReport`, so a reference file can never be deleted, hardlinked, or cloned.
+
+### 7. Cancel-on-Signal
+
+The pipeline listens for SIGINT and SIGTERM via `signal.NotifyContext`. On signal the context is cancelled, which propagates through all goroutines via `ctx.Done()`. Each stage checks the context before processing the next item, and the coordinator closes `executionCh`, which lets the executor workers exit and close `outcomeCh`.
+
+### 8. Elimination and CoW Detection as One End-of-Scan Pass
+
+Neither `dedupe` nor `find --cow` decides anything while files stream in: the detector
+only hashes. Once the input is drained and `inFlight == 0`, the coordinator repeatedly
+calls `detector.NextFinal(limit)` until it reports completion, dispatching the bounded
+batches it returns:
+
+- **dedupe**: one `DupeElim` per victim *path*, with the keeper chosen by `KeeperPolicy`
+  (references first, then more hardlinks, then the smallest path) instead of by
+  whichever hash finished first. One task per path, not per physical file: replacing
+  or deleting one path of an inode leaves its other paths on the old inode, so the
+  group would still hold two copies. A path that already is the keeper's own physical
+  file is dropped — no action can change it, but a report without `--hardlink` lists
+  it as a duplicate name.
+- **`find --cow`**: one `CoWDetect` per content bucket with at least two distinct
+  physical files, reporting the whole identical-content set at once — one path per
+  `(Dev, Inode)` (hardlinked aliases collapse) with a per-member already-shared byte
+  count. Independent copies are members too, at 0% shared, because they are precisely
+  the files that should CoW-share.
+
+Deciding at the end means a group cannot be settled before its last member was hashed,
+and the batch bound keeps the coordinator's queue (and the memory it holds) under
+control on a scan with millions of duplicates.
+
+## Termination
+
+The coordinator owns the termination condition:
+
+1. `fileInfoCh` closes when the walker and the checksum workers are done.
+2. The coordinator tracks `inFlight` (dispatched executions not yet completed).
+3. Once the input is drained **and** `inFlight == 0`, it asks the detector for
+   end-of-scan work (`detector.NextFinal`). This can happen repeatedly: completing the
+   hash of a file an early-stopped comparison left behind can reveal further
+   duplicates in the same group. Only when the detector reports that nothing is left
+   is the state final.
+4. It closes `executionCh`.
+5. The executor workers observe the closed channel and exit; a `sync.WaitGroup` then closes `outcomeCh`.
+6. The coordinator drains the remaining outcomes and returns.
 
 ## Error Handling Strategy
 
-- **Fatal errors** (e.g., can't create output file): sent on `errChan`, pipeline returns immediately
-- **Per-file errors** (e.g., can't read a file): logged, counted in stats, processing continues
-- **Action errors** (e.g., can't delete a file): logged, counted, processing continues
-- **Context cancellation**: all goroutines exit, pipeline returns `ctx.Err()`
+- **Per-file errors** (e.g., can't read a file): logged, counted in stats (`CantReadFiles`), processing continues.
+- **Action errors** (e.g., can't delete a file): reported as `ResultError`, logged, counted, processing continues.
+- **Hash/compare errors**: logged in `runExecutor` (DupeElim errors are reported by `reportElimination` instead) and fed back into the detector, which retries a file at most `maxFailedHashRetries` times before leaving it unverified and uneliminated.
+- **Context cancellation**: all goroutines exit and `pipeline.Run` returns `ctx.Err()`.
+- **`--listlink`** takes a separate, simpler path (`runListLink`) that skips duplicate detection entirely.

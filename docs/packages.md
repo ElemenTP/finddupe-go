@@ -14,36 +14,59 @@ finddupe-go/
 │   └── version.go             # version subcommand
 ├── internal/
 │   ├── config/                # Configuration
-│   │   └── config.go          # Config struct, Mode, Action types
-│   ├── dupe/                  # Core types and duplicate detection
-│   │   ├── fileinfo.go        # FileInfo, DupeGroup types
-│   │   ├── detector.go        # Hash map-based duplicate detector
+│   │   └── config.go          # Config struct, Action type
+│   ├── dupe/                  # Core types and duplicate-detection state machine
+│   │   ├── fileinfo.go        # FileInfo, InodeKey, GroupKey, Execution, ExecutionType
+│   │   ├── detector.go        # Detector state machine (Insert/OnHashDone/OnCompareDone/NextFinal)
 │   │   └── stats.go           # Thread-safe statistics (+ ZeroLenCounter)
 │   ├── fswalker/              # Filesystem traversal
-│   │   ├── walker.go          # Walker interface + implementation
-│   │   ├── walker_unix.go     # Unix inode from stat
-│   │   └── walker_windows.go  # Windows inode stub (0,0 — done in checksum)
-│   ├── checksum/              # File signature + inode computation
-│   │   ├── checksum.go        # Compute, ComputeFileInfo, ComputeFromReader
-│   │   ├── inode_unix.go      # Unix: inode from f.Stat().Sys()
-│   │   └── inode_windows.go   # Windows: inode from GetFileInformationByHandle
-│   ├── action/                # Duplicate elimination actions
-│   │   ├── executor.go        # Executor, VerifyAndExecute, VerifyFullFile
+│   │   └── walker.go          # Walker, Result, WalkOptions, glob matching
+│   ├── fileid/                # Dev/Inode/NumLinks from a stat result
+│   │   ├── fileid_unix.go     # Unix: read from the stat struct already in hand
+│   │   └── fileid_other.go    # Other platforms: no identity in os.FileInfo
+│   ├── fsprobe/               # Test helper: a temp dir whose filesystem supports a feature
+│   ├── log2phys/              # macOS: struct log2phys layout (shared with the probe)
+│   ├── checksum/              # File signature + identity computation
+│   │   ├── checksum.go        # Compute, ComputeFileInfo (returns Info), ComputeFromReader
+│   │   ├── stat_unix.go       # Unix: size/mtime/identity from one fstat
+│   │   └── stat_windows.go    # Windows: identity from GetFileInformationByHandle
+│   ├── action/                # Stateless duplicate elimination + CoW detection
+│   │   ├── executor.go        # Executor, DoExecution, Outcome, Result
 │   │   ├── delete.go          # File deletion (+ readonly handling)
-│   │   ├── hardlink.go        # Cross-platform hardlink creation
+│   │   ├── hardlink.go        # Delete-then-link hardlink creation
 │   │   ├── hardlink_unix.go   # Unix: os.Link
-│   │   ├── hardlink_windows.go# Windows: os.Link + link limit
-│   │   ├── cow.go             # CoW clone (stub — returns ErrCoWNotSupported)
-│   │   ├── cow_unix.go        # Unix CoW stub
-│   │   ├── cow_windows.go     # Windows CoW stub
+│   │   ├── hardlink_windows.go# Windows: os.Link (CreateHardLinkW) + link limit
+│   │   ├── cow.go             # cloneReplace + detectCoW (CoWDetect execution)
+│   │   ├── clone_linux.go     # Linux: FICLONE ioctl (btrfs/XFS)
+│   │   ├── clone_darwin.go    # macOS: clonefile(2) (APFS)
+│   │   ├── clone_windows.go   # Windows: FSCTL_DUPLICATE_EXTENTS_TO_FILE (ReFS)
+│   │   ├── clone_other.go     # Other platforms: ErrCoWNotSupported
+│   │   ├── replace_unix.go    # Unix: atomic os.Rename
+│   │   └── replace_windows.go # Windows: MoveFileEx(REPLACE_EXISTING)
+│   ├── extent/                # Physical extent query for CoW detection
+│   │   ├── extent.go          # Extent, Equal, SharedFlagBytes, SharedWithGroup
+│   │   ├── query_linux.go     # Linux: FS_IOC_FIEMAP
+│   │   ├── query_darwin.go    # macOS: F_LOG2PHYS_EXT (libSystem), clone ID fallback
+│   │   ├── query_windows.go   # Windows: FSCTL_GET_RETRIEVAL_POINTERS
+│   │   └── query_other.go     # Other platforms: Supported()==false
 │   ├── worker/                # Worker pool
 │   │   └── pool.go            # Bounded goroutine pool
 │   ├── pipeline/              # Orchestration
-│   │   └── pipeline.go        # Run, runNormalMode, printSummary
+│   │   └── pipeline.go        # Run, runListLink, coordinate, printSummary
 │   └── progress/              # Progress display
 │       └── progress.go        # ANSI progress reporter
 ├── test/                      # System integration tests
-│   └── system_test.go         # 46 system tests covering find/dedupe/edge cases
+│   ├── doc.go                 # Package doc (package test)
+│   └── system_test.go         # System tests (package test_test)
+├── testtools/                 # Manual platform diagnostics (not part of the CLI)
+│   └── extentdump/
+│       └── main.go            # extentdump <file>...: identity + extents + shared flag
+├── testscripts/               # Manual CoW probes for real APFS/ReFS machines
+│   ├── build-bundles.sh       # cross-compile finddupe + extentdump into bin/cow-test/
+│   ├── cow-probe.sh           # macOS/Linux bash probe
+│   ├── cow-probe-windows.ps1  # Windows PowerShell probe
+│   └── README.md              # how to build/run the probes and read the numbers
+├── bin/                       # Build output (gitignored); cow-test bundles land here
 └── docs/                      # Documentation (this directory)
 ```
 
@@ -54,8 +77,8 @@ finddupe-go/
 **Purpose**: Parse command-line arguments, validate them, construct a `config.Config`, and invoke `pipeline.Run()`.
 
 - `root.go`: Root cobra command. `Execute()` called from `main.go`.
-- `find.go`: `finddupe find` — defines flags for find mode (all wired to Config).
-- `dedupe.go`: `finddupe dedupe` — defines flags for dedupe mode, validates action flags.
+- `find.go`: `finddupe find` — defines find flags (`--hardlink`, `--listlink`, `--cow`, …), enforces their mutual exclusivity.
+- `dedupe.go`: `finddupe dedupe` — defines dedupe flags and validates that exactly one action is set.
 - `version.go`: `finddupe version` — version, build time, platform, Go version.
 
 **Dependencies**: `github.com/spf13/cobra`, `internal/config`, `internal/pipeline`
@@ -64,81 +87,197 @@ finddupe-go/
 
 **Purpose**: Define the `Config` struct and related types. Pure data — no behavior.
 
-**Key fields**: `Mode`, `Action`, `Paths`, `RefPaths`, `Threads`, `Verbose`, `PrintSigs`, `ShowProgress`, `FollowSymlinks`, `IncludeZeroLen`, `IncludeReadonly`, `SkipHardlinked`
+**Key fields**: `Action`, `Paths`, `RefPaths`, `Threads`, `Verbose`, `ListLink`, `CoWDetect`, `ShowProgress`, `FollowSymlinks`, `IncludeZeroLen`, `IncludeReadonly`, `SkipHardlinked`
 
 **Dependencies**: None (std types only)
 
 ### `internal/dupe` — Core Types and Detection
 
-**Purpose**: Define fundamental data types and implement the duplicate detection algorithm.
+**Purpose**: Define fundamental data types and implement the duplicate-detection **state machine**.
 
-**Types exported**: `FileInfo`, `DupeGroup`, `Stats`, `Detector`
+**Types exported**: `FileInfo`, `InodeKey`, `GroupKey`, `Execution`, `ExecutionType`, `Stats`, `Detector`, `Option`
+
+**Execution types**: `HashCalc`, `HashComp`, `DupeElim`, `CoWDetect`
 
 **Detector API**:
-- `Insert(fi FileInfo) []DupeGroup` — checksum-based insertion
-- `InsertHardlink(fi FileInfo) bool` — inode-based grouping (reserved)
-- `HardlinkGroups() [][]FileInfo` — returns all inode groups (reserved)
-- `Len() int` — number of unique signatures
-- `Stats() *Stats` — statistics accessor
+```go
+func NewDetector(stats *Stats, opts ...Option) *Detector
+func WithCoWDetect() Option
+func WithKeeperPolicy(policy KeeperPolicy) Option
+func WithKeeperChooser(chooser KeeperChooser) Option
+
+func (d *Detector) Insert(fi FileInfo) []Execution
+func (d *Detector) OnHashDone(key GroupKey, fi FileInfo, incomplete bool)
+func (d *Detector) OnCompareDone(key GroupKey, a, b FileInfo, incomplete bool)
+func (d *Detector) NextFinal(limit int) ([]Execution, bool)
+func (d *Detector) InsertInode(fi FileInfo)
+func (d *Detector) InodeGroups() [][]FileInfo
+func (d *Detector) InodeGroups() map[InodeKey][]FileInfo
+
+type KeeperPolicy interface {
+    Less(a, b FileInfo) bool
+}
+type DefaultKeeperPolicy struct{}
+```
+
+- `Insert` — checksum-based insertion; returns the hashing work the new file triggers (HashComp for a pair, HashCalc for itself). It never decides anything.
+- `OnHashDone` / `OnCompareDone` — feed executor outcomes back in. `incomplete` marks an attempt that reached no verdict (I/O error or a changed file), so a failed comparison is never mistaken for "the files differ".
+- `NextFinal` — end-of-scan work, at most `limit` executions per call, plus whether the detector has nothing left. It completes the hashes an early-stopped comparison left behind, then decides each content bucket with the keeper policy. The caller must have nothing in flight and must call it again until it reports completion.
+- `KeeperPolicy` — orders the members of one content bucket; the first is kept. `DefaultKeeperPolicy` prefers references, then more hardlinks, then the smallest path.
+- `KeeperChooser` — picks the keeper of one content bucket instead of the policy (`Choose(members) (keeper, ok)`); `dedupe --interactive` implements it by asking the user, and declining (or naming a non-member) leaves the bucket alone.
+- `InsertInode` / `InodeGroups` — `(Dev, Inode)` hardlink index used by `find --listlink`.
+- `WithHardlinkedAliases` — list the paths that already are the keeper's physical
+  file (`find` without `--hardlink`; every report sets it and the executor decides).
+- `WithCompressionPreference` — order compressed members first (after references) for
+  `dedupe --cow --prefer-compressed`.
 
 **Dependencies**: None (stdlib only)
 
 ### `internal/fswalker` — Filesystem Walker
 
-**Purpose**: Walk directories matching glob patterns. On Unix, also retrieves inode/link info from stat. On Windows, inode retrieval is deferred to the parallel checksum path.
+**Purpose**: Walk directories matching glob patterns. On Unix, also retrieves `Dev`/`Inode`/`NumLinks` from stat. On Windows, identity retrieval is deferred to the parallel checksum path.
 
 **Interface**:
 ```go
 type Walker struct{}
 func New() *Walker
 func (w *Walker) Walk(ctx, patterns, opts) <-chan Result
+
+type Result struct {
+    Info dupe.FileInfo
+    Err  error
+}
+
+// NoMatchError travels Err when a pattern matched nothing (see below).
+type NoMatchError struct{ Pattern string }
 ```
 
-**Features**: `**` recursive glob matching, symlink following control, zero-length file filtering, `ZeroLen` counter callback.
+**Platform helpers**: `fileid.FromFileInfo(info)` (package `internal/fileid`), shared
+by the walker and the checksum path. On Unix it reads `Dev`/`Inode`/`NumLinks` from
+the stat struct that is already in hand; on Windows `os.FileInfo` carries none of
+them, so it reports "unknown" and the scanner fills the identity from the open
+handle instead.
+
+**Features**: `**` recursive glob matching, literal paths (a pattern that names an existing path is scanned as written, so `/data/[2020] photos` is not split on its brackets), symlink following control (with per-pattern loop prevention), zero-length file filtering, `ZeroLenCounter` callback, and no-match reporting: a pattern that matches no usable file yields one `*NoMatchError` on the channel, which the pipeline turns into a failed run. Only regular files are reported: symlinks are skipped unless `FollowSymlinks` is set (then they are resolved and **reported under the target's own path**, so a later action operates on the file whose content was verified rather than on the link; links to directories are walked through the `seen` set), and devices/FIFOs/sockets are always ignored so nothing blocks on an open.
 
 **Dependencies**: `internal/dupe` (for `FileInfo`)
 
-### `internal/checksum` — Checksum + Inode Computation
+### `internal/checksum` — Checksum + Identity Computation
 
-**Purpose**: Compute 64-bit composite file signature AND retrieve filesystem inode/link info from a single file-open call.
+**Purpose**: Compute the 64-bit composite file signature AND retrieve `Dev`/`Inode`/`NumLinks` from a single file-open call.
 
 **Public API**:
 ```go
 const BytesToChecksum = 32768
 
-func Compute(path string, size int64) (uint64, error)
-func ComputeFileInfo(path string, size int64) (sig uint64, inode uint64, numLinks uint64, err error)
+type Info struct {
+    Signature uint64
+    Dev       uint64
+    Inode     uint64
+    NumLinks  uint64
+    SHA256    [32]byte
+    ModTime   time.Time
+}
+
+func ComputeFileInfo(path string, size int64) (Info, error)
+func ComputeFileInfo(path string, size int64) (Info, error)
 func ComputeFromReader(r io.Reader, size int64) (uint64, error)
 ```
 
 **Platform-specific**:
-- `inode_unix.go`: `fileInode(f *os.File)` reads inode from `f.Stat().Sys().(*syscall.Stat_t)`
-- `inode_windows.go`: `fileInode(f *os.File)` calls `GetFileInformationByHandle` on `f.Fd()`
+- `stat_unix.go`: `statFile(f *os.File)` reads size, mtime and `Dev`/`Inode`/`NumLinks` from a single `f.Stat().Sys().(*syscall.Stat_t)`
+- `stat_windows.go`: `statFile(f *os.File)` takes size/mtime from `os.FileInfo` and the volume serial, file index and link count from `GetFileInformationByHandle` on `f.Fd()` (which `os.FileInfo` does not expose)
 
-`ComputeFileInfo` is the primary function used by the pipeline — it opens the file once and returns all metadata, keeping I/O in the parallel worker pool path.
+`ComputeFileInfo` is the primary function used by the pipeline — it opens the file once and returns all metadata, keeping I/O in the parallel worker-pool path. For files ≤ 32KB it also returns the full SHA-256 at no extra I/O cost. It stats the open file and returns `dupe.ErrFileChanged` when its size is no longer the size the walker reported, so a file that grew or shrank cannot be signed as if it had the scanned content.
 
-**Dependencies**: None (stdlib + platform syscalls)
+**Dependencies**: `internal/dupe` (the `ErrFileChanged` sentinel), stdlib, platform syscalls
 
-### `internal/action` — Action Executor
+### `internal/action` — Stateless Action Executor
 
-**Purpose**: Verify duplicates (full byte comparison) and execute elimination actions.
+**Purpose**: Run `dupe.Execution` work items: full hashing, chunked comparison, elimination, and CoW detection.
 
 **API**:
 ```go
 type Executor struct{ ... }
+type Options struct {
+    Action          config.Action
+    IncludeReadonly bool
+    SkipHardlinked  bool
+}
 func New(opts Options) *Executor
-func (e *Executor) VerifyAndExecute(ctx, group) (Result, error)
-func VerifyFullFile(pathA, pathB string, expectedSize int64) (bool, error)
+func (e *Executor) DoExecution(ctx context.Context, ex dupe.Execution) (Outcome, error)
+
+type Outcome struct {
+    Kind       dupe.ExecutionType
+    Key        dupe.GroupKey
+    Files      []dupe.FileInfo
+    Result     Result
+    Err        error   // failure behind ResultError, reported by the coordinator
+    FileShared []int64 // CoWDetect: already-shared bytes per Files entry
+}
 ```
 
-**Verification flow**:
-1. If `SkipHardlinked`: check `Original.Inode == Candidate.Inode` → skip if same
-2. `VerifyFullFile`: full byte comparison in 64KB chunks
-3. If confirmed: execute action or report
+**Behavior by execution type**:
+- `HashCalc`: full SHA-256 of one file, resuming from `HashState`/`HashOffset`.
+- `HashComp`: chunked comparison of two files with early-stop; partial state is preserved for resume.
+- `DupeElim`: delete / hardlink / CoW-clone the victim, or report it. Before anything else it refuses to act on the same physical file (`samePhysicalFile`: same non-zero `Dev` + `Inode`): report mode still reports the pair unless `SkipHardlinked` (`--hardlink`), every other action returns `ResultAlreadyHardlinked`. Reference victims are never eliminated. Before a destructive action it re-checks that both files still match the size and modification time recorded with their hash (`ResultSkippedChanged` otherwise), and a hardlink pair on different devices is refused (`ResultSkippedCrossDevice`).
+- `CoWDetect`: query every member of one identical-content group and report `FileShared`, one already-shared byte count per member — how much of that member is shared with another member of its group, computed from physical identities within the same device. `FileShared` is nil when extents are unavailable for the whole group or when the filesystem reports extents without a physical identity.
 
-**Action results**: `ResultVerifiedDuplicate`, `ResultAlreadyHardlinked`, `ResultDeleted`, `ResultHardlinked`, `ResultCoWCloned`, `ResultSkippedRO`, `ResultSkippedRef`, `ResultHardlinkLimit`, `ResultNotDuplicate`, `ResultError`
+**Link/clone helpers**: `linkReplace` (hardlink under a temporary name, then atomic rename), `hardlinkLimitReached` (per OS: re-reads the link count on Windows, defers to the filesystem on Unix), `cloneReplace` (shared orchestration), `alreadyShared` (same physical file or, on the same device, `extent.Equal` → `ResultAlreadyShared`), `copyTailAt` (the unaligned tail of a block clone), `clonePlatformFile` (per OS), `replaceFile` (per OS), `preserveMetadata` (per OS: restores as much of the victim's metadata as the platform allows), `ErrCoWNotSupported`.
 
-**Dependencies**: `internal/dupe`, `internal/config`
+**Action results**: `ResultVerifiedDuplicate`, `ResultAlreadyHardlinked`, `ResultDeleted`, `ResultHardlinked`, `ResultCoWCloned`, `ResultSkippedRO`, `ResultSkippedRef`, `ResultSkippedChanged`, `ResultSkippedCrossDevice`, `ResultHardlinkLimit`, `ResultError`, `ResultAlreadyShared`
+
+**Dependencies**: `internal/dupe`, `internal/config`, `internal/extent`, `golang.org/x/sys` (CoW ioctls)
+
+### `internal/progress` — Progress Line
+
+**Purpose**: draw a live "Scanned N files..." line on stderr while the scan runs.
+
+**API**: `New(stats) *Reporter`, `(*Reporter).Run(ctx)`, and
+`IsTerminal(f *os.File) bool` — a dependency-free terminal check (character
+device). The pipeline only starts the reporter when stderr is a terminal and
+stops it, waiting for the line to be cleared, before printing the summary, so
+redirected output never collects escape sequences and no stale progress line
+sits next to a result.
+
+### `internal/volinfo` — Volume Facts
+
+**Purpose**: report filesystem-level facts about the volume a path lives on, so
+the CoW clone and the extent query share one implementation and one cache.
+
+**API**: `ClusterSize(path string) (uint64, error)` — the volume's allocation
+unit, cached per volume root. Windows-only: other platforms return
+`ErrUnsupported`, which callers translate into "CoW/extents are unavailable
+here" rather than a hard failure.
+
+### `internal/extent` — Physical Extent Query
+
+**Purpose**: Query the physical extents backing files so CoW clones (which share extents) can be distinguished from independent copies.
+
+**API**:
+```go
+var ErrUnsupported = errors.New("extent query not supported on this filesystem")
+
+type Extent struct {
+    Logical  uint64
+    Physical uint64
+    Length   uint64
+    Shared   bool
+    Encoded  bool
+}
+
+func Query(path string, size int64) ([]Extent, error)
+func Equal(a, b []Extent) bool
+func SharedFlagBytes(e []Extent) int64
+func SharedWithGroup(group [][]Extent) []int64
+func Supported() bool
+```
+
+**Platform implementations**: Linux FIEMAP (`FS_IOC_FIEMAP`), macOS `fcntl(F_LOG2PHYS_EXT)` through the libSystem wrapper (`unix.FcntlInt`) with a `getattrlist(ATTR_CMNEXT_CLONEID)` fallback for decmpfs-compressed files, Windows `FSCTL_GET_RETRIEVAL_POINTERS`; other platforms return `ErrUnsupported`.
+
+**Helpers**: `Query` takes the file size the caller already knows, so it needs no stat of its own. `Equal` is the conservative already-sharing fast path for `dedupe --cow`. `SharedFlagBytes` sums extents the filesystem marked `Shared` (a per-file signal). `SharedWithGroup` answers the already-shared bytes of every member of one content group in a single O(M log M) sweep; it is what `find --cow` reports, and it replaced a per-member "union of all the others" that cost O(n²).
+
+**Dependencies**: `golang.org/x/sys` (Unix/Windows syscalls)
 
 ### `internal/worker` — Worker Pool
 
@@ -148,7 +287,7 @@ func VerifyFullFile(pathA, pathB string, expectedSize int64) (bool, error)
 ```go
 type Pool struct { ... }
 func New(size int) *Pool
-func (p *Pool) Submit(ctx context.Context, fn func(context.Context))
+func (p *Pool) Submit(ctx context.Context, fn func(context.Context)) bool
 func (p *Pool) Wait()
 ```
 
@@ -163,7 +302,15 @@ func (p *Pool) Wait()
 func Run(ctx context.Context, cfg *config.Config) error
 ```
 
-**Internal**: `runNormalMode` spawns and connects all pipeline goroutines. `printSummary` prints final statistics.
+**Internal**:
+- `runListLink` — the `find --listlink` path (inode grouping without duplicate detection).
+- `walkAll` — walks `RefPaths` first, then `Paths`.
+- `scanChecksums` — feeds checksum tasks to the worker pool; drains the reference phase first.
+- `coordinate` — the coordinator loop that owns the detector, dispatches executions, and decides termination.
+- `detector.NextFinal(limit)` — passed to `coordinate` as the end-of-scan work source: elimination tasks (or one `CoWDetect` per content bucket in `find --cow`), drained in bounded batches after the input is finished and nothing is in flight.
+- `runExecutor` — the per-worker executor loop.
+- `reportOutcome` / `reportElimination` / `reportCoW` — user-facing output and stats. `reportCoW` prints one `CoW candidate group (N files, identical content):` block with a `shared: X% (Y of Z)` line per member, or the members only when `FileShared` is nil.
+- `printSummary` — final statistics, including `N CoW groups found (X of file bytes already shared)`.
 
 **Dependencies**: All other `internal/` packages
 
@@ -172,6 +319,42 @@ func Run(ctx context.Context, cfg *config.Config) error
 **Purpose**: Display live-updating scan progress via ANSI escape codes.
 
 **Dependencies**: `internal/dupe` (for `Stats`)
+
+## Diagnostic Tooling (not part of the binary)
+
+`find --cow` relies on platform extent APIs that cannot be validated on a
+developer's Linux machine alone. Two directories exist for that:
+
+### `testtools/extentdump`
+
+A standalone CLI, built separately from the main binary:
+
+```bash
+go build -o extentdump ./testtools/extentdump
+extentdump file1 file2
+```
+
+It prints `extent query supported=<bool>`, then for each file its
+`dev`/`inode`/`numLinks` (through `checksum.ComputeFileInfo`) and every extent's
+`logical`/`physical`/`length`/`shared`/`encoded`, followed by `sharedFlagBytes`
+and the total logical bytes. This is exactly what finddupe sees on that platform.
+
+### `testscripts/`
+
+- `build-bundles.sh` cross-compiles `finddupe` + `extentdump` for
+  linux-amd64, darwin-amd64/arm64, and windows-amd64/arm64 into
+  `bin/cow-test/<platform>/`, adds the matching probe script and README, and
+  zips or tars each bundle. `make cow-test-bundles` runs it.
+- `cow-probe.sh` (macOS/Linux bash) and `cow-probe-windows.ps1` (Windows
+  PowerShell) exercise independent copies, `dedupe --cow` plus a second run, a
+  pre-existing clone, an existing hardlink (which must stay untouched), and
+  compressible content. Linux uses `cp --reflink=never` for "independent" copies
+  because plain `cp` reflinks on btrfs; macOS uses `cp -c` for a real clone.
+- `README.md` explains how to run the bundles on APFS/ReFS and what the numbers
+  mean.
+
+The bundles themselves are build output under the gitignored `bin/` directory;
+the committed sources are the probe scripts and the `extentdump` command.
 
 ## Dependency Graph
 
@@ -186,7 +369,8 @@ cmd/
       ├── internal/checksum
       ├── internal/action
       │    ├── internal/dupe
-      │    └── internal/config
+      │    ├── internal/config
+      │    └── internal/extent
       ├── internal/worker
       └── internal/progress
            └── internal/dupe
@@ -197,5 +381,6 @@ cmd/
 1. **Accept interfaces, return structs**: Packages define interfaces for their dependencies (e.g., `fswalker.ZeroLenCounter`) but return concrete types
 2. **Channels for data flow**: Producer-consumer stages communicate via channels with explicit direction in function signatures
 3. **Context for cancellation**: Every long-running operation accepts `context.Context`
-4. **Constructor functions**: Types use `New*` constructors; struct literals used only where allowed by exhaustruct lint
-5. **No global state**: All state flows through the pipeline; stats use atomics for lock-free concurrent access
+4. **Constructor functions**: Types use `New*` constructors; struct literals used only where allowed by lint
+5. **Stateful detection, stateless execution**: The `Detector` owns all duplicate state behind one mutex; the `Executor` holds only immutable options. This is what lets executor workers run in parallel
+6. **No global state**: All state flows through the pipeline; stats use atomics for lock-free concurrent access

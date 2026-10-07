@@ -1,6 +1,6 @@
 NAME=finddupe
 BINDIR=bin
-VERSION=$(shell git describe --tags || echo "unknown version")
+VERSION=$(shell git describe --tags 2>/dev/null || echo "unknown version")
 BUILDTIME=$(shell LANG=en_US.UTF-8 date -u)
 GOBUILD=CGO_ENABLED=0 go build -trimpath -ldflags '-X "finddupe/cmd.Version=$(VERSION)" \
 		-X "finddupe/cmd.BuildTime=$(BUILDTIME)" \
@@ -29,8 +29,7 @@ WINDOWS_ARCH_LIST = \
 	windows-386 \
 	windows-amd64 \
 	windows-amd64-v3 \
-	windows-arm64 \
-	windows-armv7
+	windows-arm64
 
 all: linux-amd64 darwin-amd64 windows-amd64 # Most used
 
@@ -97,9 +96,6 @@ windows-amd64-v3:
 windows-arm64:
 	GOARCH=arm64 GOOS=windows $(GOBUILD) -o $(BINDIR)/$(NAME)-$@.exe
 
-windows-armv7:
-	GOARCH=arm GOOS=windows GOARM=7 $(GOBUILD) -o $(BINDIR)/$(NAME)-$@.exe
-
 gz_releases=$(addsuffix .gz, $(PLATFORM_LIST))
 zip_releases=$(addsuffix .zip, $(WINDOWS_ARCH_LIST))
 
@@ -114,5 +110,10 @@ all-arch: $(PLATFORM_LIST) $(WINDOWS_ARCH_LIST)
 
 releases: $(gz_releases) $(zip_releases)
 
+# Cross-compile finddupe + extentdump and assemble the per-platform CoW probe
+# bundles under bin/cow-test/ (see testscripts/README.md).
+cow-test-bundles:
+	./testscripts/build-bundles.sh
+
 clean:
-	rm $(BINDIR)/*
+	rm -rf $(BINDIR)/*

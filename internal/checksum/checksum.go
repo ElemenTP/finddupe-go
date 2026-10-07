@@ -4,95 +4,179 @@ package checksum
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"io"
 	"os"
+	"sync"
+	"time"
+
+	"finddupe/internal/dupe"
 )
 
 // BytesToChecksum is the number of bytes to read from the beginning of a file.
 // This matches the C version's BYTES_DO_CHECKSUM_OF constant.
 const BytesToChecksum = 32768
 
-// Compute opens the file at path and returns its 64-bit composite checksum.
-// The signature is (crc << 32) | sum, where crc and sum are computed from
-// the first BytesToChecksum bytes, and fileSize is added to sum.
-func Compute(path string, size int64) (uint64, error) {
-	sig, _, _, _, err := ComputeFileInfo(path, size)
-	return sig, err
+// fileStat holds the file facts the scanner needs. It is filled by one system
+// call per file (see statFile).
+type fileStat struct {
+	Size     int64
+	ModTime  time.Time
+	Dev      uint64
+	Inode    uint64
+	NumLinks uint64
+
+	// identityErr records that the physical identity could not be read while the
+	// size and modification time could. Detection still works through the
+	// checksum; hardlink grouping and the identity half of the freshness check do
+	// not, so the caller reports the degradation instead of hiding it.
+	identityErr error
+}
+
+// Bit widths and shifts of the composite checksum algorithm. They are part of
+// the on-disk-compatible signature format and must not be changed.
+const (
+	crcShiftA     = 8
+	crcShiftB     = 24
+	crcShiftC     = 9
+	byteMask      = 0xff
+	sumShift      = 1
+	sumRotate     = 31
+	checksumWidth = 32
+)
+
+// Info holds the results of a single file open: the weak signature, the
+// physical file identity, and (for files <= BytesToChecksum) the full SHA-256.
+type Info struct {
+	// Signature is the 64-bit composite checksum of the first 32KB.
+	Signature uint64
+
+	// Dev is the filesystem/volume identifier (st_dev / volume serial).
+	Dev uint64
+
+	// Inode is the filesystem object identifier (inode / NTFS file index).
+	Inode uint64
+
+	// NumLinks is the number of hardlinks to the file (0 if unavailable).
+	NumLinks uint64
+
+	// SHA256 is the full-content hash when it was computed at no extra cost
+	// (files <= BytesToChecksum); the zero value means "not yet computed".
+	SHA256 [32]byte
+
+	// ModTime is the file's modification time as observed while the checksum
+	// was computed. It is the reference the executor re-checks before acting
+	// on the file.
+	ModTime time.Time
+
+	// IdentityErr is set when the file's physical identity could not be read
+	// (Windows: GetFileInformationByHandle failed). The file is still scanned and
+	// its duplicates are still found, but --listlink will not group it and a
+	// hardlinked pair cannot be recognized as one; the caller logs it in verbose
+	// mode so the degradation is not silent.
+	IdentityErr error
 }
 
 // ComputeFileInfo opens the file once and returns the checksum signature,
-// filesystem inode, hardlink count, and SHA-256 hash. On Windows, this uses
+// filesystem identity, hardlink count, and SHA-256 hash. On Windows, this uses
 // GetFileInformationByHandle on the already-open handle — avoiding a
 // second CreateFile call in the single-threaded walker.
+//
+// The file's current size must still equal size (the size observed by the
+// walker): reading a different number of bytes would produce a signature for
+// content other than the file that was grouped, which could later make an
+// elimination act on a file that is no longer a duplicate.
 //
 // When size <= BytesToChecksum (32KB), the entire file is read for CRC so
 // SHA-256 is also computed at zero additional cost. For larger files,
 // SHA-256 is returned as zero (not yet computed).
-func ComputeFileInfo(path string, size int64) (sig uint64, inode uint64, numLinks uint64, sha256sum [32]byte, err error) {
+func ComputeFileInfo(path string, size int64) (Info, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0, 0, [32]byte{}, err
+		return Info{}, err
 	}
 	defer f.Close()
 
-	// Get inode from the open file handle (platform-specific).
-	inode, numLinks = fileInode(f)
-
-	if size <= BytesToChecksum {
-		// File fits entirely in the CRC buffer — compute SHA-256 alongside CRC
-		// at zero additional I/O cost.
-		sig, sha256sum, err = computeBoth(f, size)
-	} else {
-		sig, err = ComputeFromReader(f, size)
+	stat, err := statFile(f)
+	if err != nil {
+		return Info{}, err
 	}
-	return sig, inode, numLinks, sha256sum, err
+	if stat.Size != size {
+		return Info{}, fmt.Errorf("%w: size is %d, scanned %d", dupe.ErrFileChanged, stat.Size, size)
+	}
+
+	out := Info{
+		ModTime:     stat.ModTime,
+		Dev:         stat.Dev,
+		Inode:       stat.Inode,
+		NumLinks:    stat.NumLinks,
+		IdentityErr: stat.identityErr,
+	}
+
+	out.Signature, out.SHA256, err = computeSignature(f, size)
+	if err != nil {
+		return Info{}, err
+	}
+	return out, nil
 }
 
-// computeBoth reads the entire file (up to BytesToChecksum) and computes
-// both the weak CRC signature and the SHA-256 hash. The file must be
-// <= BytesToChecksum bytes.
-func computeBoth(r io.Reader, size int64) (uint64, [32]byte, error) {
-	bytesToRead := min(size, BytesToChecksum)
-	buf := make([]byte, bytesToRead)
-	n, err := io.ReadFull(r, buf)
-	if err != nil && err != io.ErrUnexpectedEOF {
+// computeSignature reads the first min(size, BytesToChecksum) bytes of an
+// already-open file and returns its weak signature, plus the full SHA-256 when
+// the whole file fits in that window.
+//
+// A file that ends before the size it was reported with is refused: the bytes
+// that are left are not the content the caller grouped, and folding the scanned
+// size into their checksum would describe neither version of the file.
+func computeSignature(f *os.File, size int64) (uint64, [32]byte, error) {
+	want := min(size, BytesToChecksum)
+	buf, bufPtr, err := readSignatureBuffer(f, size)
+	if err != nil {
 		return 0, [32]byte{}, err
 	}
-	buf = buf[:n]
+	defer signatureBufferPool.Put(bufPtr)
 
-	// Weak CRC (matching C CalcCrc algorithm).
-	var crc uint32
-	var sum uint32
-	for _, b := range buf {
-		crc ^= uint32(b)
-		sum += uint32(b)
-		crc = (crc >> 8) ^ ((crc & 0xff) << 24) ^ ((crc & 0xff) << 9)
-		sum = (sum << 1) + (sum >> 31)
+	if int64(len(buf)) < want {
+		return 0, [32]byte{}, fmt.Errorf("%w: read %d of %d bytes", dupe.ErrFileChanged, len(buf), want)
 	}
-	sum += uint32(size)
-	sig := (uint64(crc) << 32) | uint64(sum)
-
-	// SHA-256 of the complete file content.
-	sha256sum := sha256.Sum256(buf)
-
-	return sig, sha256sum, nil
+	if size <= BytesToChecksum {
+		// The whole file is in the buffer: SHA-256 costs nothing extra.
+		return signature(buf, size), sha256.Sum256(buf), nil
+	}
+	return signature(buf, size), [32]byte{}, nil
 }
 
-// ComputeFromReader reads up to BytesToChecksum bytes from r and returns the composite checksum.
-// The size parameter is the total file size, which is folded into the sum component.
-func ComputeFromReader(r io.Reader, size int64) (uint64, error) {
-	// Determine how many bytes to read.
-	bytesToRead := min(size, BytesToChecksum)
+// signatureBufferPool recycles the read buffer of the weak-checksum path: one
+// 32 KiB buffer per active worker instead of one per scanned file, which on a
+// scan of millions of files is the difference between a steady state and a
+// stream of large short-lived allocations.
+var signatureBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, BytesToChecksum)
+		return &buf
+	},
+}
 
-	// Read the data.
-	buf := make([]byte, bytesToRead)
-	n, err := io.ReadFull(r, buf)
-	if err != nil && err != io.ErrUnexpectedEOF {
-		return 0, err
+// readSignatureBuffer reads up to size bytes from r into a pooled buffer and
+// returns the bytes read together with the buffer that must be released.
+func readSignatureBuffer(r io.Reader, size int64) ([]byte, *[]byte, error) {
+	bufPtr, ok := signatureBufferPool.Get().(*[]byte)
+	if !ok || cap(*bufPtr) < BytesToChecksum {
+		fresh := make([]byte, BytesToChecksum)
+		bufPtr = &fresh
 	}
-	buf = buf[:n]
 
-	// Compute CRC and sum, matching the C CalcCrc algorithm exactly.
+	buf := *bufPtr
+	n, err := io.ReadFull(r, buf[:min(size, int64(len(buf)))])
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		signatureBufferPool.Put(bufPtr)
+		return nil, nil, err
+	}
+	return buf[:n], bufPtr, nil
+}
+
+// signature computes the composite 64-bit weak checksum of buf, folding the file
+// size into the sum component exactly like the C original (CalcCrc).
+func signature(buf []byte, size int64) uint64 {
 	var crc uint32
 	var sum uint32
 
@@ -101,13 +185,25 @@ func ComputeFromReader(r io.Reader, size int64) (uint64, error) {
 		sum += uint32(b)
 
 		// These operations must use uint32 to match C's unsigned int overflow behavior.
-		crc = (crc >> 8) ^ ((crc & 0xff) << 24) ^ ((crc & 0xff) << 9)
-		sum = (sum << 1) + (sum >> 31)
+		crc = (crc >> crcShiftA) ^ ((crc & byteMask) << crcShiftB) ^ ((crc & byteMask) << crcShiftC)
+		sum = (sum << sumShift) + (sum >> sumRotate)
 	}
 
-	// Add file size to sum, matching C: CheckSum.Sum += (unsigned int)FileSize.
-	sum += uint32(size)
+	// CheckSum.Sum += (unsigned int)FileSize, as in C.
+	sum += uint32(size) //nolint:gosec // size is folded into a 32-bit sum by design
 
 	// Pack into 64-bit result, matching C's Checksum_t memory layout.
-	return (uint64(crc) << 32) | uint64(sum), nil
+	return (uint64(crc) << checksumWidth) | uint64(sum)
+}
+
+// ComputeFromReader reads up to BytesToChecksum bytes from r and returns the composite checksum.
+// The size parameter is the total file size, which is folded into the sum component.
+func ComputeFromReader(r io.Reader, size int64) (uint64, error) {
+	buf, bufPtr, err := readSignatureBuffer(r, size)
+	if err != nil {
+		return 0, err
+	}
+	defer signatureBufferPool.Put(bufPtr)
+
+	return signature(buf, size), nil
 }

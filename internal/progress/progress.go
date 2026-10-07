@@ -10,6 +10,9 @@ import (
 	"finddupe/internal/dupe"
 )
 
+// defaultInterval is how often the progress line is refreshed.
+const defaultInterval = 500 * time.Millisecond
+
 // Reporter displays a live-updating progress indicator.
 type Reporter struct {
 	stats    *dupe.Stats
@@ -20,12 +23,29 @@ type Reporter struct {
 func New(stats *dupe.Stats) *Reporter {
 	return &Reporter{
 		stats:    stats,
-		interval: 500 * time.Millisecond,
+		interval: defaultInterval,
 	}
 }
 
-// Run displays the progress indicator until ctx is cancelled.
+// IsTerminal reports whether f is a terminal. It asks the operating system
+// rather than checking for a character device: /dev/null is one, and treating it
+// as a terminal would let --interactive wait for an answer that can never come
+// (and would draw the progress line into a redirected stream).
+func IsTerminal(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	return isTerminal(f.Fd())
+}
+
+// Run displays the progress indicator until ctx is cancelled. It returns
+// immediately when stderr is not a terminal, so escape sequences can never end
+// up in a redirected log.
 func (r *Reporter) Run(ctx context.Context) {
+	if !IsTerminal(os.Stderr) {
+		return
+	}
+
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 

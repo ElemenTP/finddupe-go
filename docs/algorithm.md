@@ -31,17 +31,25 @@ Result:
 
 ### Implementation: `ComputeFileInfo`
 
-The function `checksum.ComputeFileInfo(path, size)` opens the file **once** and returns:
-- `sig uint64` — the 64-bit checksum signature
-- `inode uint64` — filesystem inode / NTFS file index
-- `numLinks uint64` — hardlink count
-- `err error`
+`checksum.ComputeFileInfo(path, size)` opens the file **once** and returns a `checksum.Info`:
 
-This unified call avoids a second file-open in the walker goroutine:
-- On **Unix**: inode is read from `f.Stat().Sys().(*syscall.Stat_t)`
-- On **Windows**: inode is read from `GetFileInformationByHandle` on the open file handle
+```go
+type Info struct {
+    Signature uint64   // 64-bit composite checksum of the first 32KB
+    Dev       uint64   // Filesystem/volume identifier
+    Inode     uint64   // Filesystem object identifier
+    NumLinks  uint64   // Hardlink count (0 if unavailable)
+    SHA256    [32]byte // Full-content hash when computed at no extra cost
+}
+```
 
-`Compute(path, size)` delegates to `ComputeFileInfo`, discarding inode/link info.
+The physical identity comes from the platform helper `statFile(f)`:
+- On **Unix**: `Dev`, `Inode`, and `NumLinks` are read from `f.Stat().Sys().(*syscall.Stat_t)`.
+- On **Windows**: they are read from `GetFileInformationByHandle` on the open file handle (volume serial number, `FileIndexHigh<<32 | FileIndexLow`, `NumberOfLinks`).
+
+When `size <= BytesToChecksum (32768)`, the whole file is already read for the CRC, so `computeBoth` also returns its SHA-256 at zero additional I/O cost. For larger files `SHA256` is left as the zero value ("not yet computed").
+
+`ComputeFileInfo(path, size)` is the only entry point: it returns the signature, the filesystem identity and the modification time from one open, so the decision and the freshness check reference the same read.
 
 ### Properties
 
@@ -59,138 +67,450 @@ This is not a standard CRC. The polynomial `(x >> 8) ^ ((x & 0xff) << 24) ^ ((x 
 
 ### Overview
 
-Files are grouped by their 64-bit checksum. Each group is a list of files that share the same checksum. When a new file arrives with a checksum that already exists, it is a **potential duplicate** and must be verified with a full byte-by-byte comparison.
+Duplicate detection is a **state machine** in `internal/dupe/detector.go`. The detector performs no file I/O of its own: callers feed it files and executor outcomes, and it returns `[]dupe.Execution` work items. The one exception is the optional `--prefer-compressed` probe, consulted once per member while a group is ordered.
 
-### Hash Map Approach
+```
+detector.Insert(fi)                      → []Execution        // a newly scanned file
+detector.OnHashDone(key, fi, incomplete)                      // a HashCalc finished
+detector.OnCompareDone(key, a, b, incomplete)                 // a HashComp finished
+detector.NextFinal(limit)                → ([]Execution, bool) // end-of-scan work
+```
+
+Hashing is streaming, elimination is not. `Insert` only schedules the hashing work
+the new file needs; `NextFinal` decides who is kept once the whole scan is known,
+because the keeper can only be chosen after every member of a content group has been
+seen. The file whose hash happens to finish first is an accident of scheduling, and
+for files larger than the scan-time checksum window it is unrelated to the order the
+files were given in.
+
+Two-level grouping:
+1. **Primary key**: `GroupKey{Signature, Size}` — the weak CRC plus the file size.
+2. **Secondary key**: the full SHA-256 of the file content (`[32]byte`), with the all-zero value meaning "not yet computed".
+
+A `GroupKey` therefore maps to a `keyState`: one bucket per known SHA-256, plus a
+pending set for files whose full hash is still unknown. A *bucket* is the unit of
+content identity — only files inside the same bucket are duplicates, and one group can
+hold several unrelated contents that happen to share a weak signature and a size.
+
+### Strategy by Group Size
+
+| Files sharing the key | Action |
+|-----------------------|--------|
+| 1 file | Store it. No hashing — unique files cost nothing beyond the weak checksum, and the per-bucket maps are not even allocated. |
+| Exactly 2 unhashed files | Emit one `HashComp` (chunked comparison with early-stop). A verdict of "the two differ" settles the pair: neither file is hashed further, *as long as the group still has only those two members*. A third file with the same weak key can be identical to one of them, so the pair is hashed by `NextFinal` once the group grows (a sticky "settled" flag silently dropped that duplicate). |
+| 3 or more files | Emit `HashCalc` for the file just inserted — O(1) per insert, whatever the group size. Files an early-stopped comparison left behind are completed by `NextFinal`. |
+
+### Pseudocode
 
 ```go
-// groups maps checksum → files with that checksum
-groups := make(map[uint64][]FileInfo)
-
-func insert(fi FileInfo) []DupeGroup {
-    group, exists := groups[fi.Signature]
+func (d *Detector) Insert(fi FileInfo) []Execution {
+    key := GroupKey{Signature: fi.Signature, Size: fi.Size}
+    st, exists := d.groups[key]
     if !exists {
-        groups[fi.Signature] = []FileInfo{fi}
-        return nil // No potential duplicates
+        d.groups[key] = &keyState{first: fi, count: 1}   // no inner map yet
+        return nil
     }
 
-    // Checksum collision — create ONE DupeGroup against the first stored file.
-    // Only the first file in the group is used as the "original" to verify against.
-    // This matches the C version's behavior of comparing against the first match.
-    dupe := DupeGroup{Original: group[0], Candidate: fi}
+    st.count++
+    st.addFile(fi)                     // into its SHA-256 bucket, or the pending set
 
-    // Append to the collision chain regardless of verification outcome.
-    // CRC collisions (false positives) stay in the chain for future comparison.
-    groups[fi.Signature] = append(group, fi)
-    return []DupeGroup{dupe}
+    if fi.SHA256 != zeroSHA {          // small files arrive hashed by the scan
+        return nil
+    }
+    if st.count == 2 {                 // exactly two unhashed files: compare them
+        return []Execution{{Key: key, Type: HashComp, Files: st.pendingPair()}}
+    }
+    return []Execution{{Key: key, Type: HashCalc, Files: []FileInfo{fi}}}
 }
 ```
 
-### Comparison to C Original
+### Consistency Rules
 
-The C version uses a **binary search tree** with root at index 1, `Larger`/`Smaller` for navigation, and `Same` for collision chains. The Go version's hash map + slice approach is semantically equivalent:
+- **Keeper (deterministic)**: elimination is deferred to the end of the scan.
+  `NextFinal` completes every group, then decides each content bucket: its members are
+  sorted by the keeper policy and the first one is kept, while the others become
+  victims (one `DupeElim` each). The default policy is
+  `DefaultKeeperPolicy` — reference files first, then the file with more hardlinks
+  (deleting or replacing a file that still has other links frees no storage), then the
+  smallest path. With `--prefer-compressed` a compressed member is preferred ahead of
+  the hardlink and path rules (the probe runs once per member of a content group),
+  but never ahead of a reference file: the executor refuses to eliminate one, so a
+  reference that became a victim would leave the group un-eliminated.
+  The choice no longer depends on which hash finished first, so a run is
+  reproducible; `--ref` remains the way to force a specific original.
+- **One task per victim path**: each bucket's plan is built once and drained in
+  bounded batches. A victim is a *path*, not a physical file: deleting or replacing
+  one path of an inode leaves its other paths on the old inode, so a physical file
+  that owns several paths inside the group needs one task per path — otherwise the
+  group still holds two copies after the run and the next run has that work to do.
+  Hardlinked aliases are collapsed *after* the policy ordering only to choose the
+  keeper (so the surviving path of an inode is the preferred one and a path can never
+  be both keeper and victim) and to build the CoW group, whose sharing ratios are
+  computed from one member per physical file.
+- **Already hardlinked paths**: a path that is the keeper's own physical file is
+  dropped from the plan — no action can change it and it holds no separate storage.
+  A report without `--hardlink` keeps those pairs so they are listed (the original C
+  tool lists them as well, tagged `(hardlinked instances of same file)`); with
+  `--hardlink` the executor skips them before anything is printed.
+- **No concurrent double hashing**: only the file just inserted is scheduled while
+  streaming, and `NextFinal` is called only when nothing is in flight.
+- **Partial resume**: when a comparison stops early (or a hash attempt is interrupted),
+  the more advanced `HashState`/`HashOffset` is persisted, so the next attempt resumes
+  instead of re-reading from the start.
+- **Complete hash**: `OnHashDone`/`OnCompareDone` move a file from the pending set into
+  its concrete SHA-256 bucket. A comparison that returns two still-unhashed files
+  *without* an error proved that they differ, and a two-file group needs no further
+  hashing.
+- **Unverifiable files**: a hash that cannot be completed (I/O error, or a file that
+  keeps changing) is retried at most `maxFailedHashRetries` times by `NextFinal` and
+  then left alone — a file whose content was never verified is never eliminated.
+- **CoW-detect mode**: with `WithCoWDetect()` (`find --cow`) the same `NextFinal` pass
+  turns each content bucket with at least two distinct physical files into one
+  `CoWDetect` execution carrying all its members, instead of emitting eliminations.
+
+### Comparison to the C Original
+
+The C version uses a **binary search tree** with root at index 1, `Larger`/`Smaller` for navigation, and `Same` for collision chains. The Go version's two-level hash map is semantically equivalent:
 
 | C concept | Go equivalent |
 |-----------|---------------|
 | `FileData[]` array | `groups` map |
 | BST navigation (`Larger`/`Smaller`) | Hash map lookup (O(1)) |
-| `Same` chain for collisions | Slice for same-checksum files |
-| `CheckDuplicate()` function | `Detector.Insert()` method |
+| `Same` chain for collisions | `map[[32]byte][]FileInfo` buckets |
+| `CheckDuplicate()` function | `Detector.Insert()` + outcome callbacks + `NextFinal()` |
 
-### Hardlink-Aware Duplicate Detection (`--hardlink` in find mode)
+### Same-Physical-File Refusal (Every Action)
 
-When `--hardlink` is used with `find`, duplicate detection still operates on content checksums, but the verification step additionally checks the inode:
+Duplicate detection always operates on content, but before taking any action the executor checks physical identity. Inode numbers are only unique per device, so **both** `Dev` and `Inode` are compared (`samePhysicalFile`, with `Inode != 0` guarding against platforms that cannot report an identity):
 
 ```
-Before full byte comparison:
-  if SkipHardlinked && original.Inode != 0 &&
-     original.Inode == candidate.Inode &&
-     original.NumLinks > 1:
-       → Skip (ResultAlreadyHardlinked)
-       → Don't report, don't count in stats
-
-Otherwise:
-  → Proceed with full byte-by-byte verification
+Before acting on a DupeElim (keeper = Files[0], victim = Files[1]):
+  if samePhysicalFile(keeper, victim):   # Inode != 0, same Dev, same Inode
+      if report mode and not --hardlink:
+          → ResultVerifiedDuplicate      # still reported as a duplicate
+      else:
+          → ResultAlreadyHardlinked      # no file is touched
+  else if victim.IsRef and action != report:
+      → ResultSkippedRef                 # reference files are never eliminated
+  else if action != report and (keeper or victim changed since it was hashed):
+      → ResultSkippedChanged             # the duplicate decision is stale
+  else if action == hardlink and not sameDevice(keeper, victim):
+      → ResultSkippedCrossDevice         # hard links and clones cannot span volumes
+  else:
+      → execute the configured action
 ```
+
+"Changed since it was hashed" means the current `Size`/`ModTime` no longer match
+the values recorded with the content hash, so the pair is left alone rather than
+eliminated against a stale decision.
+
+This applies to **every** action: delete, hardlink, and CoW clone all refuse to
+touch a path that is already the same physical file as the keeper. Acting on such
+a pair would break the existing hardlink — in particular, cloning one name of a
+hardlinked pair would replace it with an unshared copy.
+
+### Files That Change While the Run Works (TOCTOU)
+
+Every check above is a check at a point in time, so a tree that is being written to
+during the run has windows in which a file can change after it was verified:
+
+| Window | What can slip through | Consequence |
+|--------|----------------------|-------------|
+| Between the scan's stat and the read (`ComputeFileInfo`) | a shrink or grow | refused (`dupe.ErrFileChanged`), counted as unreadable |
+| Between the scan and the end-of-scan decision | any change | a duplicate decision made from content that is no longer there |
+| Between the decision and the action (`unchanged`) | a change that keeps the size **and** the modification time, or a stat failure | the pair is skipped (`ResultSkippedChanged`), nothing is touched |
+| Between `unchanged` and the rename, and while a file is being read | a same-size replacement, a truncation | a clone/hash of different bytes than the decision used; a comparison stops (and now fails) instead of looping |
+| Between `dedupe --cow`'s extent query and the clone | a rewrite of the keeper | the clone copies the new bytes; the size invariant still holds |
+
+The design keeps every one of these fail-safe rather than fail-wrong: an
+unverified or changed file is never eliminated, a failed step leaves the victim in
+place (temporary name + atomic rename, rollback of the write protection), and a
+comparison that cannot reach a verdict reports `dupe.ErrFileChanged`. What it
+cannot do is make a decision about bytes that changed after the bytes were read —
+no tool can without a snapshot or a lock.
+
+Mitigations, in the order they are usually worth the effort:
+
+1. **Run when the tree is quiescent** (a backup, a stopped service, a copy that is
+   not being written). This removes every window above at once.
+2. **`--ref`** marks the files that must survive. A reference is never eliminated,
+   so even a stale decision cannot remove it, and it is the keeper of its group.
+3. **Re-run `find` after a `dedupe`** and treat a non-empty result as "something
+   changed or could not be verified" — the second run is cheap (the weak checksum
+   only) and it prints the files that were left alone.
+4. **Prefer `--hardlink` over `--delete`** when the tree is live: a hardlink keeps
+   the victim's bytes reachable through the keeper, while a delete does not. Both
+   are decided on the same verified content.
+5. **Snapshot the filesystem** (VSS on Windows, `btrfs subvolume snapshot`, an APFS
+   snapshot, a ZFS snapshot) and run the tool against the snapshot; the copy is
+   immutable while the run works.
+6. **Watch the summary**: `content verification failed` in the log plus
+   `N files could not be opened` is the tool telling you which files it could not
+   verify — those are exactly the ones a live write touched or a permission
+   blocked.
 
 This means:
-- Files with **same content + same inode** (already hardlinked) → silently skipped
-- Files with **same content + different inode** → reported as duplicates
-- Files with **different content** → not duplicates (CRC collision, stored in chain)
+- Files with **same content + same `(Dev, Inode)`** (already hardlinked) →
+  `ResultAlreadyHardlinked` (silently skipped; in verbose mode logged as
+  `already hardlinked`), except in report mode without `--hardlink`, where the
+  pair is still reported as a duplicate
+- Files with **same content + different `(Dev, Inode)`** → reported as duplicates
+- Files with **different content** → not duplicates (weak-checksum collision, kept in separate SHA-256 buckets)
 
-## 3. Full File Verification
+## 3. Chunked Comparison (`HashComp`)
 
 ### Purpose
 
-After checksum match, perform a full byte-by-byte comparison to confirm the files are truly identical. This handles:
-- CRC collisions (theoretically possible with 64-bit space)
-- Same first 32KB but different content after (e.g., video files with same header)
+When exactly two unhashed files share a weak-checksum bucket, compare them **incrementally with early-stop** instead of hashing both completely. Since most weak-checksum collisions are not real duplicates, stopping at the first differing chunk saves most of the I/O.
 
 ### Algorithm
 
 ```
-Given: fileA path, fileB path, expected size
+Given: fileA, fileB, chunk size derived from the file size
 
-1. Quick check: if sizes differ → return false immediately
-2. Quick check: if os.SameFile (same inode) → return true (same physical file)
-3. Open both files for reading
-4. Allocate two 64KB buffers
-5. While bytes remain:
-   a. Read up to 64KB from each file
-   b. Compare the two buffers with bytes.Equal()
-   c. If mismatch → close files, return false
-6. Close files, return true
+1. Open both files, restoring any saved SHA-256 state and seeking to HashOffset
+2. Verify each file still has the size recorded during the scan (and, when a
+   partial digest is being resumed, the same modification time); a file that
+   changed fails with dupe.ErrFileChanged instead of producing a digest of the
+   wrong bytes
+3. remaining = size - HashOffset
+4. While remaining > 0:
+   a. Read up to chunkSize bytes from each file
+   b. If either read is short (or returns nothing while bytes remain) → that file
+      ended before the size recorded for it, so it was truncated while the
+      comparison ran: stop with dupe.ErrFileChanged and record no new partial
+      state, so the stored HashOffset stays at a prefix that really was hashed.
+      Zero bytes are never treated as progress — doing so made the loop read EOF
+      forever and the run hang at 100% CPU instead of reporting the pair
+   c. Feed both chunks to their SHA-256 hashers
+   d. If the accumulated hashes differ → stop early, keep partial state
+   e. remaining -= bytes read
+5. End of file with equal hashes → both SHA-256 values are complete
 ```
+
+The executor returns the updated `FileInfo` records in the `Outcome`; the detector then treats a complete hash like an `OnHashDone` result and continues matching.
+
+The signature path enforces the same rule: `checksum.ComputeFileInfo` stats the
+open file and refuses to sign it when its size is no longer the size the walker
+reported.
+
+### Chunk Sizing
+
+| File size | Chunk size |
+|-----------|------------|
+| ≤ 64 KB | one read (the whole file) |
+| ≤ 16 MB | 64 KB — makes early-stop cheap |
+| > 16 MB | 1 MB — fewer syscalls |
 
 ### Performance Considerations
 
-- Early exit: return on first mismatch (don't read the rest)
-- Memory: fixed 128KB allocation (two 64KB buffers) regardless of file size
-- Same-file shortcut: `os.SameFile` avoids reading when inode matches
+- Early exit on the first differing chunk (don't read the rest)
+- Fixed memory: two chunk buffers regardless of file size
+- Partial hash state is saved so a later `HashComp`/`HashCalc` can resume from `HashOffset` instead of re-reading from the start
+- `Insert` is O(1) in the group size, and end-of-scan work is emitted in bounded batches (`NextFinal(limit)`), so a scan with millions of duplicates neither stalls the coordinator nor materializes every task at once
 
 ## 4. Action Execution
 
-### Verification Flow (`VerifyAndExecute`)
+### Verification Flow (`DoExecution`)
+
+The executor is stateless. It receives one `dupe.Execution` and returns an `Outcome`:
+
+```go
+func (e *Executor) DoExecution(ctx context.Context, ex dupe.Execution) (Outcome, error)
+```
 
 ```
-1. If SkipHardlinked: check candidate.Inode vs original.Inode → skip if same
-2. VerifyFullFile: full byte comparison
-3. If not duplicate → ResultNotDuplicate
-4. If candidate is reference file → ResultSkippedRef
-5. Execute configured action → Result{Deleted,Hardlinked,CoWCloned,VerifiedDuplicate}
+switch ex.Type:
+  HashCalc  → hash Files[0] fully (resuming from HashState/HashOffset)
+  HashComp  → compare Files[0] and Files[1] in chunks (Section 3)
+  DupeElim  → act on the victim (Files[1]); Files[0] is the keeper
+  CoWDetect → query the whole group's extents and report per-file shared bytes
 ```
+
+For a `DupeElim` execution:
+
+```
+1. If keeper and victim are the same physical file (`(Dev, Inode)`, Inode != 0)
+      → report mode without --hardlink: ResultVerifiedDuplicate (still reported)
+      → otherwise: ResultAlreadyHardlinked (no file is touched)
+2. If the victim is a reference file and the action is not "report"
+      → ResultSkippedRef (reference files are never eliminated)
+3. If the action is not "report" and either file no longer matches the size and
+   modification time recorded when its content was hashed
+      → ResultSkippedChanged (the duplicate decision is stale; nothing is touched)
+4. Hardlink and CoW clone: if keeper and victim are on different devices
+      → ResultSkippedCrossDevice (neither a hardlink nor a clone can span
+        volumes; a clone shares storage blocks)
+5. Otherwise execute the configured action
+```
+
+Step 3 is the re-check that makes elimination safe on a live filesystem: the
+hashes are computed earlier in the scan, so a file that was rewritten, appended
+to, or replaced in the meantime must never be eliminated against that stale
+decision. The readers enforce the same rule while hashing (Section 3).
+
+The same-physical-file check applies to delete, hardlink, and CoW clone alike; it
+prevents an existing hardlink from being broken.
 
 ### Delete
 
 ```
-1. Check candidate file permissions
-2. If readonly and not --rdonly → skip (ResultSkippedRO)
-3. If readonly and --rdonly → chmod to add write permission
-4. os.Remove(candidatePath)
-5. Update stats
+1. Check the victim's permissions
+2. If read-only and not --rdonly → ResultSkippedRO
+3. If read-only and --rdonly → chmod to add write permission
+4. os.Remove(victimPath)
+5. → ResultDeleted
 ```
 
 ### Hardlink
 
 ```
-1. Verify source file exists
-2. Check source NumLinks < 1023 (Windows NTFS limit)
-3. os.Remove(candidatePath) — delete the duplicate
-4. os.Link(originalPath, candidatePath) — create hardlink
-5. Restore file mode and modification time
-6. Update stats
+1. Re-read the keeper's link count and refuse at the NTFS limit (1023)
+   → else ResultHardlinkLimit
+2. If the victim is read-only and not --rdonly → ResultSkippedRO
+3. os.Link(keeperPath, temporaryNameNextToVictim)
+4. os.Rename / MoveFileEx(temporaryName, victimPath) — atomic replace
+5. → ResultHardlinked
 ```
 
-The sequence "delete then link" (instead of `os.Link` directly on the existing file) is required because:
-- `os.Link` fails if the destination exists
-- We delete the duplicate's directory entry first, then create a new one pointing to the original's inode
+The link count is re-read instead of trusting `FileInfo.NumLinks`, which comes
+from the scan and is stale after the first link is created; on Unix the
+filesystem's own (far higher or absent) limit is left to the kernel.
 
-### CoW Clone (Stub)
+The link is created under a temporary name next to the victim and renamed over
+it, so the victim is either the untouched original file or the finished
+hardlink — never missing. A plain remove-then-link destroys the victim whenever
+linking fails: different devices, a filesystem without hard links, the link
+limit, or a keeper that vanished. Hard links share the keeper's inode, so the
+victim necessarily takes on the keeper's permissions and timestamps; the
+victim's own metadata is *not* restored, because restoring it would silently
+rewrite the keeper's metadata as well.
 
-Returns `ErrCoWNotSupported` on all platforms. Real implementation deferred:
-- **Linux (btrfs/xfs)**: `ioctl FICLONERANGE`
-- **macOS (APFS)**: `clonefile(2)`
-- **Windows (ReFS)**: `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
+### CoW Clone
+
+CoW elimination is implemented per platform. The victim is replaced with a block clone of the keeper:
+
+- **Linux** (btrfs/XFS): `FICLONE` ioctl via `golang.org/x/sys/unix` `IoctlFileClone`.
+- **macOS** (APFS): `clonefile(2)` via `unix.Clonefile`.
+- **Windows** (ReFS/Dev Drive): `FSCTL_DUPLICATE_EXTENTS_TO_FILE` for the
+  cluster-aligned part, with the trailing partial cluster copied explicitly to
+  its own offset in the destination and the destination preallocated.
+
+All platforms go through `cloneReplace(src, dst)` in `internal/action/cow.go`:
+
+```
+0. If keeper and victim are the same physical file, or they are on the same
+   device and their extent layouts compare Equal,
+   → ResultAlreadyShared (no clone, no file change). The keeper's layout is
+   remembered for the rest of its group (keyed by path, size and mtime, bounded
+   and dropped when full), because every other victim asks the same question and
+   the keeper is never modified by an elimination
+1. Create a temporary file next to the victim
+2. Clone the keeper into the temporary path (platform-specific)
+3. Complete the clone's data layout from the keeper: the clone holds the keeper's
+   bytes, so attributes that describe where those bytes live are the keeper's.
+   macOS needs this explicitly — a decmpfs-compressed file keeps its payload in
+   com.apple.ResourceFork, its header in com.apple.decmpfs and its state in the
+   UF_COMPRESSED flag, and a clone that loses them reads back as zero bytes
+4. Restore the victim's metadata on the temporary file: ownership, mode
+   (including setuid/setgid/sticky), extended attributes (which carry POSIX
+   ACLs on Linux and resource forks on macOS), timestamps, and (macOS) BSD
+   file flags. Storage attributes and storage flags are exempt from that sync in
+   both directions, because they belong to the cloned data. Unlike a hardlink, a
+   clone has its own inode, so the victim's identity can be preserved instead of
+   inheriting the keeper's
+5. Check that the clone reports the keeper's size. A clone that does not is never
+   put in place: the temporary file is removed, the victim is untouched and the
+   action is reported as failed
+6. Atomically replace the victim (os.Rename on Unix,
+   MoveFileEx(REPLACE_EXISTING) on Windows)
+
+The statistics these steps need are the ones already taken: the keeper's and the
+victim's stat come from the freshness check (`unchanged`), and the metadata is applied
+from that value instead of re-reading the source, so a clone costs one stat of the
+victim (existence and mode) and one of the clone it just created.
+```
+
+The extent check is only a "skip the work" fast path: content equality was already
+established by the detector, so cloning anyway is safe and idempotent. It is
+deliberately conservative — `extent.Equal` returns false for empty lists and for
+unknown (zero) physical addresses, compares encoded (compressed) extents by their
+encoded runs, and any
+uncertainty (unsupported filesystem, query failure) simply means "clone".
+Physical offsets are only meaningful within one device, so two files with
+different `Dev` values are never treated as sharing storage. Extent lengths are
+clamped to the file's size: filesystems allocate whole blocks, and without the
+clamp a fully shared 100000-byte file would report 102400 shared bytes (a ratio
+above 100%).
+
+Unsupported filesystems return `ErrCoWNotSupported` and the victim is left
+untouched. → `ResultCoWCloned` on success, `ResultAlreadyShared` when the pair
+already shares all storage.
+
+### CoW Detection (`find --cow`)
+
+Detection is opt-in because it costs an extra open + extent query per file. It is
+a single final pass: after the input is fully drained and every hash/comparison
+has finished, the detector state is complete and the pipeline asks for groups.
+
+1. `dupe.Detector.NextFinal()` walks every content bucket with at least two
+   **distinct physical files**, keeping one path per `(Dev, Inode)`. Hardlinked
+   aliases collapse to a single member; use `find --listlink` to list hardlink
+   groups.
+2. The detector turns each bucket into one `CoWDetect` execution instead of one
+   execution per pair, drained in bounded batches.
+3. `detectCoW` computes, for every member, how many of its bytes it shares with
+   another member of *its own group*: `extent.SharedWithGroup` intersects each
+   member's physical ranges with the ranges of the others in one sweep, within the
+   same device. The kernel's per-extent `Shared` flag (Linux
+   `FIEMAP_EXTENT_SHARED`) is not used for this: it says the extent is shared with
+   *someone*, which made an untouched original look 100% shared where a partially
+   rewritten clone shares only its tail. `Outcome.FileShared []int64` carries one
+   value per `Outcome.Files` entry; it is nil when extent information is
+   unavailable for the whole group, and also when the filesystem reports extents
+   without a physical identity (reporting 0% would claim nothing is shared).
+
+`find --cow` therefore reports a group, not a pair:
+
+```
+CoW candidate group (2 files, identical content):
+    '/data/b.bin'  shared: 100.0% (128 kB of 128 kB)
+    '/data/a.bin'  shared:   0.0% (0 B of 128 kB)
+
+Files:     256 kB in      2 files
+Dupes:     128 kB in      1 files
+  1 CoW groups found (128 kB of file bytes already shared)
+```
+
+Independent copies are listed too, with 0% shared — they are exactly the members
+that should end up CoW-sharing. `CoWSharedBytes` is a per-file sum: each shared
+range is counted once per member, so it must not be read as physical bytes saved.
+Same-inode (hardlinked) aliases are not separate members.
+
+### What the `Dupes:` line counts
+
+`Dupes:` follows the *decision*, not the action: a pair whose content was verified
+identical counts as a duplicate even when the elimination was skipped (read-only,
+`--ref`, cross-device hardlink or clone, NTFS link limit) or failed, because the duplicate
+storage is still there. Three outcomes are deliberately excluded: a pair that
+turned out to be the same inode (already hardlinked) or to already share all its
+extents (already shared) is not duplicate storage, and a pair whose decision was
+withdrawn because a file changed during the scan is not a duplicate any more. The
+action-specific counters (`N files deleted`, `N reference files skipped`, …) are
+reported separately, so both questions stay answerable.
+
+A pair that turned out to be the same inode is still *listed* by `find` unless
+`--hardlink` asked to skip it, tagged `(hardlinked instances of same file)`.
+Listing it and counting it are different questions: the list answers "which names
+are duplicates", the count answers "how many bytes exist twice". A tree full of
+hardlinked copies therefore prints more pairs than `Dupes:` counts — the original
+C tool prints those pairs too but counts them as duplicate files.
+
+On filesystems without extent reporting `FileShared` stays nil: the group members
+are still listed, with a note that extent information is unavailable. The
+group-wide `extent.SharedWithGroup` (physical overlap, with a physical-start match
+for compressed btrfs) remains available as a library helper. See
+[cross-platform.md](cross-platform.md) for the per-platform ioctls.
 
 ## 5. Glob Pattern Matching (`**`)
 
@@ -200,7 +520,7 @@ Match file paths against patterns with `**` (recursive wildcard) support, matchi
 
 ### Algorithm
 
-Implemented as a recursive component-matcher in `fswalker/matchComponents`:
+Implemented as a recursive component-matcher in `fswalker.matchComponents`:
 
 ```go
 // matchComponents recursively matches pattern components against path components.
@@ -240,27 +560,29 @@ func matchComponents(patParts, nameParts []string) bool {
 
 ### Integration with filepath.WalkDir
 
-The walker calls `filepath.WalkDir` to enumerate files, then filters each path against the user's patterns. For non-recursive patterns (no `**`), subdirectories are skipped via `filepath.SkipDir`.
+The walker calls `filepath.WalkDir` to enumerate files, then filters each path against the user's patterns (the pattern is compiled once per walk; each candidate path is still split into components for the match, which measurement showed is not a bottleneck next to the stat calls) (component matching folds case on Windows, see [cross-platform.md](cross-platform.md)). For non-recursive patterns (no `**`), subdirectories are skipped via `filepath.SkipDir`. On Unix the walker also fills `Dev`/`Inode`/`NumLinks` from the already-available stat struct via `fileid.FromFileInfo`; where `os.FileInfo` exposes no identity it reports "unknown", and the scanner fills it from the open handle later.
 
 ## 6. Multi-Threading Design
 
 ### Parallelization Strategy
 
-The checksum computation (which includes `os.Open` + read 32KB + CRC calculation + inode retrieval) is the CPU/I/O bottleneck and runs in a **bounded worker pool**:
+The checksum computation (`os.Open` + read 32KB + CRC + identity retrieval) is the primary CPU/I/O bottleneck and runs in a **bounded worker pool**. Executor work (full hashing, comparison, elimination) runs in a second pool of the same size.
 
 ```
-Walker (1 goroutine):     filepath.WalkDir → stat → send to channel
-Scanner feeder (1 goroutine): read channel → pool.Submit (may block)
-Worker pool (N goroutines):  os.Open → CRC + inode → send to fileCh
-Detector (1 goroutine):  hash map insert → create DupeGroups
-Executor (1 goroutine):  full comparison → action
+Walker (1 goroutine):          filepath.WalkDir → stat → walkResultCh
+Scanner feeder (1 goroutine):  read walkResultCh → pool.Submit (may block)
+Worker pool (N goroutines):    os.Open → CRC + Dev/Inode/NumLinks → fileInfoCh
+Coordinator (1 goroutine):     owns Detector; Insert/OnHashDone/OnCompareDone
+                               → dispatch Executions
+Executor pool (N goroutines):  DoExecution → Outcome → coordinator
+Progress (1 goroutine):        ticker → stderr
 ```
 
-The worker pool uses a semaphore channel (`chan struct{}`) with buffer size `threads` to limit concurrency. `pool.Submit` blocks when all workers are busy, providing natural back-pressure.
+The worker pool uses a semaphore channel (`chan struct{}`) with buffer size `threads`. `pool.Submit` blocks when all workers are busy, providing natural back-pressure.
 
 ### File Open Optimization
 
-Files are opened **once** per scan in the parallel worker pool goroutines (via `checksum.ComputeFileInfo`). On Windows, `GetFileInformationByHandle` is called on the same handle — avoiding a second `CreateFile` call that would serialize I/O in the single-threaded walker.
+Files are opened **once** per scan in the parallel worker-pool goroutines (via `checksum.ComputeFileInfo`). On Windows, `GetFileInformationByHandle` is called on the same handle — avoiding a second `CreateFile` call that would serialize I/O in the single-threaded walker.
 
 ## 7. Progress Reporting
 

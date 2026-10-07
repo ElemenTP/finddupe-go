@@ -2,19 +2,27 @@ package fswalker_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"finddupe/internal/fswalker"
 )
 
 // collectResults reads all results from the channel and returns paths and errors.
-func collectResults(t *testing.T, ch <-chan fswalker.Result) (paths []string, errs []error) {
+func collectResults(t *testing.T, ch <-chan fswalker.Result) ([]string, []error) {
 	t.Helper()
+
+	var (
+		paths []string
+		errs  []error
+	)
+
 	for r := range ch {
 		if r.Err != nil {
 			errs = append(errs, r.Err)
@@ -23,7 +31,7 @@ func collectResults(t *testing.T, ch <-chan fswalker.Result) (paths []string, er
 		}
 	}
 	sort.Strings(paths)
-	return
+	return paths, errs
 }
 
 func TestWalk_EmptyDir(t *testing.T) {
@@ -34,11 +42,67 @@ func TestWalk_EmptyDir(t *testing.T) {
 	ch := w.Walk(context.Background(), []string{dir}, fswalker.WalkOptions{})
 	paths, errs := collectResults(t, ch)
 
-	if len(errs) > 0 {
-		t.Errorf("unexpected errors: %v", errs)
+	// An empty directory matches nothing, which the caller turns into a failed
+	// run rather than a silent success.
+	if len(errs) != 1 || !isNoMatch(errs[0], dir) {
+		t.Errorf("expected one no-match error for %s, got %v", dir, errs)
 	}
 	if len(paths) != 0 {
 		t.Errorf("expected 0 files, got %d: %v", len(paths), paths)
+	}
+}
+
+// isNoMatch reports whether err is a NoMatchError for the given pattern.
+func isNoMatch(err error, pattern string) bool {
+	var noMatch *fswalker.NoMatchError
+	return errors.As(err, &noMatch) && noMatch.Pattern == pattern
+}
+
+// TestWalk_NoMatchError covers the patterns that must be reported as matching
+// nothing instead of quietly succeeding.
+func TestWalk_NoMatchError(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "a.txt", "content")
+
+	patterns := []string{
+		filepath.Join(dir, "does-not-exist"),
+		filepath.Join(dir, "*.jpg"),
+		filepath.Join(t.TempDir(), "empty-subdir"),
+	}
+
+	for _, pattern := range patterns {
+		t.Run(filepath.Base(pattern), func(t *testing.T) {
+			t.Parallel()
+			w := fswalker.New()
+			ch := w.Walk(context.Background(), []string{pattern}, fswalker.WalkOptions{})
+			_, errs := collectResults(t, ch)
+
+			if len(errs) != 1 || !isNoMatch(errs[0], pattern) {
+				t.Fatalf("pattern %s: expected one no-match error, got %v", pattern, errs)
+			}
+		})
+	}
+}
+
+// TestWalk_MatchingPatternIsNotReported verifies that a pattern which matched a
+// file (even one skipped as empty) is not reported as a miss.
+func TestWalk_MatchingPatternIsNotReported(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "empty.bin", "")
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{dir}, fswalker.WalkOptions{})
+	paths, errs := collectResults(t, ch)
+
+	if len(paths) != 0 {
+		t.Fatalf("zero-length files are skipped by default, got %v", paths)
+	}
+	if len(errs) != 0 {
+		t.Fatalf("a pattern that matched a (skipped) file must not report a miss: %v", errs)
 	}
 }
 
@@ -263,6 +327,36 @@ func TestWalk_MultiplePatterns(t *testing.T) {
 
 // Helpers
 
+// collectInfo reads all results and returns the reported size and report count
+// per path. A path may legitimately be reported more than once (a file reached
+// both directly and through a followed symlink); the pipeline deduplicates paths
+// downstream.
+func collectInfo(t *testing.T, ch <-chan fswalker.Result) (map[string]int64, map[string]int, []error) {
+	t.Helper()
+
+	sizes := make(map[string]int64)
+	counts := make(map[string]int)
+	var errs []error
+	for r := range ch {
+		if r.Err != nil {
+			errs = append(errs, r.Err)
+			continue
+		}
+		sizes[r.Info.Path] = r.Info.Size
+		counts[r.Info.Path]++
+	}
+	return sizes, counts, errs
+}
+
+// symlinkTo creates a symbolic link, skipping the test where that is not
+// permitted (Windows without developer mode).
+func symlinkTo(t *testing.T, oldname, newname string) {
+	t.Helper()
+	if err := os.Symlink(oldname, newname); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+}
+
 func writeFile(t *testing.T, baseDir, name, content string) {
 	t.Helper()
 	path := filepath.Join(baseDir, name)
@@ -280,5 +374,675 @@ func mkSubdir(t *testing.T, dir, name string) {
 	t.Helper()
 	if err := os.Mkdir(filepath.Join(dir, name), 0755); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestWalk_SymlinkToFile_SkippedWithoutFollow verifies the default policy:
+// entries that are symbolic links are not reported unless -j is set.
+func TestWalk_SymlinkToFile_SkippedWithoutFollow(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.bin")
+	writeFile(t, dir, "target.bin", strings.Repeat("x", 4096))
+	symlinkTo(t, target, filepath.Join(dir, "link.bin"))
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{dir}, fswalker.WalkOptions{})
+	paths, errs := collectResults(t, ch)
+
+	if len(errs) > 0 {
+		t.Errorf("unexpected errors: %v", errs)
+	}
+	if len(paths) != 1 || !strings.HasSuffix(paths[0], "target.bin") {
+		t.Fatalf("expected only target.bin, got %v", paths)
+	}
+}
+
+// TestWalk_SymlinkToFile_FollowedIsReportedAsTarget is the regression test for
+// two bugs at once: a link used to be reported with its own size (the length of
+// the target path) and, even once that was fixed, the link path itself was
+// reported — so `dedupe -j` linked the symlink or deleted the link instead of
+// acting on the file whose content had been verified. A followed link is now
+// reported under its resolved target path.
+func TestWalk_SymlinkToFile_FollowedIsReportedAsTarget(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const size = 4096
+	target := filepath.Join(dir, "target.bin")
+	writeFile(t, dir, "target.bin", strings.Repeat("x", size))
+	link := filepath.Join(dir, "link.bin")
+	symlinkTo(t, target, link)
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{dir}, fswalker.WalkOptions{FollowSymlinks: true})
+	sizes, counts, errs := collectInfo(t, ch)
+
+	if len(errs) > 0 {
+		t.Errorf("unexpected errors: %v", errs)
+	}
+	if _, ok := sizes[link]; ok {
+		t.Errorf("a followed link must be reported under its target path, not %s", link)
+	}
+	if got := sizes[target]; got != size {
+		t.Errorf("target size = %d, want %d", got, size)
+	}
+	// The file is reached twice (directly and through the link); the pipeline
+	// deduplicates paths, the walker does not.
+	if counts[target] != 2 {
+		t.Errorf("target reported %d times, want 2 (direct + through the link)", counts[target])
+	}
+}
+
+// TestWalk_SymlinkToDir_Followed verifies that -j descends into a directory
+// symlink exactly once, even when its target is also part of the tree.
+func TestWalk_SymlinkToDir_Followed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real")
+	mkSubdir(t, dir, "real")
+	writeFile(t, dir, "real/inside.txt", "content")
+	symlinkTo(t, target, filepath.Join(dir, "link"))
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{dir}, fswalker.WalkOptions{FollowSymlinks: true})
+	paths, errs := collectResults(t, ch)
+
+	if len(errs) > 0 {
+		t.Errorf("unexpected errors: %v", errs)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("expected the file under the target exactly once, got %v", paths)
+	}
+	if !strings.HasSuffix(paths[0], "inside.txt") {
+		t.Errorf("expected inside.txt, got %s", paths[0])
+	}
+}
+
+// walkPaths walks one pattern and returns the sorted result paths.
+func walkPaths(t *testing.T, pattern string, opts fswalker.WalkOptions) ([]string, []error) {
+	t.Helper()
+
+	w := fswalker.New()
+	paths, errs := collectResults(t, w.Walk(context.Background(), []string{pattern}, opts))
+	sort.Strings(paths)
+	return paths, errs
+}
+
+// TestWalk_DirLinkMatchesAtItsPosition is the regression test for a directory
+// symlink making a depth-limited pattern lose files. The link sits at depth 1 and
+// its target is also part of the tree: following the link re-anchored the pattern
+// on the target (so nothing inside matched), while the visit that would have
+// matched was skipped because the target had already been walked. Whatever the
+// plain walk finds must be found with -j as well.
+func TestWalk_DirLinkMatchesAtItsPosition(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "parent/v2.3/file.txt", "content")
+	symlinkTo(t, filepath.Join(dir, "parent", "v2.3"), filepath.Join(dir, "parent", "latest"))
+
+	pattern := filepath.Join(dir, "parent", "*", "*.txt")
+	plain, plainErrs := walkPaths(t, pattern, fswalker.WalkOptions{})
+	followed, followedErrs := walkPaths(t, pattern, fswalker.WalkOptions{FollowSymlinks: true})
+
+	if len(plainErrs) > 0 {
+		t.Fatalf("plain walk errors = %v", plainErrs)
+	}
+	if len(plain) != 1 {
+		t.Fatalf("plain walk paths = %v, want the file under v2.3", plain)
+	}
+	if len(followedErrs) > 0 {
+		t.Fatalf("the link visit made the pattern look like a miss: %v", followedErrs)
+	}
+	if len(followed) != len(plain) {
+		t.Fatalf("following the link changed the matches: %v vs %v", followed, plain)
+	}
+}
+
+// TestWalk_DirLinkMatchesWhereTheLinkSits covers the components a link occupies:
+// a file inside the target sits where the link's contents appear, not where the
+// target lives in the file system.
+func TestWalk_DirLinkMatchesWhereTheLinkSits(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "ext/a/x.txt", "content")
+	mkSubdir(t, dir, "scan")
+	symlinkTo(t, filepath.Join(dir, "ext"), filepath.Join(dir, "scan", "link"))
+
+	followed := fswalker.WalkOptions{FollowSymlinks: true}
+	// scan/link/a/x.txt: three components below the walk root.
+	deep := filepath.Join(dir, "scan", "*", "*", "*.txt")
+	paths, errs := walkPaths(t, deep, followed)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(paths) != 1 || !strings.HasSuffix(paths[0], "x.txt") {
+		t.Fatalf("scan/*/*/*.txt = %v, want x.txt through the link", paths)
+	}
+
+	// scan/link/a/x.txt is *not* scan/*/*.txt: the link occupies the first
+	// component, the directory inside the target the second.
+	shallow := filepath.Join(dir, "scan", "*", "*.txt")
+	paths, _ = walkPaths(t, shallow, followed)
+	if len(paths) != 0 {
+		t.Fatalf("scan/*/*.txt = %v, want nothing (the file is one level deeper)", paths)
+	}
+}
+
+// TestWalk_BackslashIsNotASeparator verifies that a name containing a backslash
+// is one path component on Unix: splitting on it made a depth-limited pattern
+// fail on any such file, while pathDepth (which uses the platform separator) said
+// the depth matched.
+func TestWalk_BackslashIsNotASeparator(t *testing.T) {
+	t.Parallel()
+
+	if filepath.Separator != '/' {
+		t.Skip("a backslash is a separator on this platform")
+	}
+
+	dir := t.TempDir()
+	writeFile(t, dir, `sub/a\b.txt`, "content")
+
+	pattern := filepath.Join(dir, "*", "*.txt")
+	paths, errs := walkPaths(t, pattern, fswalker.WalkOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("a depth-2 pattern must match a name containing a backslash, got %v", paths)
+	}
+}
+
+// TestWalk_UnreadableDirIsReported verifies that a directory whose contents
+// cannot be read is reported (and counted as unreadable) instead of looking like
+// a pattern that matched nothing.
+func TestWalk_UnreadableDirIsReported(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+
+	dir := t.TempDir()
+	writeFile(t, dir, "locked/b.txt", "content")
+	locked := filepath.Join(dir, "locked")
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	paths, errs := walkPaths(t, filepath.Join(dir, "**"), fswalker.WalkOptions{})
+	if len(paths) != 0 {
+		t.Fatalf("files inside an unreadable directory must not be reported, got %v", paths)
+	}
+	if len(errs) != 1 {
+		t.Fatalf("errors = %v, want one reported permission error", errs)
+	}
+
+	// A pattern naming the unreadable directory must not be reported as a miss.
+	direct := filepath.Join(locked, "**")
+	paths, errs = walkPaths(t, direct, fswalker.WalkOptions{})
+	if len(paths) != 0 {
+		t.Fatalf("paths = %v, want none", paths)
+	}
+	if len(errs) != 1 || isNoMatch(errs[0], direct) {
+		t.Fatalf("errors = %v, want the permission error and no no-match error", errs)
+	}
+}
+
+// countingZeroLen counts skipped zero-length files.
+type countingZeroLen struct{ n int64 }
+
+func (c *countingZeroLen) AddZeroLen(delta int64) { c.n += delta }
+
+// TestWalk_ZeroLengthCountedOnce verifies that the same skipped zero-length file
+// is counted once, whether it is reached twice through a link or named twice.
+func TestWalk_ZeroLengthCountedOnce(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "empty.txt", "")
+	symlinkTo(t, filepath.Join(dir, "empty.txt"), filepath.Join(dir, "link.txt"))
+
+	counter := &countingZeroLen{}
+	w := fswalker.New()
+	if _, errs := collectResults(t, w.Walk(context.Background(), []string{dir},
+		fswalker.WalkOptions{FollowSymlinks: true, ZeroLen: counter})); len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if counter.n != 1 {
+		t.Errorf("zero-length counter = %d with -j, want 1", counter.n)
+	}
+
+	counter = &countingZeroLen{}
+	if _, errs := collectResults(t, w.Walk(context.Background(), []string{dir, dir},
+		fswalker.WalkOptions{ZeroLen: counter})); len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if counter.n != 1 {
+		t.Errorf("zero-length counter = %d for a repeated directory, want 1", counter.n)
+	}
+}
+
+// TestWalk_SymlinkDir_SkippedWithoutFollow verifies that a directory symlink is
+// not descended into (and does not spill its contents in as files) by default.
+func TestWalk_SymlinkDir_SkippedWithoutFollow(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	mkSubdir(t, dir, "outside")
+	writeFile(t, dir, "outside/hidden.txt", "content")
+	symlinkTo(t, filepath.Join(dir, "outside"), filepath.Join(dir, "link"))
+
+	pattern := filepath.Join(dir, "link")
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{pattern}, fswalker.WalkOptions{})
+	paths, errs := collectResults(t, ch)
+
+	// Nothing matched (the link was not followed), so the pattern is reported
+	// as a miss rather than quietly doing nothing.
+	if len(errs) != 1 || !isNoMatch(errs[0], pattern) {
+		t.Errorf("expected one no-match error for the unfollowed link, got %v", errs)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("a directory symlink must not be walked without -j, got %v", paths)
+	}
+}
+
+// TestWalk_SymlinkLoop_Terminates verifies that a link pointing at an ancestor
+// directory does not make the walk recurse forever.
+func TestWalk_SymlinkLoop_Terminates(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	mkSubdir(t, dir, "sub")
+	writeFile(t, dir, "sub/file.txt", "content")
+	symlinkTo(t, dir, filepath.Join(dir, "sub", "up"))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w := fswalker.New()
+		ch := w.Walk(context.Background(), []string{dir}, fswalker.WalkOptions{FollowSymlinks: true})
+		for range ch {
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("walk did not terminate on a symlink loop")
+	}
+}
+
+// TestWalk_BrokenSymlink_FollowedIsIgnored verifies that a dangling link is not
+// reported as an error or as a file.
+func TestWalk_BrokenSymlink_FollowedIsIgnored(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "a.txt", "content")
+	symlinkTo(t, filepath.Join(dir, "does-not-exist"), filepath.Join(dir, "dangling"))
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{dir}, fswalker.WalkOptions{FollowSymlinks: true})
+	paths, errs := collectResults(t, ch)
+
+	if len(errs) > 0 {
+		t.Errorf("a dangling link must not produce an error: %v", errs)
+	}
+	if len(paths) != 1 || !strings.HasSuffix(paths[0], "a.txt") {
+		t.Fatalf("expected only a.txt, got %v", paths)
+	}
+}
+
+// TestWalk_ExplicitSymlinkArgument verifies that a link named directly on the
+// command line is resolved to its target.
+func TestWalk_ExplicitSymlinkArgument(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.bin")
+	writeFile(t, dir, "target.bin", strings.Repeat("y", 128))
+	link := filepath.Join(dir, "link.bin")
+	symlinkTo(t, target, link)
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{link}, fswalker.WalkOptions{})
+	sizes, _, errs := collectInfo(t, ch)
+
+	if len(errs) > 0 {
+		t.Errorf("unexpected errors: %v", errs)
+	}
+	if _, ok := sizes[link]; ok {
+		t.Errorf("an explicit link argument must be reported under its target path, not %s", link)
+	}
+	if got := sizes[target]; got != 128 {
+		t.Fatalf("explicit link argument reported size %d, want 128 (%v)", got, sizes)
+	}
+}
+
+// TestWalk_MultipleRecursivePatterns is the regression test for a shared
+// loop-prevention set: the second pattern used to skip every directory the first
+// one had already recorded, silently losing whole subtrees (and reporting "no
+// files matched" for patterns that do match).
+func TestWalk_MultipleRecursivePatterns(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	mkSubdir(t, dir, "sub")
+	writeFile(t, dir, "sub/a.txt", "a")
+	writeFile(t, dir, "sub/b.jpg", "b")
+	writeFile(t, dir, "top.jpg", "c")
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{
+		filepath.Join(dir, "**", "*.txt"),
+		filepath.Join(dir, "**", "*.jpg"),
+	}, fswalker.WalkOptions{})
+	paths, errs := collectResults(t, ch)
+
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	want := []string{
+		filepath.Join(dir, "sub", "a.txt"),
+		filepath.Join(dir, "sub", "b.jpg"),
+		filepath.Join(dir, "top.jpg"),
+	}
+	if len(paths) != len(want) {
+		t.Fatalf("expected %v, got %v", want, paths)
+	}
+	for i := range want {
+		if paths[i] != want[i] {
+			t.Errorf("path[%d] = %s, want %s", i, paths[i], want[i])
+		}
+	}
+}
+
+// TestWalk_GlobInDirectoryComponent verifies that a wildcard directory
+// component matches: matchPath used to compare the whole pattern against the
+// basename only, so "sub/*/x.txt" (and "*/x.txt") never matched anything, and a
+// non-recursive walk never descended far enough to look.
+func TestWalk_GlobInDirectoryComponent(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	mkSubdir(t, dir, "sub")
+	mkSubdir(t, dir, "sub/s1")
+	mkSubdir(t, dir, "sub/s2")
+	writeFile(t, dir, "sub/s1/x.txt", "content")
+	writeFile(t, dir, "sub/s2/y.txt", "other")
+
+	for _, pattern := range []string{
+		filepath.Join(dir, "sub", "*", "x.txt"),
+		filepath.Join(dir, "*", "s1", "*.txt"),
+	} {
+		w := fswalker.New()
+		ch := w.Walk(context.Background(), []string{pattern}, fswalker.WalkOptions{})
+		paths, errs := collectResults(t, ch)
+
+		if len(errs) > 0 {
+			t.Fatalf("pattern %s: unexpected errors: %v", pattern, errs)
+		}
+		if len(paths) != 1 || !strings.HasSuffix(paths[0], "x.txt") {
+			t.Fatalf("pattern %s: expected x.txt, got %v", pattern, paths)
+		}
+	}
+}
+
+// TestWalk_ManyDoubleStarsTerminate guards the matcher against the exponential
+// backtracking it used to have: each "**" retried every remaining split point,
+// so a pattern with 8 of them took minutes per candidate file (and a
+// non-matching pattern is the worst case, because nothing short-circuits).
+func TestWalk_ManyDoubleStarsTerminate(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	deep := dir
+	for i := range 40 {
+		deep = filepath.Join(deep, fmt.Sprintf("d%d", i))
+	}
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, deep, "x.txt", "content")
+
+	// Interleaved literals keep every "**" alive: eight adjacent stars would be
+	// collapsed into one at compile time and would never exercise the backtracking.
+	pattern := filepath.Join(dir, strings.Repeat("**/nope/", 8)+"*.bin") // matches nothing
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w := fswalker.New()
+		ch := w.Walk(context.Background(), []string{pattern}, fswalker.WalkOptions{})
+		for range ch {
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("a pattern with 8 '**' took longer than 20s to match nothing")
+	}
+}
+
+// TestWalk_DoubleStarCollapse verifies that repeated "**" components behave
+// like a single one (they are collapsed when the pattern is compiled).
+func TestWalk_DoubleStarCollapse(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	mkSubdir(t, dir, "a")
+	mkSubdir(t, dir, "a/b")
+	writeFile(t, dir, "a/b/x.txt", "content")
+
+	for _, pattern := range []string{
+		filepath.Join(dir, "**", "**", "**", "x.txt"),
+		filepath.Join(dir, "**", "x.txt"),
+	} {
+		w := fswalker.New()
+		ch := w.Walk(context.Background(), []string{pattern}, fswalker.WalkOptions{})
+		paths, errs := collectResults(t, ch)
+
+		if len(errs) > 0 {
+			t.Fatalf("pattern %s: unexpected errors: %v", pattern, errs)
+		}
+		if len(paths) != 1 || !strings.HasSuffix(paths[0], "x.txt") {
+			t.Fatalf("pattern %s: expected x.txt, got %v", pattern, paths)
+		}
+	}
+}
+
+// TestWalk_LiteralPathWithGlobCharacters verifies that a path containing glob
+// metacharacters is scanned as written when it exists, instead of being split
+// into a pattern that matches nothing.
+func TestWalk_LiteralPathWithGlobCharacters(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bracketed := filepath.Join(dir, "[2020] photos")
+	mkSubdir(t, dir, "[2020] photos")
+	writeFile(t, dir, "[2020] photos/a.txt", "content")
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{bracketed}, fswalker.WalkOptions{})
+	paths, errs := collectResults(t, ch)
+
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(paths) != 1 || !strings.HasSuffix(paths[0], "a.txt") {
+		t.Fatalf("expected a.txt under the bracketed directory, got %v", paths)
+	}
+}
+
+// TestWalk_PatternWithFilePathPrefix verifies that a pattern whose literal
+// prefix is a regular file ("notes.txt/*.jpg") matches nothing and is reported
+// as a miss, instead of being counted as an unreadable file (Linux returns
+// ENOTDIR, which is not "not exist") or reporting the prefix itself (Windows).
+func TestWalk_PatternWithFilePathPrefix(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "notes.txt", "content")
+	pattern := filepath.Join(dir, "notes.txt", "*.jpg")
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{pattern}, fswalker.WalkOptions{})
+	paths, errs := collectResults(t, ch)
+
+	if len(paths) != 0 {
+		t.Fatalf("a pattern under a regular file must match nothing, got %v", paths)
+	}
+	if len(errs) != 1 || !isNoMatch(errs[0], pattern) {
+		t.Fatalf("expected one no-match error, got %v", errs)
+	}
+}
+
+// TestWalk_NonDirectoryPrefixReportsError verifies that a prefix that cannot be
+// stat'ed for a reason other than "does not exist" is still reported as an
+// error, naming the pattern.
+func TestWalk_NonDirectoryPrefixReportsError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission checks do not apply to root")
+	}
+	t.Parallel()
+
+	dir := t.TempDir()
+	locked := filepath.Join(dir, "locked")
+	mkSubdir(t, dir, "locked")
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	pattern := filepath.Join(locked, "**", "*.txt")
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{pattern}, fswalker.WalkOptions{})
+	paths, errs := collectResults(t, ch)
+
+	if len(paths) != 0 {
+		t.Fatalf("expected no files, got %v", paths)
+	}
+	if len(errs) == 0 {
+		t.Fatal("expected a permission error to be reported")
+	}
+}
+
+// TestWalk_GlobInsideGlobNamedDir verifies that a pattern whose base directory
+// contains metacharacters is split at the existing directory, not at the first
+// bracket.
+func TestWalk_GlobInsideGlobNamedDir(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	mkSubdir(t, dir, "[2020] photos")
+	writeFile(t, dir, "[2020] photos/a.txt", "content")
+	writeFile(t, dir, "[2020] photos/b.jpg", "image")
+
+	w := fswalker.New()
+	pattern := filepath.Join(dir, "[2020] photos", "*.txt")
+	ch := w.Walk(context.Background(), []string{pattern}, fswalker.WalkOptions{})
+	paths, errs := collectResults(t, ch)
+
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(paths) != 1 || !strings.HasSuffix(paths[0], "a.txt") {
+		t.Fatalf("expected only a.txt, got %v", paths)
+	}
+}
+
+// TestWalk_GlobClassStillMatches verifies that a real character class is still
+// treated as a glob.
+func TestWalk_GlobClassStillMatches(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "a.txt", "a")
+	writeFile(t, dir, "b.txt", "b")
+	writeFile(t, dir, "c.txt", "c")
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{filepath.Join(dir, "[ab].txt")}, fswalker.WalkOptions{})
+	paths, errs := collectResults(t, ch)
+
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("expected a.txt and b.txt, got %v", paths)
+	}
+}
+
+// TestWalk_FileInfoCarriesModTime verifies that the walker records the
+// modification time the executor later re-checks.
+func TestWalk_FileInfoCarriesModTime(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "a.txt", "content")
+	info, err := os.Stat(filepath.Join(dir, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{dir}, fswalker.WalkOptions{})
+	for r := range ch {
+		if r.Err != nil {
+			t.Fatalf("unexpected error: %v", r.Err)
+		}
+		if !r.Info.ModTime.Equal(info.ModTime()) {
+			t.Errorf("ModTime = %v, want %v", r.Info.ModTime, info.ModTime())
+		}
+	}
+}
+
+// TestWalk_SymlinkedPrefixReportsFilesOnce covers a directory reached under two
+// spellings: the walk root is spelled through a symlink, and a directory symlink
+// inside the tree resolves to the canonical path of a directory that is already
+// part of the walk. A visited set keyed by the path spelling holds both, so the
+// subtree is walked twice and every file in it is reported twice — which is what
+// a symlinked prefix (macOS /var, a symlinked TMPDIR) produced.
+func TestWalk_SymlinkedPrefixReportsFilesOnce(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.MkdirAll(filepath.Join(target, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, dir, "target/sub/inside.txt", "content")
+
+	alias := filepath.Join(dir, "alias")
+	symlinkTo(t, target, alias)
+
+	// The walk starts inside the aliased spelling of the tree, and a link inside
+	// it points at the canonical spelling of the same directory.
+	walkRoot := filepath.Join(alias, "sub")
+	symlinkTo(t, filepath.Join(target, "sub"), filepath.Join(walkRoot, "loop"))
+
+	w := fswalker.New()
+	ch := w.Walk(context.Background(), []string{walkRoot}, fswalker.WalkOptions{FollowSymlinks: true})
+	paths, errs := collectResults(t, ch)
+
+	if len(errs) > 0 {
+		t.Errorf("unexpected errors: %v", errs)
+	}
+
+	inside := 0
+	for _, path := range paths {
+		if strings.HasSuffix(path, "inside.txt") {
+			inside++
+		}
+	}
+	if inside != 1 {
+		t.Errorf("inside.txt was reported %d times, want 1 (paths: %v)", inside, paths)
 	}
 }
