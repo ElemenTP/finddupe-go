@@ -98,6 +98,31 @@ func TestCompute_FileSizeFoldedIn(t *testing.T) {
 	}
 }
 
+// TestComputeFileInfo_IdentityAvailable documents the contract the pipeline logs
+// on: a file the platform can identify reports no identity error, so the verbose
+// "file identity unavailable" notice only ever appears where identity really was
+// not available.
+func TestComputeFileInfo_IdentityAvailable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "identified.bin")
+	if err := os.WriteFile(path, []byte("identity"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := checksum.ComputeFileInfo(path, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.IdentityErr != nil {
+		t.Fatalf("IdentityErr = %v, want nil for a readable file", info.IdentityErr)
+	}
+	if info.Dev == 0 && info.Inode == 0 {
+		t.Log("this platform reports no file identity at all; the notice stays silent")
+	}
+}
+
 func TestComputeFileInfo_SizeChanged(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

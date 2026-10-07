@@ -450,6 +450,14 @@ func submitChecksum(
 			return
 		}
 
+		if info.IdentityErr != nil {
+			// Info level: this is what -v is for. Duplicate detection still works,
+			// but the file cannot appear in a --listlink group and an already
+			// hardlinked pair is reported (and counted) as two copies.
+			logger.InfoContext(ctx, "file identity unavailable",
+				"path", fi.Path, "error", info.IdentityErr)
+		}
+
 		fi.Signature = info.Signature
 		fi.Dev = info.Dev
 		fi.Inode = info.Inode

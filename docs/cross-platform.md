@@ -83,7 +83,10 @@ The NTFS file index serves the same role as the Unix inode, and the volume seria
 
 ### Fallback
 
-If identity retrieval fails (a handle without `FILE_READ_ATTRIBUTES`, a redirector that reports no file IDs, `GetFileInformationByHandle` refusing), `Dev`, `Inode`, and `NumLinks` are 0 and the scan continues: duplicate detection still works via checksum, but `--listlink` silently omits those files from every hardlink group, reports cannot tag an already-hardlinked pair (`(hardlinked instances of same file)` needs the identity, so such a pair is listed as two independent duplicates and counted once for the storage), the freshness check loses its identity half and keeps size+mtime, and `dedupeByInode` cannot collapse aliases (extra no-op actions, never a wrong one). Nothing is acted on incorrectly; the run just knows less. `find -v` is the way to notice, because the "hardlinked instances" lines stop appearing for those files.
+If identity retrieval fails (a handle without `FILE_READ_ATTRIBUTES`, a redirector that reports no file IDs, `GetFileInformationByHandle` refusing), `Dev`, `Inode`, and `NumLinks` are 0 and the scan continues: duplicate detection still works via checksum, but `--listlink` silently omits those files from every hardlink group, reports cannot tag an already-hardlinked pair (`(hardlinked instances of same file)` needs the identity, so such a pair is listed as two independent duplicates and counted once for the storage), the freshness check loses its identity half and keeps size+mtime, and `dedupeByInode` cannot collapse aliases (extra no-op actions, never a wrong one). Nothing is acted on incorrectly; the run just knows less. In verbose mode the scan
+logs `file identity unavailable` with the path and the underlying error once per
+such file, and the "hardlinked instances" lines stop appearing for them, which is
+how the degradation is noticed rather than guessed.
 
 ## 2. Hardlink Creation
 
@@ -244,16 +247,16 @@ Verified on a Darwin 27.0.0 / macOS 27 ARM64 APFS data volume:
 - APFS native compression is exposed through the `SF_COMPRESSED` flag (`ls -lO`
   prints `compressed`, `stat -f %Sf` lists it as a flag), not as a readable
   `com.apple.decmpfs` xattr;
-- a clone whose source stores its payload *inline* in `com.apple.decmpfs` (no
-  `com.apple.ResourceFork`) makes `dedupe --cow` **fail the action instead of
-  producing a clone that reads back as zero bytes**: the layout pass copies the
-  decmpfs header, and a header whose payload lives in a resource fork that is not
-  there would describe data that does not exist. The victim is left untouched
-  (temp name + atomic rename) and the run exits non-zero. `clonefile` normally
-  carries the whole compressed attribute set across, so this is a defensive
-  fail-closed path; the fix if a real Mac hits it is to copy the decmpfs header
-  and the resource fork as one unit, or to compare the clone's own layout before
-  accepting it;
+- a decmpfs header whose compression type stores the payload in the resource fork
+  (`4`, `7`, `8`, `12`) **requires** that fork: if it is missing — a damaged or
+  truncated keeper — the layout pass fails the action instead of producing a clone
+  that reads back as zero bytes (victim untouched, temp file removed, reason
+  logged, non-zero exit). Types that keep the payload *inside* `com.apple.decmpfs`
+  (`1`, `3`, `11`) have no resource fork by design, so the header alone is copied
+  and the action succeeds; an unreadable or unknown header is treated as a
+  resource-fork type, which is the fail-safe direction. `clonefile` normally
+  carries the whole compressed attribute set across, so this is a defensive path
+  that only runs when the clone did not inherit the compression;
 - a clone whose first 256 KiB were rewritten reports **75.0% (768 KiB of 1 MiB)**,
   and `dedupe --cow` brings it back to 100%: the partial-ratio path is exercised
   on real APFS, not just in the unit tests;

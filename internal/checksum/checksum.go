@@ -25,6 +25,12 @@ type fileStat struct {
 	Dev      uint64
 	Inode    uint64
 	NumLinks uint64
+
+	// identityErr records that the physical identity could not be read while the
+	// size and modification time could. Detection still works through the
+	// checksum; hardlink grouping and the identity half of the freshness check do
+	// not, so the caller reports the degradation instead of hiding it.
+	identityErr error
 }
 
 // Bit widths and shifts of the composite checksum algorithm. They are part of
@@ -62,6 +68,13 @@ type Info struct {
 	// was computed. It is the reference the executor re-checks before acting
 	// on the file.
 	ModTime time.Time
+
+	// IdentityErr is set when the file's physical identity could not be read
+	// (Windows: GetFileInformationByHandle failed). The file is still scanned and
+	// its duplicates are still found, but --listlink will not group it and a
+	// hardlinked pair cannot be recognized as one; the caller logs it in verbose
+	// mode so the degradation is not silent.
+	IdentityErr error
 }
 
 // ComputeFileInfo opens the file once and returns the checksum signature,
@@ -93,10 +106,11 @@ func ComputeFileInfo(path string, size int64) (Info, error) {
 	}
 
 	out := Info{
-		ModTime:  stat.ModTime,
-		Dev:      stat.Dev,
-		Inode:    stat.Inode,
-		NumLinks: stat.NumLinks,
+		ModTime:     stat.ModTime,
+		Dev:         stat.Dev,
+		Inode:       stat.Inode,
+		NumLinks:    stat.NumLinks,
+		IdentityErr: stat.identityErr,
 	}
 
 	out.Signature, out.SHA256, err = computeSignature(f, size)

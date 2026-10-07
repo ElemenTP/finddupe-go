@@ -23,6 +23,11 @@ func statFile(f *os.File) (fileStat, error) {
 	out := fileStat{Size: info.Size(), ModTime: info.ModTime()}
 	winInfo, infoErr := wininfo.FromHandle(windows.Handle(f.Fd()))
 	if infoErr != nil {
+		// Without the identity the file is still scanned (checksum, size, mtime)
+		// but it cannot be grouped by --listlink or recognized as one half of an
+		// existing hardlink. The error travels with the result so the pipeline can
+		// say so in verbose mode instead of degrading invisibly.
+		out.identityErr = infoErr
 		return out, nil
 	}
 	out.Dev = winInfo.VolumeSerialNumber
